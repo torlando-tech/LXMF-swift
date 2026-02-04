@@ -60,7 +60,10 @@ extension LXMRouter {
     /// Handle delivery packet received for LXMF destination.
     ///
     /// This is called when a packet arrives for a registered LXMF destination.
-    /// Reconstructs the full LXMF wire format and routes to lxmfDelivery.
+    /// IMPORTANT: Sends delivery proof FIRST, then unpacks and validates the message.
+    ///
+    /// Reference: Python LXMF/LXMRouter.py delivery_packet() lines 1817-1818
+    /// The proof is sent immediately upon packet reception, before message validation.
     ///
     /// - Parameters:
     ///   - data: Packet data
@@ -69,7 +72,12 @@ extension LXMRouter {
         let destHex = packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined()
         print("[LXMF_INBOUND] deliveryPacket called: destType=\(packet.header.destinationType), destHash=\(destHex), dataLen=\(data.count)")
 
-        // Reconstruct full LXMF data based on packet type
+        // STEP 1: Send delivery proof IMMEDIATELY (before unpacking)
+        // Reference: Python Packet.prove() -> Identity.prove()
+        // The proof proves we received the packet by signing its hash
+        await sendDeliveryProof(for: packet)
+
+        // STEP 2: Reconstruct full LXMF data based on packet type
         var lxmfData = Data()
 
         if packet.header.destinationType != .link {
@@ -84,10 +92,78 @@ extension LXMRouter {
             print("[LXMF_INBOUND] Link delivery: using data as-is, lxmfData len=\(lxmfData.count)")
         }
 
-        // Route to delivery handler
+        // STEP 3: Route to delivery handler for unpacking and validation
         print("[LXMF_INBOUND] Calling lxmfDelivery() with \(lxmfData.count) bytes")
         let accepted = await lxmfDelivery(lxmfData)
         print("[LXMF_INBOUND] lxmfDelivery() returned accepted=\(accepted)")
+    }
+
+    /// Send a delivery proof for a received packet.
+    ///
+    /// The proof is a PROOF packet containing:
+    /// - Destination: Truncated hash of received packet (16 bytes)
+    /// - Data: Ed25519 signature of the full packet hash (64 bytes)
+    ///
+    /// This proves to the sender that we received their packet.
+    /// The proof is routed back using the packet hash as destination,
+    /// which transport nodes can match to pending deliveries.
+    ///
+    /// Reference: Python RNS Identity.prove() lines 807-818
+    ///
+    /// - Parameter packet: The received packet to prove
+    private func sendDeliveryProof(for packet: Packet) async {
+        guard let transport = transport else {
+            print("[LXMF_PROOF] Cannot send proof: transport not available")
+            return
+        }
+
+        // Compute packet hash (used as proof destination and signature input)
+        let packetHash = packet.getFullHash()
+        let proofDestination = packet.getTruncatedHash()
+
+        let hashHex = packetHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+        let destHex = proofDestination.prefix(8).map { String(format: "%02x", $0) }.joined()
+        print("[LXMF_PROOF] Generating proof: packetHash=\(hashHex), proofDest=\(destHex)")
+
+        // Sign the packet hash with our identity
+        let signature: Data
+        do {
+            signature = try identity.sign(packetHash)
+            let sigHex = signature.prefix(8).map { String(format: "%02x", $0) }.joined()
+            print("[LXMF_PROOF] Signed with identity, signature[0:8]=\(sigHex)")
+        } catch {
+            print("[LXMF_PROOF] Failed to sign packet hash: \(error)")
+            return
+        }
+
+        // Create PROOF packet
+        // Reference: Python Packet.py PROOF type = 0x03
+        // Header: HEADER_1, destinationType=SINGLE, packetType=PROOF
+        let proofHeader = PacketHeader(
+            headerType: .header1,
+            hasContext: false,
+            hasIFAC: false,
+            transportType: .broadcast,
+            destinationType: .single,
+            packetType: .proof,
+            hopCount: 0
+        )
+
+        let proofPacket = Packet(
+            header: proofHeader,
+            destination: proofDestination,
+            transportAddress: nil,
+            context: 0x00,  // NONE context
+            data: signature  // 64-byte Ed25519 signature (implicit proof mode)
+        )
+
+        // Send proof via transport
+        do {
+            try await transport.send(packet: proofPacket)
+            print("[LXMF_PROOF] Delivery proof sent successfully to \(destHex)")
+        } catch {
+            print("[LXMF_PROOF] Failed to send delivery proof: \(error)")
+        }
     }
 
     // MARK: - Announce Handling
