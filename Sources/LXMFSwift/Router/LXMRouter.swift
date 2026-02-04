@@ -140,6 +140,14 @@ public actor LXMRouter {
         // Load failed outbound from database
         let failed = try await database.loadFailedOutbound()
         self.failedOutbound = failed
+
+        // Start the outbound processing loop if there are pending messages
+        if !pending.isEmpty {
+            print("[LXMF_ROUTER] Starting outbound processor with \(pending.count) pending messages")
+            Task {
+                await processOutbound()
+            }
+        }
     }
 
     // MARK: - Delegate Management
@@ -405,9 +413,16 @@ public actor LXMRouter {
             }
 
             // Check if should attempt delivery now
-            guard shouldAttemptDelivery(message) else {
+            let destHex = message.destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+            let shouldAttempt = shouldAttemptDelivery(message)
+            if !shouldAttempt {
+                if let nextAttempt = message.nextDeliveryAttempt {
+                    let waitTime = nextAttempt.timeIntervalSince(Date())
+                    appendRouterDebug("[ROUTER] Skipping \(destHex) - wait \(Int(waitTime))s until next attempt")
+                }
                 continue
             }
+            appendRouterDebug("[ROUTER] Attempting delivery to \(destHex), method=\(message.method)")
 
             // Increment delivery attempts
             message.deliveryAttempts += 1
@@ -417,15 +432,26 @@ public actor LXMRouter {
                 switch message.method {
                 case .opportunistic:
                     // Opportunistic delivery: single packet via transport
+                    let destHashHex = message.destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+                    appendRouterDebug("[ROUTER] Processing OPPORTUNISTIC message to \(destHashHex)")
+                    print("[LXMF_OPP] Processing opportunistic to \(destHashHex), attempts=\(message.deliveryAttempts)")
+
                     // Check if we need path and don't have one
-                    if message.deliveryAttempts >= Self.MAX_PATHLESS_TRIES,
-                       !(await hasPath(message.destinationHash)) {
+                    let hasPathForOpp = await hasPath(message.destinationHash)
+                    appendRouterDebug("[ROUTER] hasPath(\(destHashHex))=\(hasPathForOpp), attempts=\(message.deliveryAttempts)")
+
+                    if message.deliveryAttempts >= Self.MAX_PATHLESS_TRIES, !hasPathForOpp {
                         // Request path and wait
+                        appendRouterDebug("[ROUTER] No path after \(message.deliveryAttempts) tries, requesting path")
                         requestPath(message.destinationHash)
                         message.nextDeliveryAttempt = Date().addingTimeInterval(Self.PATH_REQUEST_WAIT)
                     } else {
                         // Attempt send
+                        appendRouterDebug("[ROUTER] Calling sendOpportunistic...")
+                        print("[LXMF_OPP] Calling sendOpportunistic for \(destHashHex)")
                         try await sendOpportunistic(&message)
+                        appendRouterDebug("[ROUTER] sendOpportunistic completed successfully")
+                        print("[LXMF_OPP] sendOpportunistic completed for \(destHashHex)")
                         messagesToRemove.append(message)
 
                         // Update database

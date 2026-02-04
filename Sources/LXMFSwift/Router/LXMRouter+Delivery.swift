@@ -58,22 +58,31 @@ extension LXMRouter {
     /// Reference: Python LXMRouter opportunistic send (lines 2600-2630)
     /// Reference: RNS Identity.encrypt() for SINGLE destination encryption
     public func sendOpportunistic(_ message: inout LXMessage) async throws {
+        appendDeliveryDebug("[OPP_SEND] Starting sendOpportunistic")
+
         guard let transport = self.transport else {
+            appendDeliveryDebug("[OPP_SEND] ERROR: transport not available")
             throw LXMFError.transportNotAvailable
         }
 
         guard let pathTable = self.pathTable else {
+            appendDeliveryDebug("[OPP_SEND] ERROR: pathTable not available")
             throw LXMFError.transportNotAvailable
         }
 
         guard let packed = message.packed else {
+            appendDeliveryDebug("[OPP_SEND] ERROR: message not packed (packed=nil)")
             throw LXMFError.notPacked
         }
+        appendDeliveryDebug("[OPP_SEND] Message packed, \(packed.count) bytes")
 
         // Look up path entry for destination to get their public key
+        let destHex = message.destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
         guard let pathEntry = await pathTable.lookup(destinationHash: message.destinationHash) else {
+            appendDeliveryDebug("[OPP_SEND] ERROR: no path entry for \(destHex)")
             throw LXMFError.destinationNotFound
         }
+        appendDeliveryDebug("[OPP_SEND] Found path entry for \(destHex), hops=\(pathEntry.hopCount)")
 
         // Get recipient's encryption public key (use ratchet if available, otherwise base key)
         // When a destination announces with a ratchet, we MUST use the ratchet key for
@@ -107,6 +116,7 @@ extension LXMRouter {
         // Encrypt data to recipient's public key using SINGLE destination encryption
         // Output format: [ephemeral_pub 32B][IV 16B][ciphertext][HMAC 32B]
         // NOTE: The HKDF salt is the IDENTITY hash (from public keys), NOT the destination hash!
+        appendDeliveryDebug("[OPP_SEND] Encrypting \(plaintextData.count) bytes")
         let encryptedData: Data
         do {
             encryptedData = try Identity.encrypt(
@@ -114,16 +124,20 @@ extension LXMRouter {
                 to: recipientEncryptionPubKey,
                 identityHash: identityHash  // Use identity hash as HKDF salt per Python RNS
             )
+            appendDeliveryDebug("[OPP_SEND] Encrypted to \(encryptedData.count) bytes")
         } catch {
+            appendDeliveryDebug("[OPP_SEND] ERROR: encryption failed: \(error)")
             throw LXMFError.encodingFailed("Encryption failed: \(error.localizedDescription)")
         }
 
         // Create packet with destination from message
+        // Use BROADCAST transport type - the transport layer will convert to HEADER_2
+        // if multi-hop routing is needed based on path table lookup
         let header = PacketHeader(
             headerType: .header1,           // Single address (destination)
             hasContext: false,               // No context byte for LXMF
             hasIFAC: false,                  // No interface access codes
-            transportType: .transport,       // Route via path table
+            transportType: .broadcast,       // Broadcast to all interfaces (transport handles HEADER_2 conversion)
             destinationType: .single,        // Encrypted single destination
             packetType: .data,               // Application data
             hopCount: 0                      // Start at 0 hops
@@ -141,13 +155,21 @@ extension LXMRouter {
         message.state = .sending
 
         // Send via transport
-        try await transport.send(packet: packet)
+        appendDeliveryDebug("[OPP_SEND] Sending packet via transport...")
+        do {
+            try await transport.send(packet: packet)
+            appendDeliveryDebug("[OPP_SEND] Packet sent successfully!")
+        } catch {
+            appendDeliveryDebug("[OPP_SEND] ERROR: transport.send failed: \(error)")
+            throw error
+        }
 
         // Mark as sent
         message.state = .sent
 
         // Notify delegate
         notifyUpdate(message)
+        appendDeliveryDebug("[OPP_SEND] Message marked as sent")
     }
 
     // MARK: - Direct Delivery
@@ -187,66 +209,96 @@ extension LXMRouter {
         do {
             link = try await getOrEstablishLink(to: message.destinationHash, transport: transport)
             print("[LXMF_DIRECT] sendDirect: link established to \(destHashHex)")
+            appendDeliveryDebug("[DIRECT] Link established to \(destHashHex)")
         } catch {
             print("[LXMF_DIRECT] sendDirect: link establishment failed: \(error)")
+            appendDeliveryDebug("[DIRECT] Link establishment FAILED: \(error)")
             throw error
         }
 
         // Identify ourselves to the remote peer so they can respond
         // This sends our public keys over the link, enabling bidirectional LXMF
+        appendDeliveryDebug("[DIRECT] Calling link.identify()")
         do {
             try await link.identify(identity: identity)
             print("[LXMF_DIRECT] sendDirect: identified to remote peer")
+            appendDeliveryDebug("[DIRECT] identify() succeeded")
         } catch {
             // Identification failure is not fatal - message can still be delivered
             // but the remote may not be able to respond
             print("[LXMF_DIRECT] sendDirect: identify failed (non-fatal): \(error)")
+            appendDeliveryDebug("[DIRECT] identify() FAILED (non-fatal): \(error)")
         }
 
         // Update message state
         message.state = .sending
+        appendDeliveryDebug("[DIRECT] Message state -> sending, packed.count=\(packed.count)")
 
         // Send based on message size
         if packed.count <= LXMFConstants.LINK_PACKET_MAX_CONTENT {
             // Small enough for link DATA packet
             // IMPORTANT: Link packets must be encrypted using the link's derived key
-            let encrypted = try await link.encrypt(packed)
-            print("[LXMF_DIRECT] Encrypted \(packed.count) bytes to \(encrypted.count) bytes for link")
+            appendDeliveryDebug("[DIRECT] Encrypting \(packed.count) bytes for link")
+            let encrypted: Data
+            do {
+                encrypted = try await link.encrypt(packed)
+                print("[LXMF_DIRECT] Encrypted \(packed.count) bytes to \(encrypted.count) bytes for link")
+                appendDeliveryDebug("[DIRECT] Encrypted to \(encrypted.count) bytes")
+            } catch {
+                appendDeliveryDebug("[DIRECT] ENCRYPT FAILED: \(error)")
+                throw error
+            }
 
             // Create link DATA packet
             // NOTE: Python RNS uses context=NONE (0x00) for regular link data
             // The LXMF message format is self-identifying, no special context needed
+            let linkId = await link.linkId
+            let linkIdHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
+
+            // Get destination hash for path lookup (to determine if we need HEADER_2)
+            let destHash = await link.destinationHash
+            let destHashHex = destHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+            appendDeliveryDebug("[DIRECT] Creating DATA packet: linkId=\(linkIdHex), destHash=\(destHashHex)")
+
+            // Create HEADER_1 packet - transport.send() will convert to HEADER_2 if needed
+            // by looking up the destination path
             let header = PacketHeader(
-                headerType: .header1,       // Link packets use HEADER_1
-                hasContext: false,          // No special context for link data
+                headerType: .header1,
+                hasContext: false,
                 hasIFAC: false,
-                transportType: .broadcast,  // Local broadcast to interface
-                destinationType: .link,     // Link destination type
+                transportType: .broadcast,
+                destinationType: .link,
                 packetType: .data,
                 hopCount: 0
             )
 
-            let linkId = await link.linkId
+            // Use destination hash for routing lookup, but linkId as actual destination
             let packet = Packet(
                 header: header,
-                destination: linkId,        // Link ID as destination
+                destination: linkId,
                 transportAddress: nil,
-                context: 0x00,              // NONE context for regular link data
-                data: encrypted             // Encrypted LXMF message
+                context: 0x00,
+                data: encrypted
             )
 
-            try await transport.send(packet: packet)
+            appendDeliveryDebug("[DIRECT] Sending DATA packet via transport (destHash=\(destHashHex) for routing)")
+            try await transport.sendLinkData(packet: packet, destinationHash: destHash)
+            appendDeliveryDebug("[DIRECT] DATA packet sent successfully")
         } else {
             // Need Resource for large message
             // Link.sendResource handles chunking and transfer
+            appendDeliveryDebug("[DIRECT] Message too large (\(packed.count) bytes), using Resource")
             try await link.sendResource(data: packed, requestId: nil, isResponse: false)
+            appendDeliveryDebug("[DIRECT] Resource transfer complete")
         }
 
         // Mark as sent
         message.state = .sent
+        appendDeliveryDebug("[DIRECT] Message state -> sent")
 
         // Notify delegate
         notifyUpdate(message)
+        appendDeliveryDebug("[DIRECT] Delegate notified, sendDirect complete")
     }
 
     // MARK: - Link Management
