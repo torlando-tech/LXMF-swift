@@ -286,6 +286,14 @@ public actor LXMRouter {
             let sourceHashHex = sourceHash.prefix(8).map { String(format: "%02x", $0) }.joined()
             print("[LXMF_INBOUND] sourceHash=\(sourceHashHex)")
 
+            // Self-echo detection: relay broadcasts our own outbound messages back to us.
+            // Skip any message whose source is our own LXMF delivery destination hash.
+            let localDeliveryHash = Destination.hash(identity: identity, appName: "lxmf", aspects: ["delivery"])
+            if sourceHash == localDeliveryHash {
+                print("[LXMF_INBOUND] Self-echo detected (sourceHash matches local delivery hash), ignoring")
+                return false
+            }
+
             // Look up source identity from cache for signature validation
             let sourceIdentity = identityCache[sourceHash]
             print("[LXMF_INBOUND] sourceIdentity from cache: \(sourceIdentity != nil ? "FOUND" : "NOT FOUND")")

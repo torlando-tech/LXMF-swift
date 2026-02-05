@@ -178,6 +178,9 @@ public struct MessageRecord: Codable, FetchableRecord, PersistableRecord {
         }
         message.method = restoredMethod
 
+        // Restore incoming flag (unpackFromBytes hardcodes incoming=true)
+        message.incoming = incoming
+
         return message
     }
 }
