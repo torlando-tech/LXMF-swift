@@ -172,6 +172,15 @@ public actor LXMRouter {
         isShutdown = true
     }
 
+    /// Restart the router after a shutdown.
+    ///
+    /// Call this after reconnection to re-enable message processing.
+    /// The router must have a new transport set before calling this.
+    public func restart() {
+        isShutdown = false
+        appendRouterDebug("[ROUTER] restart() called, isShutdown=false")
+    }
+
     // MARK: - Transport Management
 
     /// Set the transport for message delivery.
