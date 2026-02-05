@@ -16,26 +16,28 @@ import GRDB
 public actor LXMFDatabase {
     // MARK: - Properties
 
-    private let dbQueue: DatabaseQueue
+    private let dbPool: DatabasePool
 
     // MARK: - Initialization
 
     /// Create or open LXMF database.
     ///
-    /// - Parameter path: Database file path (use ":memory:" for in-memory)
+    /// - Parameter path: Database file path
     /// - Throws: DatabaseError if initialization fails
     public init(path: String) throws {
         // Configure database
         var config = Configuration()
         config.prepareDatabase { db in
-            // Enable WAL mode for concurrent access
+            // Enable WAL mode for concurrent reads during writes
             try db.execute(sql: "PRAGMA journal_mode=WAL")
             // Set synchronous mode to NORMAL for better performance
             try db.execute(sql: "PRAGMA synchronous=NORMAL")
+            // Retry for up to 5 seconds if the database is locked
+            try db.execute(sql: "PRAGMA busy_timeout=5000")
         }
 
-        // Create database queue
-        dbQueue = try DatabaseQueue(path: path, configuration: config)
+        // Create database pool (allows concurrent reads during writes in WAL mode)
+        dbPool = try DatabasePool(path: path, configuration: config)
 
         // Run migrations
         var migrator = DatabaseMigrator()
@@ -96,7 +98,7 @@ public actor LXMFDatabase {
                          columns: ["last_message_timestamp"])
         }
 
-        try migrator.migrate(dbQueue)
+        try migrator.migrate(dbPool)
     }
 
     // MARK: - Message Operations
@@ -108,7 +110,7 @@ public actor LXMFDatabase {
     /// - Parameter message: LXMessage to save (must be packed)
     /// - Throws: DatabaseError or LXMFError if save fails
     public func saveMessage(_ message: LXMessage) throws {
-        try dbQueue.write { db in
+        try dbPool.write { db in
             // Update/create conversation FIRST (foreign key requires it)
             try self.updateConversationForMessage(message, in: db)
 
@@ -126,7 +128,7 @@ public actor LXMFDatabase {
     /// - Returns: LXMessage if found, nil otherwise
     /// - Throws: DatabaseError or LXMFError if retrieval fails
     public func getMessage(id: Data) throws -> LXMessage? {
-        try dbQueue.read { db in
+        try dbPool.read { db in
             guard let record = try MessageRecord
                 .filter(Column("message_id") == id)
                 .fetchOne(db) else {
@@ -142,7 +144,7 @@ public actor LXMFDatabase {
     /// - Returns: True if message exists
     /// - Throws: DatabaseError
     public func hasMessage(id: Data) throws -> Bool {
-        try dbQueue.read { db in
+        try dbPool.read { db in
             try MessageRecord
                 .filter(Column("message_id") == id)
                 .fetchCount(db) > 0
@@ -160,7 +162,7 @@ public actor LXMFDatabase {
     /// - Returns: Array of LXMessage
     /// - Throws: DatabaseError or LXMFError
     public func getMessages(forConversation hash: Data, limit: Int = 50, offset: Int = 0) throws -> [LXMessage] {
-        try dbQueue.read { db in
+        try dbPool.read { db in
             let records = try MessageRecord
                 .filter(Column("conversation_hash") == hash)
                 .order(Column("timestamp").desc)
@@ -178,7 +180,7 @@ public actor LXMFDatabase {
     ///   - state: New state
     /// - Throws: DatabaseError
     public func updateMessageState(id: Data, state: LXMessageState) throws {
-        try dbQueue.write { db in
+        try dbPool.write { db in
             try db.execute(
                 sql: "UPDATE messages SET state = ?, updated_at = ? WHERE message_id = ?",
                 arguments: [state.rawValue, Date().timeIntervalSince1970, id]
@@ -196,7 +198,7 @@ public actor LXMFDatabase {
     /// - Returns: Array of ConversationRecord
     /// - Throws: DatabaseError
     public func getConversations(limit: Int = 100, offset: Int = 0) throws -> [ConversationRecord] {
-        try dbQueue.read { db in
+        try dbPool.read { db in
             try ConversationRecord
                 .order(Column("last_message_timestamp").desc)
                 .limit(limit, offset: offset)
@@ -210,7 +212,7 @@ public actor LXMFDatabase {
     /// - Returns: ConversationRecord if found, nil otherwise
     /// - Throws: DatabaseError
     public func getConversation(hash: Data) throws -> ConversationRecord? {
-        try dbQueue.read { db in
+        try dbPool.read { db in
             try ConversationRecord
                 .filter(Column("destination_hash") == hash)
                 .fetchOne(db)
@@ -224,7 +226,7 @@ public actor LXMFDatabase {
     /// - Parameter hash: Destination hash (16 bytes)
     /// - Throws: DatabaseError
     public func markConversationRead(hash: Data) throws {
-        try dbQueue.write { db in
+        try dbPool.write { db in
             try db.execute(
                 sql: """
                     UPDATE conversations
@@ -243,7 +245,7 @@ public actor LXMFDatabase {
     /// - Parameter hash: Destination hash (16 bytes)
     /// - Throws: DatabaseError
     public func deleteConversation(hash: Data) throws {
-        try dbQueue.write { db in
+        try dbPool.write { db in
             try db.execute(
                 sql: "DELETE FROM conversations WHERE destination_hash = ?",
                 arguments: [hash]
@@ -261,7 +263,7 @@ public actor LXMFDatabase {
     ///   - displayName: Display name for the conversation (optional)
     /// - Throws: DatabaseError
     public func ensureConversation(hash: Data, displayName: String?) throws {
-        try dbQueue.write { db in
+        try dbPool.write { db in
             if var conversation = try ConversationRecord
                 .filter(Column("destination_hash") == hash)
                 .fetchOne(db) {
@@ -292,7 +294,7 @@ public actor LXMFDatabase {
     /// - Parameter message: Message to update conversation for
     /// - Throws: DatabaseError
     public func updateConversation(for message: LXMessage) throws {
-        try dbQueue.write { db in
+        try dbPool.write { db in
             try updateConversationForMessage(message, in: db)
         }
     }
@@ -304,7 +306,7 @@ public actor LXMFDatabase {
     /// - Returns: Array of LXMessage
     /// - Throws: DatabaseError or LXMFError
     public func loadPendingOutbound() throws -> [LXMessage] {
-        try dbQueue.read { db in
+        try dbPool.read { db in
             let records = try MessageRecord
                 .filter(Column("state") == LXMessageState.outbound.rawValue)
                 .order(Column("timestamp").asc)
@@ -321,7 +323,7 @@ public actor LXMFDatabase {
     /// - Returns: Array of LXMessage
     /// - Throws: DatabaseError or LXMFError
     public func loadFailedOutbound() throws -> [LXMessage] {
-        try dbQueue.read { db in
+        try dbPool.read { db in
             let records = try MessageRecord
                 .filter(Column("state") == LXMessageState.failed.rawValue)
                 .order(Column("timestamp").desc)
