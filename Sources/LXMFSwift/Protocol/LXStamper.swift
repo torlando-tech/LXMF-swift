@@ -41,6 +41,10 @@ public enum LXStamper {
     /// Python: WORKBLOCK_EXPAND_ROUNDS = 3000
     public static let EXPAND_ROUNDS = 3000
 
+    /// Number of HKDF expansion rounds for propagation node stamp validation
+    /// Python: WORKBLOCK_EXPAND_ROUNDS_PN = 1000
+    public static let EXPAND_ROUNDS_PN = 1000
+
     /// Bytes per expansion round
     /// Python: each round generates 256 bytes
     public static let EXPAND_LENGTH = 256
@@ -73,13 +77,15 @@ public enum LXStamper {
     ///     return workblock
     /// ```
     ///
-    /// - Parameter material: Input material (typically message ID)
-    /// - Returns: 768000-byte workblock (3000 x 256)
-    public static func stampWorkblock(material: Data) -> Data {
+    /// - Parameters:
+    ///   - material: Input material (typically message ID / transient ID)
+    ///   - expandRounds: Number of HKDF expansion rounds (default: 3000, PN: 1000)
+    /// - Returns: Workblock of size expandRounds x 256 bytes
+    public static func stampWorkblock(material: Data, expandRounds: Int = EXPAND_ROUNDS) -> Data {
         var workblock = Data()
-        workblock.reserveCapacity(EXPAND_ROUNDS * EXPAND_LENGTH)
+        workblock.reserveCapacity(expandRounds * EXPAND_LENGTH)
 
-        for n in 0..<EXPAND_ROUNDS {
+        for n in 0..<expandRounds {
             // msgpack.packb(n) - pack counter as MessagePack integer
             let counter = packMessagePackInt(n)
 
@@ -141,11 +147,12 @@ public enum LXStamper {
     /// - Parameters:
     ///   - messageID: Message identifier to generate stamp for
     ///   - cost: Required number of leading zero bits (default: 16)
+    ///   - expandRounds: Number of HKDF expansion rounds (default: 3000, PN: 1000)
     /// - Returns: Tuple of (stamp, rounds) where rounds is number of attempts
-    public static func generateStamp(messageID: Data, cost: Int = DEFAULT_COST) async -> (stamp: Data, rounds: Int) {
+    public static func generateStamp(messageID: Data, cost: Int = DEFAULT_COST, expandRounds: Int = EXPAND_ROUNDS) async -> (stamp: Data, rounds: Int) {
         // Use Task.detached to run on background thread and avoid blocking
         return await Task.detached(priority: .userInitiated) {
-            let workblock = stampWorkblock(material: messageID)
+            let workblock = stampWorkblock(material: messageID, expandRounds: expandRounds)
             return generateStampSync(workblock: workblock, cost: cost)
         }.value
     }

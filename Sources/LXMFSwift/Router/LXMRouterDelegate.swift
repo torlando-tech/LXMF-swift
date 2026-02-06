@@ -47,6 +47,22 @@ public protocol LXMRouterDelegate: AnyObject, Sendable {
     ///   - message: The failed message
     ///   - reason: The error causing failure
     func router(_ router: LXMRouter, didFailMessage message: LXMessage, reason: LXMFError)
+
+    /// Called when propagation sync state changes.
+    ///
+    /// Provides progress updates during sync operations for UI display.
+    ///
+    /// - Parameters:
+    ///   - router: The router performing the sync
+    ///   - state: Current sync transfer state
+    func router(_ router: LXMRouter, didUpdateSyncState state: PropagationTransferState)
+
+    /// Called when propagation sync completes.
+    ///
+    /// - Parameters:
+    ///   - router: The router that completed sync
+    ///   - newMessages: Number of new messages received
+    func router(_ router: LXMRouter, didCompleteSyncWithNewMessages newMessages: Int)
 }
 
 /// Default implementations for optional delegate methods.
@@ -64,6 +80,14 @@ public extension LXMRouterDelegate {
     }
 
     func router(_ router: LXMRouter, didFailMessage message: LXMessage, reason: LXMFError) {
+        // Default: no-op
+    }
+
+    func router(_ router: LXMRouter, didUpdateSyncState state: PropagationTransferState) {
+        // Default: no-op
+    }
+
+    func router(_ router: LXMRouter, didCompleteSyncWithNewMessages newMessages: Int) {
         // Default: no-op
     }
 }

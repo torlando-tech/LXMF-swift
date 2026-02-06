@@ -59,6 +59,15 @@ public enum LXMFError: Error, Sendable {
 
     /// Message not packed (must call pack() first)
     case notPacked
+
+    /// Propagation node not configured
+    case propagationNodeNotSet
+
+    /// Propagation delivery or sync failed
+    case propagationFailed(String)
+
+    /// Sync from propagation node failed
+    case syncFailed(String)
 }
 
 extension LXMFError: LocalizedError {
@@ -98,6 +107,12 @@ extension LXMFError: LocalizedError {
             return "Database operation failed: \(detail)"
         case .notPacked:
             return "Message not packed (must call pack() first)"
+        case .propagationNodeNotSet:
+            return "Propagation node not configured"
+        case .propagationFailed(let detail):
+            return "Propagation delivery failed: \(detail)"
+        case .syncFailed(let detail):
+            return "Sync from propagation node failed: \(detail)"
         }
     }
 }

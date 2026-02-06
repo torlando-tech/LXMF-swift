@@ -76,7 +76,7 @@ public actor LXMRouter {
     /// Duplicate detection cache: transient ID -> timestamp
     /// Transient ID is message.hash (32 bytes)
     /// Cached for 1 hour to prevent processing duplicates
-    private var deliveredTransientIDs: [Data: Date] = [:]
+    var deliveredTransientIDs: [Data: Date] = [:]
 
     /// Cached stamp costs from announces: destination_hash -> (timestamp, cost)
     public var outboundStampCosts: [Data: (Date, Int)] = [:]
@@ -98,6 +98,21 @@ public actor LXMRouter {
 
     /// Active and pending links for direct delivery
     public var deliveryLinks: [Data: Link] = [:]
+
+    /// Active propagation links (separate cache from delivery links)
+    public var propagationLinks: [Data: Link] = [:]
+
+    /// Outbound propagation node hash (16 bytes).
+    /// When set, .propagated delivery sends messages to this node.
+    public var outboundPropagationNode: Data?
+
+    /// Stamp cost required by the selected propagation node.
+    /// Set when selecting a propagation node (from PropagationNodeInfo.stampCost).
+    /// 0 = no stamp work required (any 32-byte stamp accepted).
+    public var propagationStampCost: Int = 0
+
+    /// Current sync state for UI observation.
+    public var syncState = PropagationTransferState()
 
     /// Registered delivery destinations
     public var deliveryDestinations: [Data: (Destination, Int?)] = [:]
@@ -396,116 +411,148 @@ public actor LXMRouter {
         processingOutbound = true
         defer { processingOutbound = false }
 
-        // Process each pending message
-        var messagesToRemove: [LXMessage] = []
+        // Track indices to remove (use index-based access so struct mutations persist)
+        var indicesToRemove: IndexSet = []
 
-        for var message in pendingOutbound {
+        for i in pendingOutbound.indices {
             // Check if message already delivered
-            if message.state == .delivered {
-                messagesToRemove.append(message)
+            if pendingOutbound[i].state == .delivered {
+                indicesToRemove.insert(i)
                 continue
             }
 
             // Check if message cancelled
-            if message.state == .cancelled {
-                messagesToRemove.append(message)
-                notifyFailure(message, reason: .invalidStateTransition(from: .outbound, to: .cancelled))
+            if pendingOutbound[i].state == .cancelled {
+                indicesToRemove.insert(i)
+                notifyFailure(pendingOutbound[i], reason: .invalidStateTransition(from: .outbound, to: .cancelled))
                 continue
             }
 
             // Check if max delivery attempts exceeded
-            if message.deliveryAttempts >= Self.MAX_DELIVERY_ATTEMPTS {
-                message.state = .failed
-                messagesToRemove.append(message)
-                failedOutbound.append(message)
+            if pendingOutbound[i].deliveryAttempts >= Self.MAX_DELIVERY_ATTEMPTS {
+                pendingOutbound[i].state = .failed
+                let failedMsg = pendingOutbound[i]
+                indicesToRemove.insert(i)
+                failedOutbound.append(failedMsg)
 
                 // Update database
-                Task.detached { [database, message] in
-                    try? await database.updateMessageState(id: message.hash, state: .failed)
+                Task.detached { [database] in
+                    try? await database.updateMessageState(id: failedMsg.hash, state: .failed)
                 }
 
                 // Notify delegate
-                notifyFailure(message, reason: .maxAttemptsExceeded)
+                notifyFailure(failedMsg, reason: .maxAttemptsExceeded)
                 continue
             }
 
             // Check if should attempt delivery now
-            let destHex = message.destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-            let shouldAttempt = shouldAttemptDelivery(message)
+            let destHex = pendingOutbound[i].destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+            let shouldAttempt = shouldAttemptDelivery(pendingOutbound[i])
             if !shouldAttempt {
-                if let nextAttempt = message.nextDeliveryAttempt {
+                if let nextAttempt = pendingOutbound[i].nextDeliveryAttempt {
                     let waitTime = nextAttempt.timeIntervalSince(Date())
                     appendRouterDebug("[ROUTER] Skipping \(destHex) - wait \(Int(waitTime))s until next attempt")
                 }
                 continue
             }
-            appendRouterDebug("[ROUTER] Attempting delivery to \(destHex), method=\(message.method)")
+            appendRouterDebug("[ROUTER] Attempting delivery to \(destHex), method=\(pendingOutbound[i].method)")
 
             // Increment delivery attempts
-            message.deliveryAttempts += 1
+            pendingOutbound[i].deliveryAttempts += 1
 
             // Attempt delivery based on method
             do {
-                switch message.method {
+                switch pendingOutbound[i].method {
                 case .opportunistic:
                     // Opportunistic delivery: single packet via transport
-                    let destHashHex = message.destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+                    let destHashHex = pendingOutbound[i].destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
                     appendRouterDebug("[ROUTER] Processing OPPORTUNISTIC message to \(destHashHex)")
-                    print("[LXMF_OPP] Processing opportunistic to \(destHashHex), attempts=\(message.deliveryAttempts)")
+                    print("[LXMF_OPP] Processing opportunistic to \(destHashHex), attempts=\(pendingOutbound[i].deliveryAttempts)")
 
                     // Check if we need path and don't have one
-                    let hasPathForOpp = await hasPath(message.destinationHash)
-                    appendRouterDebug("[ROUTER] hasPath(\(destHashHex))=\(hasPathForOpp), attempts=\(message.deliveryAttempts)")
+                    let hasPathForOpp = await hasPath(pendingOutbound[i].destinationHash)
+                    appendRouterDebug("[ROUTER] hasPath(\(destHashHex))=\(hasPathForOpp), attempts=\(pendingOutbound[i].deliveryAttempts)")
 
-                    if message.deliveryAttempts >= Self.MAX_PATHLESS_TRIES, !hasPathForOpp {
+                    if pendingOutbound[i].deliveryAttempts >= Self.MAX_PATHLESS_TRIES, !hasPathForOpp {
                         // Request path and wait
-                        appendRouterDebug("[ROUTER] No path after \(message.deliveryAttempts) tries, requesting path")
-                        requestPath(message.destinationHash)
-                        message.nextDeliveryAttempt = Date().addingTimeInterval(Self.PATH_REQUEST_WAIT)
+                        appendRouterDebug("[ROUTER] No path after \(pendingOutbound[i].deliveryAttempts) tries, requesting path")
+                        requestPath(pendingOutbound[i].destinationHash)
+                        pendingOutbound[i].nextDeliveryAttempt = Date().addingTimeInterval(Self.PATH_REQUEST_WAIT)
                     } else {
-                        // Attempt send
+                        // Attempt send (copy out for inout async call, then write back)
                         appendRouterDebug("[ROUTER] Calling sendOpportunistic...")
                         print("[LXMF_OPP] Calling sendOpportunistic for \(destHashHex)")
-                        try await sendOpportunistic(&message)
+                        var msg = pendingOutbound[i]
+                        try await sendOpportunistic(&msg)
+                        pendingOutbound[i] = msg
                         appendRouterDebug("[ROUTER] sendOpportunistic completed successfully")
                         print("[LXMF_OPP] sendOpportunistic completed for \(destHashHex)")
-                        messagesToRemove.append(message)
+                        indicesToRemove.insert(i)
 
                         // Update database
-                        Task.detached { [database, message] in
-                            try? await database.updateMessageState(id: message.hash, state: .sent)
+                        let sentMsg = pendingOutbound[i]
+                        Task.detached { [database] in
+                            try? await database.updateMessageState(id: sentMsg.hash, state: .sent)
                         }
                     }
 
                 case .direct:
                     // Direct delivery: over link
-                    let destHashHex = message.destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+                    let destHashHex = pendingOutbound[i].destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
                     appendRouterDebug("[ROUTER] Processing DIRECT message to \(destHashHex)")
-                    let hasPathToRecipient = await hasPath(message.destinationHash)
+                    let hasPathToRecipient = await hasPath(pendingOutbound[i].destinationHash)
                     appendRouterDebug("[ROUTER] hasPath(\(destHashHex))=\(hasPathToRecipient)")
                     print("[LXMF_DIRECT] Checking path to \(destHashHex), hasPath=\(hasPathToRecipient)")
                     if hasPathToRecipient {
-                        // Attempt link-based send
+                        // Attempt link-based send (copy out for inout async call)
                         print("[LXMF_DIRECT] Establishing link to \(destHashHex)")
-                        try await sendDirect(&message)
+                        var msg = pendingOutbound[i]
+                        try await sendDirect(&msg)
+                        pendingOutbound[i] = msg
                         print("[LXMF_DIRECT] Message sent via link to \(destHashHex)")
-                        messagesToRemove.append(message)
+                        indicesToRemove.insert(i)
 
                         // Update database
-                        Task.detached { [database, message] in
-                            try? await database.updateMessageState(id: message.hash, state: .sent)
+                        let sentMsg = pendingOutbound[i]
+                        Task.detached { [database] in
+                            try? await database.updateMessageState(id: sentMsg.hash, state: .sent)
                         }
                     } else {
                         // Need path first
                         print("[LXMF_DIRECT] No path to \(destHashHex), requesting path")
-                        requestPath(message.destinationHash)
-                        message.nextDeliveryAttempt = Date().addingTimeInterval(Self.PATH_REQUEST_WAIT)
+                        requestPath(pendingOutbound[i].destinationHash)
+                        pendingOutbound[i].nextDeliveryAttempt = Date().addingTimeInterval(Self.PATH_REQUEST_WAIT)
                     }
 
                 case .propagated:
-                    // TODO: Propagation node delivery (future plan)
-                    // For now, skip propagated messages
-                    break
+                    let destHashHex = pendingOutbound[i].destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+                    appendRouterDebug("[ROUTER] Processing PROPAGATED message to \(destHashHex)")
+
+                    guard let nodeHash = outboundPropagationNode else {
+                        // Propagation node not yet configured - don't count as attempt, retry soon
+                        appendRouterDebug("[ROUTER] No propagation node set, deferring (will retry in 3s)")
+                        pendingOutbound[i].deliveryAttempts -= 1  // Undo increment
+                        pendingOutbound[i].nextDeliveryAttempt = Date().addingTimeInterval(3)
+                        break
+                    }
+
+                    let hasPathToNode = await hasPath(nodeHash)
+
+                    if hasPathToNode {
+                        var msg = pendingOutbound[i]
+                        try await sendPropagated(&msg)
+                        pendingOutbound[i] = msg
+                        indicesToRemove.insert(i)
+
+                        let sentMsg = pendingOutbound[i]
+                        Task.detached { [database] in
+                            try? await database.updateMessageState(id: sentMsg.hash, state: .sent)
+                        }
+                    } else {
+                        appendRouterDebug("[ROUTER] No path to propagation node, requesting path")
+                        requestPath(nodeHash)
+                        pendingOutbound[i].nextDeliveryAttempt = Date().addingTimeInterval(Self.PATH_REQUEST_WAIT)
+                    }
 
                 default:
                     // Unknown method, skip
@@ -514,14 +561,14 @@ public actor LXMRouter {
             } catch {
                 // Delivery failed, will retry on next cycle
                 // Schedule retry with exponential backoff
-                let backoffSeconds = min(Double(message.deliveryAttempts) * Self.PATH_REQUEST_WAIT, 300.0)
-                message.nextDeliveryAttempt = Date().addingTimeInterval(backoffSeconds)
+                let backoffSeconds = min(Double(pendingOutbound[i].deliveryAttempts) * Self.PATH_REQUEST_WAIT, 300.0)
+                pendingOutbound[i].nextDeliveryAttempt = Date().addingTimeInterval(backoffSeconds)
             }
         }
 
-        // Remove sent messages from pending
-        pendingOutbound.removeAll { message in
-            messagesToRemove.contains { $0.hash == message.hash }
+        // Remove sent/completed messages from pending (reverse order to preserve indices)
+        for i in indicesToRemove.sorted().reversed() {
+            pendingOutbound.remove(at: i)
         }
 
         // Persist state changes
