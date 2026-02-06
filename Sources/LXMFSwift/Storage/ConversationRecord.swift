@@ -42,6 +42,9 @@ public struct ConversationRecord: Codable, FetchableRecord, PersistableRecord {
     /// Record update timestamp
     public var updatedAt: Double
 
+    /// Whether this conversation is marked as favorite/saved contact
+    public var isFavorite: Int
+
     // MARK: - Column Mapping (snake_case to camelCase)
 
     enum CodingKeys: String, CodingKey {
@@ -53,6 +56,7 @@ public struct ConversationRecord: Codable, FetchableRecord, PersistableRecord {
         case isUnread = "is_unread"
         case createdAt = "created_at"
         case updatedAt = "updated_at"
+        case isFavorite = "is_favorite"
     }
 
     // MARK: - Computed Properties
@@ -70,7 +74,8 @@ public struct ConversationRecord: Codable, FetchableRecord, PersistableRecord {
         displayName: String? = nil,
         lastMessageTimestamp: Double,
         lastMessagePreview: String? = nil,
-        unreadCount: Int = 0
+        unreadCount: Int = 0,
+        isFavorite: Bool = false
     ) {
         self.destinationHash = destinationHash
         self.displayName = displayName
@@ -78,6 +83,7 @@ public struct ConversationRecord: Codable, FetchableRecord, PersistableRecord {
         self.lastMessagePreview = lastMessagePreview
         self.unreadCount = unreadCount
         self.isUnread = unreadCount > 0 ? 1 : 0
+        self.isFavorite = isFavorite ? 1 : 0
 
         let now = Date().timeIntervalSince1970
         self.createdAt = now

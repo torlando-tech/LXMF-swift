@@ -98,6 +98,13 @@ public actor LXMFDatabase {
                          columns: ["last_message_timestamp"])
         }
 
+        // v2: Add is_favorite column to conversations
+        migrator.registerMigration("v2_add_favorite") { db in
+            try db.alter(table: "conversations") { t in
+                t.add(column: "is_favorite", .integer).defaults(to: 0)
+            }
+        }
+
         try migrator.migrate(dbPool)
     }
 
@@ -284,6 +291,25 @@ public actor LXMFDatabase {
                 )
                 try conversation.insert(db)
             }
+        }
+    }
+
+    /// Set favorite status for a conversation.
+    ///
+    /// - Parameters:
+    ///   - hash: Destination hash (16 bytes)
+    ///   - isFavorite: Whether to mark as favorite
+    /// - Throws: DatabaseError
+    public func setFavorite(hash: Data, isFavorite: Bool) throws {
+        try dbPool.write { db in
+            try db.execute(
+                sql: """
+                    UPDATE conversations
+                    SET is_favorite = ?, updated_at = ?
+                    WHERE destination_hash = ?
+                    """,
+                arguments: [isFavorite ? 1 : 0, Date().timeIntervalSince1970, hash]
+            )
         }
     }
 
