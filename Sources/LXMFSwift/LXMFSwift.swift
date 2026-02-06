@@ -2,20 +2,15 @@
 //  LXMFSwift.swift
 //  LXMFSwift
 //
-//  Re-export file for LXMFSwift package.
-//  Apps importing LXMFSwift automatically get access to ReticulumSwift types.
-//
-//  Usage:
-//  ```swift
-//  import LXMFSwift
-//  // Now you have access to both LXMF and Reticulum types
-//  ```
+//  Entry point for LXMFSwift package.
+//  Provides LXMF messaging types (router, messages, database).
+//  For network connectivity types (interfaces, transport, identity),
+//  import ReticulumSwift directly.
 //
 
 import Foundation
 
-// Re-export ReticulumSwift so consumers don't need to import both packages
-@_exported import ReticulumSwift
+import ReticulumSwift
 
 // MARK: - LXMF Types
 
