@@ -10,7 +10,7 @@
 
 import Foundation
 
-import ReticulumSwift
+@_exported import ReticulumSwift
 
 // MARK: - LXMF Types
 
