@@ -172,6 +172,15 @@ public struct LXMessage {
                     fieldsMap[keyValue] = .string(stringValue)
                 } else if let intValue = value as? Int {
                     fieldsMap[keyValue] = .int(Int64(intValue))
+                } else if let arrayValue = value as? [Any] {
+                    // Convert array to MessagePack (for Field 4 icon appearance, etc.)
+                    var msgpackArray: [LXMFMessagePackValue] = []
+                    for item in arrayValue {
+                        if let s = item as? String { msgpackArray.append(.string(s)) }
+                        else if let d = item as? Data { msgpackArray.append(.binary(d)) }
+                        else if let i = item as? Int { msgpackArray.append(.int(Int64(i))) }
+                    }
+                    fieldsMap[keyValue] = .array(msgpackArray)
                 } else if let dictValue = value as? [String: Any] {
                     // Convert nested dict to MessagePack
                     var nestedMap: [LXMFMessagePackValue: LXMFMessagePackValue] = [:]
@@ -316,6 +325,19 @@ public struct LXMessage {
                         extractedFields[keyByte] = str
                     case .int(let int):
                         extractedFields[keyByte] = int
+                    case .array(let arr):
+                        // Convert msgpack array to [Any] (for Field 4 icon appearance, etc.)
+                        var swiftArray: [Any] = []
+                        for item in arr {
+                            switch item {
+                            case .string(let s): swiftArray.append(s)
+                            case .binary(let d): swiftArray.append(d)
+                            case .int(let i): swiftArray.append(i)
+                            case .uint(let u): swiftArray.append(u)
+                            default: break
+                            }
+                        }
+                        extractedFields[keyByte] = swiftArray
                     case .map(let nestedMap):
                         // Convert nested map to [String: Any]
                         var nestedDict: [String: Any] = [:]

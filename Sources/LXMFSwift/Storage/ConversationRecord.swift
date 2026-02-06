@@ -45,6 +45,15 @@ public struct ConversationRecord: Codable, FetchableRecord, PersistableRecord {
     /// Whether this conversation is marked as favorite/saved contact
     public var isFavorite: Int
 
+    /// MDI icon name for peer's profile icon (from LXMF Field 4)
+    public var iconName: String?
+
+    /// Foreground color hex for peer's icon (6 chars, e.g., "FFFFFF")
+    public var iconFgColor: String?
+
+    /// Background color hex for peer's icon (6 chars, e.g., "1E88E5")
+    public var iconBgColor: String?
+
     // MARK: - Column Mapping (snake_case to camelCase)
 
     enum CodingKeys: String, CodingKey {
@@ -57,6 +66,9 @@ public struct ConversationRecord: Codable, FetchableRecord, PersistableRecord {
         case createdAt = "created_at"
         case updatedAt = "updated_at"
         case isFavorite = "is_favorite"
+        case iconName = "icon_name"
+        case iconFgColor = "icon_fg_color"
+        case iconBgColor = "icon_bg_color"
     }
 
     // MARK: - Computed Properties

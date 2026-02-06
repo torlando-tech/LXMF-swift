@@ -105,6 +105,15 @@ public actor LXMFDatabase {
             }
         }
 
+        // v3: Add icon appearance columns to conversations
+        migrator.registerMigration("v3_add_icon_appearance") { db in
+            try db.alter(table: "conversations") { t in
+                t.add(column: "icon_name", .text)
+                t.add(column: "icon_fg_color", .text)
+                t.add(column: "icon_bg_color", .text)
+            }
+        }
+
         try migrator.migrate(dbPool)
     }
 
@@ -356,6 +365,46 @@ public actor LXMFDatabase {
                 .fetchAll(db)
 
             return try records.map { try $0.toLXMessage() }
+        }
+    }
+
+    // MARK: - Icon Appearance
+
+    /// Update peer icon appearance for a conversation.
+    ///
+    /// - Parameters:
+    ///   - hash: Destination hash (16 bytes)
+    ///   - iconName: MDI icon name
+    ///   - fgColor: Foreground color hex (6 chars)
+    ///   - bgColor: Background color hex (6 chars)
+    /// - Throws: DatabaseError
+    public func updatePeerIcon(_ hash: Data, iconName: String, fgColor: String, bgColor: String) throws {
+        try dbPool.write { db in
+            try db.execute(
+                sql: """
+                    UPDATE conversations
+                    SET icon_name = ?, icon_fg_color = ?, icon_bg_color = ?, updated_at = ?
+                    WHERE destination_hash = ?
+                    """,
+                arguments: [iconName, fgColor, bgColor, Date().timeIntervalSince1970, hash]
+            )
+        }
+    }
+
+    /// Get peer icon appearance for a conversation.
+    ///
+    /// - Parameter hash: Destination hash (16 bytes)
+    /// - Returns: IconAppearance if set, nil otherwise
+    /// - Throws: DatabaseError
+    public func getPeerIcon(_ hash: Data) throws -> IconAppearance? {
+        try dbPool.read { db in
+            guard let record = try ConversationRecord
+                .filter(Column("destination_hash") == hash)
+                .fetchOne(db) else { return nil }
+            guard let name = record.iconName,
+                  let fg = record.iconFgColor,
+                  let bg = record.iconBgColor else { return nil }
+            return IconAppearance(iconName: name, foregroundColor: fg, backgroundColor: bg)
         }
     }
 
