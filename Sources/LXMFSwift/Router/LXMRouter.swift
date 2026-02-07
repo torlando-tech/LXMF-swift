@@ -15,21 +15,6 @@ import Foundation
 import CryptoKit
 import ReticulumSwift
 
-/// Helper to append debug messages to file
-private func appendRouterDebug(_ message: String) {
-    let line = "[\(Date())] \(message)\n"
-    let path = "/tmp/columba_router_debug.log"
-    if let handle = FileHandle(forWritingAtPath: path) {
-        handle.seekToEndOfFile()
-        if let data = line.data(using: .utf8) {
-            handle.write(data)
-        }
-        handle.closeFile()
-    } else {
-        try? line.write(toFile: path, atomically: true, encoding: .utf8)
-    }
-}
-
 /// LXMF message router actor.
 ///
 /// Manages outbound message queues, processes delivery attempts, handles incoming messages,
@@ -193,7 +178,6 @@ public actor LXMRouter {
     /// The router must have a new transport set before calling this.
     public func restart() {
         isShutdown = false
-        appendRouterDebug("[ROUTER] restart() called, isShutdown=false")
     }
 
     // MARK: - Transport Management
@@ -243,9 +227,6 @@ public actor LXMRouter {
     ///
     /// Reference: Python LXMRouter.handle_outbound() lines 1627-1672
     public func handleOutbound(_ message: inout LXMessage) async throws {
-        let destHex = message.destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-        appendRouterDebug("[ROUTER] handleOutbound called for dest=\(destHex), method=\(message.method)")
-
         // Set state to OUTBOUND
         message.state = .outbound
 
@@ -395,17 +376,13 @@ public actor LXMRouter {
     ///
     /// Reference: Python LXMRouter.process_outbound() lines 2496-2700
     public func processOutbound() async {
-        appendRouterDebug("[ROUTER] processOutbound called, pending=\(pendingOutbound.count)")
-
         // Don't process if shutdown
         guard !isShutdown else {
-            appendRouterDebug("[ROUTER] shutdown flag set, skipping")
             return
         }
 
         // Guard against reentrant calls
         guard !processingOutbound else {
-            appendRouterDebug("[ROUTER] already processing, skipping")
             return
         }
         processingOutbound = true
@@ -449,13 +426,8 @@ public actor LXMRouter {
             let destHex = pendingOutbound[i].destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
             let shouldAttempt = shouldAttemptDelivery(pendingOutbound[i])
             if !shouldAttempt {
-                if let nextAttempt = pendingOutbound[i].nextDeliveryAttempt {
-                    let waitTime = nextAttempt.timeIntervalSince(Date())
-                    appendRouterDebug("[ROUTER] Skipping \(destHex) - wait \(Int(waitTime))s until next attempt")
-                }
                 continue
             }
-            appendRouterDebug("[ROUTER] Attempting delivery to \(destHex), method=\(pendingOutbound[i].method)")
 
             // Increment delivery attempts
             pendingOutbound[i].deliveryAttempts += 1
@@ -466,26 +438,21 @@ public actor LXMRouter {
                 case .opportunistic:
                     // Opportunistic delivery: single packet via transport
                     let destHashHex = pendingOutbound[i].destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-                    appendRouterDebug("[ROUTER] Processing OPPORTUNISTIC message to \(destHashHex)")
                     print("[LXMF_OPP] Processing opportunistic to \(destHashHex), attempts=\(pendingOutbound[i].deliveryAttempts)")
 
                     // Check if we need path and don't have one
                     let hasPathForOpp = await hasPath(pendingOutbound[i].destinationHash)
-                    appendRouterDebug("[ROUTER] hasPath(\(destHashHex))=\(hasPathForOpp), attempts=\(pendingOutbound[i].deliveryAttempts)")
 
                     if pendingOutbound[i].deliveryAttempts >= Self.MAX_PATHLESS_TRIES, !hasPathForOpp {
                         // Request path and wait
-                        appendRouterDebug("[ROUTER] No path after \(pendingOutbound[i].deliveryAttempts) tries, requesting path")
                         requestPath(pendingOutbound[i].destinationHash)
                         pendingOutbound[i].nextDeliveryAttempt = Date().addingTimeInterval(Self.PATH_REQUEST_WAIT)
                     } else {
                         // Attempt send (copy out for inout async call, then write back)
-                        appendRouterDebug("[ROUTER] Calling sendOpportunistic...")
                         print("[LXMF_OPP] Calling sendOpportunistic for \(destHashHex)")
                         var msg = pendingOutbound[i]
                         try await sendOpportunistic(&msg)
                         pendingOutbound[i] = msg
-                        appendRouterDebug("[ROUTER] sendOpportunistic completed successfully")
                         print("[LXMF_OPP] sendOpportunistic completed for \(destHashHex)")
                         indicesToRemove.insert(i)
 
@@ -499,9 +466,7 @@ public actor LXMRouter {
                 case .direct:
                     // Direct delivery: over link
                     let destHashHex = pendingOutbound[i].destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-                    appendRouterDebug("[ROUTER] Processing DIRECT message to \(destHashHex)")
                     let hasPathToRecipient = await hasPath(pendingOutbound[i].destinationHash)
-                    appendRouterDebug("[ROUTER] hasPath(\(destHashHex))=\(hasPathToRecipient)")
                     print("[LXMF_DIRECT] Checking path to \(destHashHex), hasPath=\(hasPathToRecipient)")
                     if hasPathToRecipient {
                         // Attempt link-based send (copy out for inout async call)
@@ -526,11 +491,9 @@ public actor LXMRouter {
 
                 case .propagated:
                     let destHashHex = pendingOutbound[i].destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-                    appendRouterDebug("[ROUTER] Processing PROPAGATED message to \(destHashHex)")
 
                     guard let nodeHash = outboundPropagationNode else {
                         // Propagation node not yet configured - don't count as attempt, retry soon
-                        appendRouterDebug("[ROUTER] No propagation node set, deferring (will retry in 3s)")
                         pendingOutbound[i].deliveryAttempts -= 1  // Undo increment
                         pendingOutbound[i].nextDeliveryAttempt = Date().addingTimeInterval(3)
                         break
@@ -549,7 +512,6 @@ public actor LXMRouter {
                             try? await database.updateMessageState(id: sentMsg.hash, state: .sent)
                         }
                     } else {
-                        appendRouterDebug("[ROUTER] No path to propagation node, requesting path")
                         requestPath(nodeHash)
                         pendingOutbound[i].nextDeliveryAttempt = Date().addingTimeInterval(Self.PATH_REQUEST_WAIT)
                     }

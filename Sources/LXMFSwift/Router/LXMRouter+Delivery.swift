@@ -12,21 +12,6 @@ import Foundation
 import CryptoKit
 import ReticulumSwift
 
-/// Helper to append debug messages to file (Delivery extension)
-private func appendDeliveryDebug(_ message: String) {
-    let line = "[\(Date())] \(message)\n"
-    let path = "/tmp/columba_router_debug.log"
-    if let handle = FileHandle(forWritingAtPath: path) {
-        handle.seekToEndOfFile()
-        if let data = line.data(using: .utf8) {
-            handle.write(data)
-        }
-        handle.closeFile()
-    } else {
-        try? line.write(toFile: path, atomically: true, encoding: .utf8)
-    }
-}
-
 /// LXMF message context byte for link packets
 public enum LXMFContext {
     /// LXMF message context (value from Python: 0xF2)
@@ -58,31 +43,23 @@ extension LXMRouter {
     /// Reference: Python LXMRouter opportunistic send (lines 2600-2630)
     /// Reference: RNS Identity.encrypt() for SINGLE destination encryption
     public func sendOpportunistic(_ message: inout LXMessage) async throws {
-        appendDeliveryDebug("[OPP_SEND] Starting sendOpportunistic")
-
         guard let transport = self.transport else {
-            appendDeliveryDebug("[OPP_SEND] ERROR: transport not available")
             throw LXMFError.transportNotAvailable
         }
 
         guard let pathTable = self.pathTable else {
-            appendDeliveryDebug("[OPP_SEND] ERROR: pathTable not available")
             throw LXMFError.transportNotAvailable
         }
 
         guard let packed = message.packed else {
-            appendDeliveryDebug("[OPP_SEND] ERROR: message not packed (packed=nil)")
             throw LXMFError.notPacked
         }
-        appendDeliveryDebug("[OPP_SEND] Message packed, \(packed.count) bytes")
 
         // Look up path entry for destination to get their public key
         let destHex = message.destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
         guard let pathEntry = await pathTable.lookup(destinationHash: message.destinationHash) else {
-            appendDeliveryDebug("[OPP_SEND] ERROR: no path entry for \(destHex)")
             throw LXMFError.destinationNotFound
         }
-        appendDeliveryDebug("[OPP_SEND] Found path entry for \(destHex), hops=\(pathEntry.hopCount)")
 
         // Get recipient's encryption public key (use ratchet if available, otherwise base key)
         // When a destination announces with a ratchet, we MUST use the ratchet key for
@@ -116,7 +93,6 @@ extension LXMRouter {
         // Encrypt data to recipient's public key using SINGLE destination encryption
         // Output format: [ephemeral_pub 32B][IV 16B][ciphertext][HMAC 32B]
         // NOTE: The HKDF salt is the IDENTITY hash (from public keys), NOT the destination hash!
-        appendDeliveryDebug("[OPP_SEND] Encrypting \(plaintextData.count) bytes")
         let encryptedData: Data
         do {
             encryptedData = try Identity.encrypt(
@@ -124,9 +100,7 @@ extension LXMRouter {
                 to: recipientEncryptionPubKey,
                 identityHash: identityHash  // Use identity hash as HKDF salt per Python RNS
             )
-            appendDeliveryDebug("[OPP_SEND] Encrypted to \(encryptedData.count) bytes")
         } catch {
-            appendDeliveryDebug("[OPP_SEND] ERROR: encryption failed: \(error)")
             throw LXMFError.encodingFailed("Encryption failed: \(error.localizedDescription)")
         }
 
@@ -155,12 +129,9 @@ extension LXMRouter {
         message.state = .sending
 
         // Send via transport
-        appendDeliveryDebug("[OPP_SEND] Sending packet via transport...")
         do {
             try await transport.send(packet: packet)
-            appendDeliveryDebug("[OPP_SEND] Packet sent successfully!")
         } catch {
-            appendDeliveryDebug("[OPP_SEND] ERROR: transport.send failed: \(error)")
             throw error
         }
 
@@ -169,7 +140,6 @@ extension LXMRouter {
 
         // Notify delegate
         notifyUpdate(message)
-        appendDeliveryDebug("[OPP_SEND] Message marked as sent")
     }
 
     // MARK: - Direct Delivery
@@ -186,66 +156,51 @@ extension LXMRouter {
     /// Reference: Python LXMRouter direct send (lines 2630-2680)
     public func sendDirect(_ message: inout LXMessage) async throws {
         let destHashHex = message.destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-        appendDeliveryDebug("[DELIVERY] sendDirect called for \(destHashHex)")
 
         guard let transport = self.transport else {
-            appendDeliveryDebug("[DELIVERY] ERROR: transport is nil")
             print("[LXMF_DIRECT] Error: transport not available")
             throw LXMFError.transportNotAvailable
         }
-        appendDeliveryDebug("[DELIVERY] transport is available")
 
         guard let packed = message.packed else {
-            appendDeliveryDebug("[DELIVERY] ERROR: message not packed")
             print("[LXMF_DIRECT] Error: message not packed")
             throw LXMFError.notPacked
         }
-        appendDeliveryDebug("[DELIVERY] message packed, size=\(packed.count)")
 
         // Get or establish link to destination
-        appendDeliveryDebug("[DELIVERY] Getting/establishing link to \(destHashHex)")
         print("[LXMF_DIRECT] sendDirect: getting/establishing link to \(destHashHex)")
         let link: Link
         do {
             link = try await getOrEstablishLink(to: message.destinationHash, transport: transport)
             print("[LXMF_DIRECT] sendDirect: link established to \(destHashHex)")
-            appendDeliveryDebug("[DIRECT] Link established to \(destHashHex)")
         } catch {
             print("[LXMF_DIRECT] sendDirect: link establishment failed: \(error)")
-            appendDeliveryDebug("[DIRECT] Link establishment FAILED: \(error)")
             throw error
         }
 
         // Identify ourselves to the remote peer so they can respond
         // This sends our public keys over the link, enabling bidirectional LXMF
-        appendDeliveryDebug("[DIRECT] Calling link.identify()")
         do {
             try await link.identify(identity: identity)
             print("[LXMF_DIRECT] sendDirect: identified to remote peer")
-            appendDeliveryDebug("[DIRECT] identify() succeeded")
         } catch {
             // Identification failure is not fatal - message can still be delivered
             // but the remote may not be able to respond
             print("[LXMF_DIRECT] sendDirect: identify failed (non-fatal): \(error)")
-            appendDeliveryDebug("[DIRECT] identify() FAILED (non-fatal): \(error)")
         }
 
         // Update message state
         message.state = .sending
-        appendDeliveryDebug("[DIRECT] Message state -> sending, packed.count=\(packed.count)")
 
         // Send based on message size
         if packed.count <= LXMFConstants.LINK_PACKET_MAX_CONTENT {
             // Small enough for link DATA packet
             // IMPORTANT: Link packets must be encrypted using the link's derived key
-            appendDeliveryDebug("[DIRECT] Encrypting \(packed.count) bytes for link")
             let encrypted: Data
             do {
                 encrypted = try await link.encrypt(packed)
                 print("[LXMF_DIRECT] Encrypted \(packed.count) bytes to \(encrypted.count) bytes for link")
-                appendDeliveryDebug("[DIRECT] Encrypted to \(encrypted.count) bytes")
             } catch {
-                appendDeliveryDebug("[DIRECT] ENCRYPT FAILED: \(error)")
                 throw error
             }
 
@@ -258,7 +213,6 @@ extension LXMRouter {
             // Get destination hash for path lookup (to determine if we need HEADER_2)
             let destHash = await link.destinationHash
             let destHashHex = destHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-            appendDeliveryDebug("[DIRECT] Creating DATA packet: linkId=\(linkIdHex), destHash=\(destHashHex)")
 
             // Create HEADER_1 packet - transport.send() will convert to HEADER_2 if needed
             // by looking up the destination path
@@ -281,24 +235,18 @@ extension LXMRouter {
                 data: encrypted
             )
 
-            appendDeliveryDebug("[DIRECT] Sending DATA packet via transport (destHash=\(destHashHex) for routing)")
             try await transport.sendLinkData(packet: packet, destinationHash: destHash)
-            appendDeliveryDebug("[DIRECT] DATA packet sent successfully")
         } else {
             // Need Resource for large message
             // Link.sendResource handles chunking and transfer
-            appendDeliveryDebug("[DIRECT] Message too large (\(packed.count) bytes), using Resource")
             try await link.sendResource(data: packed, requestId: nil, isResponse: false)
-            appendDeliveryDebug("[DIRECT] Resource transfer complete")
         }
 
         // Mark as sent
         message.state = .sent
-        appendDeliveryDebug("[DIRECT] Message state -> sent")
 
         // Notify delegate
         notifyUpdate(message)
-        appendDeliveryDebug("[DIRECT] Delegate notified, sendDirect complete")
     }
 
     // MARK: - Link Management
@@ -322,32 +270,26 @@ extension LXMRouter {
     /// Reference: RNS Link.py, Python LXMF LXMRouter direct delivery
     private func getOrEstablishLink(to destinationHash: Data, transport: ReticuLumTransport) async throws -> Link {
         let destHex = destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-        appendDeliveryDebug("[LINK] getOrEstablishLink to \(destHex)")
 
         // Check for existing delivery link
         if let link = deliveryLinks[destinationHash] {
             // Verify link is still active
             let state = await link.state
-            appendDeliveryDebug("[LINK] Found existing link, state=\(state)")
             if state == .active {
                 return link
             }
             // Remove stale link
-            appendDeliveryDebug("[LINK] Removing stale link")
             deliveryLinks.removeValue(forKey: destinationHash)
         }
 
         // Look up path entry to get recipient's public keys
         guard let pathTable = self.pathTable else {
-            appendDeliveryDebug("[LINK] ERROR: pathTable is nil")
             throw LXMFError.transportNotAvailable
         }
 
         guard let pathEntry = await pathTable.lookup(destinationHash: destinationHash) else {
-            appendDeliveryDebug("[LINK] ERROR: path entry not found for \(destHex)")
             throw LXMFError.destinationNotFound
         }
-        appendDeliveryDebug("[LINK] Found path entry, publicKeys len=\(pathEntry.publicKeys.count)")
 
         // Create public-key-only Identity from path entry's public keys
         let recipientIdentity: Identity
@@ -390,7 +332,6 @@ extension LXMRouter {
 
         // Get local identity for link initiation (from LXMRouter's identity)
         let localIdentity = getLinkIdentity()
-        appendDeliveryDebug("[LINK] Got local identity, initiating link")
 
         // Use transport's initiateLink which properly registers the link
         // in pendingLinks so PROOF packets can be routed to it
@@ -399,9 +340,7 @@ extension LXMRouter {
             link = try await transport.initiateLink(to: destination, identity: localIdentity)
             let linkId = await link.linkId
             let linkIdHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
-            appendDeliveryDebug("[LINK] Link initiated, linkId=\(linkIdHex)")
         } catch {
-            appendDeliveryDebug("[LINK] ERROR: initiateLink failed: \(error)")
             throw error
         }
 
@@ -411,12 +350,9 @@ extension LXMRouter {
         // Wait for link to become active (with timeout)
         // Link will transition: pending -> handshake -> active
         // when PROOF packet is received
-        appendDeliveryDebug("[LINK] Waiting for link to become active")
         do {
             try await waitForLinkActive(link, timeout: LXMFConstants.LINK_ESTABLISHMENT_TIMEOUT)
-            appendDeliveryDebug("[LINK] Link is now active")
         } catch {
-            appendDeliveryDebug("[LINK] ERROR: waitForLinkActive failed: \(error)")
             throw error
         }
 

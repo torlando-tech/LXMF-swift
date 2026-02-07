@@ -13,21 +13,6 @@
 import Foundation
 import ReticulumSwift
 
-/// Helper for sync debug logging.
-private func appendSyncDebug(_ message: String) {
-    let line = "[\(Date())] \(message)\n"
-    let path = "/tmp/columba_sync_debug.log"
-    if let handle = FileHandle(forWritingAtPath: path) {
-        handle.seekToEndOfFile()
-        if let data = line.data(using: .utf8) {
-            handle.write(data)
-        }
-        handle.closeFile()
-    } else {
-        try? line.write(toFile: path, atomically: true, encoding: .utf8)
-    }
-}
-
 extension LXMRouter {
 
     // MARK: - Sync from Propagation Node
@@ -43,8 +28,6 @@ extension LXMRouter {
     ///
     /// - Throws: LXMFError if propagation node not set, link fails, or sync fails
     public func syncFromPropagationNode() async throws {
-        appendSyncDebug("[SYNC] Starting syncFromPropagationNode")
-
         guard let propagationNode = outboundPropagationNode else {
             syncState.state = .noPath
             syncState.errorDescription = "No propagation node configured"
@@ -63,7 +46,6 @@ extension LXMRouter {
         notifySyncStateUpdate()
 
         let nodeHex = propagationNode.prefix(8).map { String(format: "%02x", $0) }.joined()
-        appendSyncDebug("[SYNC] Syncing from propagation node \(nodeHex)")
 
         // Establish link to propagation node
         let link: Link
@@ -71,7 +53,6 @@ extension LXMRouter {
             link = try await getOrEstablishPropagationLink(to: propagationNode, transport: transport)
             syncState.state = .linkEstablished
             notifySyncStateUpdate()
-            appendSyncDebug("[SYNC] Link established")
         } catch {
             syncState.state = .linkFailed
             syncState.errorDescription = error.localizedDescription
@@ -82,15 +63,13 @@ extension LXMRouter {
         // Identify ourselves
         do {
             try await link.identify(identity: identity)
-            appendSyncDebug("[SYNC] Identified to node")
         } catch {
-            appendSyncDebug("[SYNC] identify() failed (non-fatal): \(error)")
+            // Non-fatal
         }
 
         // Step 1: LIST - get transient IDs from node
         syncState.state = .requestSent
         notifySyncStateUpdate()
-        appendSyncDebug("[SYNC] Step 1: Requesting message list")
 
         let listRequestData = packLXMF(.array([.null, .null]))
         let listReceipt: RequestReceipt
@@ -110,14 +89,12 @@ extension LXMRouter {
         // Wait for LIST response
         let listResponse = try await waitForRequestResponse(listReceipt)
         let transientIds = parseTransientIdList(listResponse)
-        appendSyncDebug("[SYNC] Step 1 complete: \(transientIds.count) messages available")
 
         if transientIds.isEmpty {
             syncState.state = .complete
             syncState.lastSync = Date()
             notifySyncStateUpdate()
             notifySyncCompletion(newMessageCount: 0)
-            appendSyncDebug("[SYNC] No messages to sync")
             return
         }
 
@@ -128,11 +105,9 @@ extension LXMRouter {
         // Filter out messages we already have
         let wantIds = filterTransientIds(transientIds)
         let haveIds = transientIds.filter { !wantIds.contains($0) }
-        appendSyncDebug("[SYNC] Want \(wantIds.count), have \(haveIds.count)")
 
         if wantIds.isEmpty {
             // We have all messages already, just ACK
-            appendSyncDebug("[SYNC] Already have all messages, sending ACK")
             try await sendSyncAck(link: link, ackIds: transientIds)
             syncState.state = .complete
             syncState.lastSync = Date()
@@ -142,8 +117,6 @@ extension LXMRouter {
         }
 
         // Step 2: WANT/HAVE - request messages we need
-        appendSyncDebug("[SYNC] Step 2: Requesting \(wantIds.count) messages")
-
         let wantArray = LXMFMessagePackValue.array(wantIds.map { .binary($0) })
         let haveArray = LXMFMessagePackValue.array(haveIds.map { .binary($0) })
         let limit = LXMFMessagePackValue.uint(UInt64(PropagationConstants.DEFAULT_PER_TRANSFER_LIMIT))
@@ -166,7 +139,6 @@ extension LXMRouter {
         // Wait for WANT response (array of message data)
         let wantResponse = try await waitForRequestResponse(wantReceipt)
         let receivedMessages = parseMessageDataArray(wantResponse)
-        appendSyncDebug("[SYNC] Step 2 complete: received \(receivedMessages.count) messages")
 
         // Process received messages through lxmfDelivery
         var newMessageCount = 0
@@ -188,10 +160,7 @@ extension LXMRouter {
         // Also ACK messages we already had
         ackIds.append(contentsOf: haveIds)
 
-        appendSyncDebug("[SYNC] Processed \(newMessageCount) new messages")
-
         // Step 3: ACK - tell node to delete received messages
-        appendSyncDebug("[SYNC] Step 3: Sending ACK for \(ackIds.count) messages")
         try await sendSyncAck(link: link, ackIds: ackIds)
 
         // Complete
@@ -199,7 +168,6 @@ extension LXMRouter {
         syncState.lastSync = Date()
         notifySyncStateUpdate()
         notifySyncCompletion(newMessageCount: newMessageCount)
-        appendSyncDebug("[SYNC] Sync complete: \(newMessageCount) new messages")
     }
 
     // MARK: - Sync Helpers
