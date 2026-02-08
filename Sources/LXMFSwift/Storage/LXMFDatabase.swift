@@ -334,6 +334,28 @@ public actor LXMFDatabase {
         }
     }
 
+    /// Get raw message records for conversation (no LXMessage unpacking).
+    ///
+    /// Returns lightweight MessageRecord structs directly from database,
+    /// avoiding expensive MessagePack decode + SHA256 + Ed25519 verification.
+    /// Use this for UI display paths where only metadata is needed.
+    ///
+    /// - Parameters:
+    ///   - hash: Conversation destination hash (16 bytes)
+    ///   - limit: Maximum number of records to return
+    ///   - offset: Number of records to skip
+    /// - Returns: Array of MessageRecord
+    /// - Throws: DatabaseError
+    public func getMessageRecords(forConversation hash: Data, limit: Int = 50, offset: Int = 0) throws -> [MessageRecord] {
+        try dbPool.read { db in
+            try MessageRecord
+                .filter(Column("conversation_hash") == hash)
+                .order(Column("timestamp").desc)
+                .limit(limit, offset: offset)
+                .fetchAll(db)
+        }
+    }
+
     /// Load pending outbound messages.
     ///
     /// Returns messages in OUTBOUND state for router to send.
