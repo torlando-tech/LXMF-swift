@@ -424,17 +424,21 @@ public actor LXMFDatabase {
             .filter(Column("destination_hash") == conversationHash)
             .fetchOne(db) {
 
-            // Update existing conversation
-            conversation.lastMessageTimestamp = message.timestamp
-            conversation.updatedAt = Date().timeIntervalSince1970
+            // Only update preview/timestamp if this message is newer (or equal).
+            // This prevents an older outbound save from overwriting a newer
+            // incoming message's preview when saves race.
+            if message.timestamp >= conversation.lastMessageTimestamp {
+                conversation.lastMessageTimestamp = message.timestamp
+                conversation.updatedAt = Date().timeIntervalSince1970
 
-            // Generate preview (first 100 chars of content as UTF-8 string)
-            if let contentStr = String(data: message.content, encoding: .utf8) {
-                let preview = String(contentStr.prefix(100))
-                conversation.lastMessagePreview = preview
+                // Generate preview (first 100 chars of content as UTF-8 string)
+                if let contentStr = String(data: message.content, encoding: .utf8) {
+                    let preview = String(contentStr.prefix(100))
+                    conversation.lastMessagePreview = preview
+                }
             }
 
-            // Increment unread count if incoming
+            // Increment unread count if incoming (regardless of timestamp)
             if message.incoming {
                 conversation.unreadCount += 1
                 conversation.isUnread = 1
