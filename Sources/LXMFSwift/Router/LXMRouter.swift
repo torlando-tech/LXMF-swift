@@ -241,6 +241,19 @@ public actor LXMRouter {
             _ = try message.pack()
         }
 
+        // Auto-fallback from opportunistic if message exceeds single-packet limit.
+        // For opportunistic, the data sent is packed[DEST_LENGTH:] which must fit in a single
+        // encrypted RNS packet. If too large, use the fallbackMethod (.direct or .propagated).
+        // Reference: Python LXMessage.pack() lines 400-406
+        if message.method == .opportunistic, let packed = message.packed {
+            let packedPayloadSize = packed.count - (2 * LXMFConstants.DESTINATION_LENGTH + LXMFConstants.SIGNATURE_LENGTH)
+            if packedPayloadSize > LXMFConstants.ENCRYPTED_PACKET_MAX_CONTENT {
+                let fallback = message.fallbackMethod ?? .direct
+                print("[LXMF] Message too large for opportunistic (\(packedPayloadSize) > \(LXMFConstants.ENCRYPTED_PACKET_MAX_CONTENT)), falling back to \(fallback)")
+                message.method = fallback
+            }
+        }
+
         // Add to pending outbound queue
         pendingOutbound.append(message)
 

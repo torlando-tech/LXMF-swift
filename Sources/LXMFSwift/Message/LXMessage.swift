@@ -84,6 +84,12 @@ public struct LXMessage {
     /// Delivery progress (0.0 to 1.0)
     public var progress: Double = 0.0
 
+    /// Fallback method when opportunistic can't be used (message too large).
+    /// Set by the app layer to control large-message behavior:
+    /// - .direct: try link-based delivery, then propagation on failure
+    /// - .propagated: skip direct, go straight to propagation node
+    public var fallbackMethod: LXDeliveryMethod?
+
     /// Physical layer statistics (for received messages)
     public var rssi: Double?
     public var snr: Double?
