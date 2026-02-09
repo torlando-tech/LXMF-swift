@@ -11,6 +11,9 @@
 import Foundation
 import CryptoKit
 import ReticulumSwift
+import os.log
+
+private let directSendLogger = Logger(subsystem: "com.columba.app", category: "DirectSend")
 
 /// LXMF message context byte for link packets
 public enum LXMFContext {
@@ -157,40 +160,45 @@ extension LXMRouter {
     public func sendDirect(_ message: inout LXMessage) async throws {
         let destHashHex = message.destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
 
+        let packedSize = message.packed?.count ?? 0
+        let method = String(describing: message.method)
+        directSendLogger.info("[DIRECT] sendDirect called: dest=\(destHashHex), packed=\(packedSize) bytes, method=\(method)")
+
         guard let transport = self.transport else {
-            print("[LXMF_DIRECT] Error: transport not available")
+            directSendLogger.error("[DIRECT] transport not available")
             throw LXMFError.transportNotAvailable
         }
 
         guard let packed = message.packed else {
-            print("[LXMF_DIRECT] Error: message not packed")
+            directSendLogger.error("[DIRECT] message not packed")
             throw LXMFError.notPacked
         }
 
         // Get or establish link to destination
-        print("[LXMF_DIRECT] sendDirect: getting/establishing link to \(destHashHex)")
+        directSendLogger.info("[DIRECT] getting/establishing link to \(destHashHex)")
         let link: Link
         do {
             link = try await getOrEstablishLink(to: message.destinationHash, transport: transport)
-            print("[LXMF_DIRECT] sendDirect: link established to \(destHashHex)")
+            let linkId = await link.linkId
+            let linkIdHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
+            directSendLogger.info("[DIRECT] link established: linkId=\(linkIdHex)")
         } catch {
-            print("[LXMF_DIRECT] sendDirect: link establishment failed: \(error)")
+            directSendLogger.error("[DIRECT] link establishment failed: \(error)")
             throw error
         }
 
         // Identify ourselves to the remote peer so they can respond
-        // This sends our public keys over the link, enabling bidirectional LXMF
         do {
             try await link.identify(identity: identity)
-            print("[LXMF_DIRECT] sendDirect: identified to remote peer")
+            directSendLogger.info("[DIRECT] identified to remote peer")
         } catch {
-            // Identification failure is not fatal - message can still be delivered
-            // but the remote may not be able to respond
-            print("[LXMF_DIRECT] sendDirect: identify failed (non-fatal): \(error)")
+            directSendLogger.warning("[DIRECT] identify failed (non-fatal): \(error)")
         }
 
         // Update message state
         message.state = .sending
+
+        directSendLogger.info("[DIRECT] packed size=\(packed.count), LINK_PACKET_MAX=\(LXMFConstants.LINK_PACKET_MAX_CONTENT)")
 
         // Send based on message size
         if packed.count <= LXMFConstants.LINK_PACKET_MAX_CONTENT {
@@ -238,12 +246,17 @@ extension LXMRouter {
             try await transport.sendLinkData(packet: packet, destinationHash: destHash)
         } else {
             // Need Resource for large message
-            // Link.sendResource handles chunking and transfer
-            try await link.sendResource(data: packed, requestId: nil, isResponse: false)
+            directSendLogger.info("[DIRECT] Message too large for link packet (\(packed.count) > \(LXMFConstants.LINK_PACKET_MAX_CONTENT)), using Resource transfer")
+            let resource = try await link.sendResource(data: packed, requestId: nil, isResponse: false)
+            let numParts = await resource.numParts
+            let resHash = await resource.hash
+            let resHashHex = resHash?.prefix(8).map { String(format: "%02x", $0) }.joined() ?? "nil"
+            directSendLogger.info("[DIRECT] Resource created: hash=\(resHashHex), parts=\(numParts), advertisement sent")
         }
 
         // Mark as sent
         message.state = .sent
+        directSendLogger.info("[DIRECT] Message marked sent for dest=\(destHashHex)")
 
         // Notify delegate
         notifyUpdate(message)

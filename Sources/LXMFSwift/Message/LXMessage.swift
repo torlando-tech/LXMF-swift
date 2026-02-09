@@ -22,6 +22,13 @@ import ReticulumSwift
 /// - stamp is NOT included in hash computation
 /// - signature = sign(destination_hash + source_hash + msgpack(payload) + hash)
 public struct LXMessage {
+    // MARK: - LXMF Field Keys
+
+    public static let FIELD_ICON_APPEARANCE: UInt8 = 0x04
+    public static let FIELD_FILE_ATTACHMENTS: UInt8 = 0x05
+    public static let FIELD_IMAGE: UInt8 = 0x06
+    public static let FIELD_AUDIO: UInt8 = 0x07
+
     // MARK: - Properties
 
     /// Destination hash (16 bytes, truncated SHA256)
@@ -179,14 +186,10 @@ public struct LXMessage {
                 } else if let intValue = value as? Int {
                     fieldsMap[keyValue] = .int(Int64(intValue))
                 } else if let arrayValue = value as? [Any] {
-                    // Convert array to MessagePack (for Field 4 icon appearance, etc.)
-                    var msgpackArray: [LXMFMessagePackValue] = []
-                    for item in arrayValue {
-                        if let s = item as? String { msgpackArray.append(.string(s)) }
-                        else if let d = item as? Data { msgpackArray.append(.binary(d)) }
-                        else if let i = item as? Int { msgpackArray.append(.int(Int64(i))) }
-                    }
-                    fieldsMap[keyValue] = .array(msgpackArray)
+                    // Convert array to MessagePack with recursive nested array support
+                    // Handles flat arrays (Field 4 icon appearance) and nested arrays
+                    // (Field 5 file attachments: [[filename, data], ...])
+                    fieldsMap[keyValue] = .array(Self.convertArrayToMsgpack(arrayValue))
                 } else if let dictValue = value as? [String: Any] {
                     // Convert nested dict to MessagePack
                     var nestedMap: [LXMFMessagePackValue: LXMFMessagePackValue] = [:]
@@ -332,18 +335,10 @@ public struct LXMessage {
                     case .int(let int):
                         extractedFields[keyByte] = int
                     case .array(let arr):
-                        // Convert msgpack array to [Any] (for Field 4 icon appearance, etc.)
-                        var swiftArray: [Any] = []
-                        for item in arr {
-                            switch item {
-                            case .string(let s): swiftArray.append(s)
-                            case .binary(let d): swiftArray.append(d)
-                            case .int(let i): swiftArray.append(i)
-                            case .uint(let u): swiftArray.append(u)
-                            default: break
-                            }
-                        }
-                        extractedFields[keyByte] = swiftArray
+                        // Convert msgpack array to [Any] with recursive nested array support
+                        // Handles flat arrays (Field 4 icon appearance) and nested arrays
+                        // (Field 5 file attachments: [[filename, data], ...])
+                        extractedFields[keyByte] = Self.convertMsgpackArrayToSwift(arr)
                     case .map(let nestedMap):
                         // Convert nested map to [String: Any]
                         var nestedDict: [String: Any] = [:]
@@ -493,5 +488,38 @@ public struct LXMessage {
         self.unverifiedReason = nil
         self.sourceIdentity = nil
         self.packed = nil
+    }
+
+    // MARK: - Array Conversion Helpers
+
+    /// Convert a Swift `[Any]` array to MessagePack values, handling nested arrays recursively.
+    private static func convertArrayToMsgpack(_ array: [Any]) -> [LXMFMessagePackValue] {
+        var result: [LXMFMessagePackValue] = []
+        for item in array {
+            if let s = item as? String { result.append(.string(s)) }
+            else if let d = item as? Data { result.append(.binary(d)) }
+            else if let i = item as? Int { result.append(.int(Int64(i))) }
+            else if let nested = item as? [Any] {
+                result.append(.array(convertArrayToMsgpack(nested)))
+            }
+        }
+        return result
+    }
+
+    /// Convert a MessagePack array to Swift `[Any]`, handling nested arrays recursively.
+    private static func convertMsgpackArrayToSwift(_ array: [LXMFMessagePackValue]) -> [Any] {
+        var result: [Any] = []
+        for item in array {
+            switch item {
+            case .string(let s): result.append(s)
+            case .binary(let d): result.append(d)
+            case .int(let i): result.append(i)
+            case .uint(let u): result.append(u)
+            case .array(let nested):
+                result.append(convertMsgpackArrayToSwift(nested))
+            default: break
+            }
+        }
+        return result
     }
 }

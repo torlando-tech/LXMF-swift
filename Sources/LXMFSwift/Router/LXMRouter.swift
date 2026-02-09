@@ -14,6 +14,9 @@
 import Foundation
 import CryptoKit
 import ReticulumSwift
+import os.log
+
+private let routerLogger = Logger(subsystem: "com.columba.app", category: "LXMRouter")
 
 /// LXMF message router actor.
 ///
@@ -249,8 +252,11 @@ public actor LXMRouter {
             let packedPayloadSize = packed.count - (2 * LXMFConstants.DESTINATION_LENGTH + LXMFConstants.SIGNATURE_LENGTH)
             if packedPayloadSize > LXMFConstants.ENCRYPTED_PACKET_MAX_CONTENT {
                 let fallback = message.fallbackMethod ?? .direct
+                routerLogger.info("[OUTBOUND] Message too large for opportunistic (\(packedPayloadSize) > \(LXMFConstants.ENCRYPTED_PACKET_MAX_CONTENT)), falling back to \(String(describing: fallback))")
                 print("[LXMF] Message too large for opportunistic (\(packedPayloadSize) > \(LXMFConstants.ENCRYPTED_PACKET_MAX_CONTENT)), falling back to \(fallback)")
                 message.method = fallback
+            } else {
+                routerLogger.info("[OUTBOUND] Message fits in opportunistic: \(packedPayloadSize) bytes")
             }
         }
 
@@ -480,14 +486,16 @@ public actor LXMRouter {
                     // Direct delivery: over link
                     let destHashHex = pendingOutbound[i].destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
                     let hasPathToRecipient = await hasPath(pendingOutbound[i].destinationHash)
+                    let attempt = pendingOutbound[i].deliveryAttempts
+                    routerLogger.info("[PROCESS] Direct delivery: dest=\(destHashHex), hasPath=\(hasPathToRecipient), attempt=\(attempt)")
                     print("[LXMF_DIRECT] Checking path to \(destHashHex), hasPath=\(hasPathToRecipient)")
                     if hasPathToRecipient {
                         // Attempt link-based send (copy out for inout async call)
-                        print("[LXMF_DIRECT] Establishing link to \(destHashHex)")
+                        routerLogger.info("[PROCESS] Starting sendDirect to \(destHashHex)")
                         var msg = pendingOutbound[i]
                         try await sendDirect(&msg)
                         pendingOutbound[i] = msg
-                        print("[LXMF_DIRECT] Message sent via link to \(destHashHex)")
+                        routerLogger.info("[PROCESS] sendDirect completed to \(destHashHex)")
                         indicesToRemove.insert(i)
 
                         // Update database
@@ -497,6 +505,7 @@ public actor LXMRouter {
                         }
                     } else {
                         // Need path first
+                        routerLogger.warning("[PROCESS] No path to \(destHashHex), requesting path")
                         print("[LXMF_DIRECT] No path to \(destHashHex), requesting path")
                         requestPath(pendingOutbound[i].destinationHash)
                         pendingOutbound[i].nextDeliveryAttempt = Date().addingTimeInterval(Self.PATH_REQUEST_WAIT)
@@ -538,6 +547,8 @@ public actor LXMRouter {
                 // Schedule retry with exponential backoff
                 let backoffSeconds = min(Double(pendingOutbound[i].deliveryAttempts) * Self.PATH_REQUEST_WAIT, 300.0)
                 pendingOutbound[i].nextDeliveryAttempt = Date().addingTimeInterval(backoffSeconds)
+                let destHex = pendingOutbound[i].destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+                routerLogger.error("[PROCESS] Delivery failed for \(destHex): \(error.localizedDescription), retrying in \(backoffSeconds)s")
             }
         }
 

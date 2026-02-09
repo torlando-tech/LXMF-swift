@@ -11,6 +11,34 @@
 import Foundation
 import ReticulumSwift
 
+// MARK: - LXMF Resource Handler
+
+/// Resource callback handler for LXMF direct delivery over links.
+///
+/// When a resource transfer completes on an LXMF delivery link, the
+/// assembled data is delivered to the router's lxmfDelivery handler.
+///
+/// Reference: Python LXMF/LXMRouter.py delivery_resource_concluded()
+final class LXMFResourceHandler: ResourceCallbacks, @unchecked Sendable {
+    private let router: LXMRouter
+
+    init(router: LXMRouter) {
+        self.router = router
+    }
+
+    func resourceConcluded(_ resource: Resource) async {
+        // Get assembled data from the completed resource
+        guard let data = await resource.assembledData else {
+            print("[LXMF_RESOURCE] Resource concluded but no assembled data available")
+            return
+        }
+
+        print("[LXMF_RESOURCE] Resource transfer complete, delivering \(data.count) bytes to LXMF")
+        let accepted = await router.lxmfDelivery(data)
+        print("[LXMF_RESOURCE] lxmfDelivery returned accepted=\(accepted)")
+    }
+}
+
 extension LXMRouter {
 
     // MARK: - Delivery Destinations
@@ -19,6 +47,11 @@ extension LXMRouter {
     ///
     /// When a packet is received for this destination, it will be routed to
     /// the router's lxmfDelivery handler for unpacking and processing.
+    ///
+    /// Also registers a link callback so that inbound links to this destination
+    /// are configured for resource transfer (needed for large messages).
+    ///
+    /// Reference: Python LXMF/LXMRouter.py delivery_link_established()
     ///
     /// - Parameters:
     ///   - destination: Destination to register for LXMF delivery
@@ -55,6 +88,19 @@ extension LXMRouter {
             }
         }
         print("[LXMF_INBOUND] Callback registered successfully")
+
+        // Register link callback for resource-based direct delivery
+        // When a remote peer establishes a link to our delivery destination,
+        // we need to accept resources (large LXMF messages sent via Resource transfer).
+        // Reference: Python LXMF/LXMRouter.py delivery_link_established() lines 1847-1852
+        let resourceHandler = LXMFResourceHandler(router: self)
+        await transport.registerDestinationLinkCallback(for: destination.hash) { [resourceHandler] (link: Link) async in
+            print("[LXMF_RESOURCE] Inbound link established, configuring resource handling")
+            await link.setResourceStrategy(.acceptAll)
+            await link.setResourceCallbacks(resourceHandler)
+            print("[LXMF_RESOURCE] Resource strategy=acceptAll, callbacks set")
+        }
+        print("[LXMF_INBOUND] Link callback registered for resource handling")
     }
 
     /// Handle delivery packet received for LXMF destination.
