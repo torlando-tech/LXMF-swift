@@ -287,9 +287,15 @@ public struct LXMessage {
 
         // Unpack payload - convert to contiguous Data to avoid slice issues
         let contiguousPayload = Data(packedPayload)
-        guard let payloadValue = try? unpackLXMF(contiguousPayload),
-              case .array(var payloadArray) = payloadValue else {
-            throw LXMFError.invalidMessageFormat("Could not unpack payload")
+        let payloadHex = contiguousPayload.prefix(32).map { String(format: "%02x", $0) }.joined()
+        let payloadValue: LXMFMessagePackValue
+        do {
+            payloadValue = try unpackLXMF(contiguousPayload)
+        } catch {
+            throw LXMFError.invalidMessageFormat("Could not unpack payload (\(contiguousPayload.count)B, hex=\(payloadHex)): \(error)")
+        }
+        guard case .array(var payloadArray) = payloadValue else {
+            throw LXMFError.invalidMessageFormat("Payload is not an array: \(payloadValue), hex=\(payloadHex)")
         }
 
         // Extract stamp if present (5th element)
@@ -307,16 +313,42 @@ public struct LXMessage {
             throw LXMFError.invalidMessageFormat("Payload array too short")
         }
 
-        guard case .double(let timestamp) = payloadArray[0] else {
-            throw LXMFError.invalidMessageFormat("Invalid timestamp")
+        // Accept timestamp as double, float, uint, or int (Python usually sends float64,
+        // but integer timestamps are possible from some senders)
+        let timestamp: Double
+        switch payloadArray[0] {
+        case .double(let d):
+            timestamp = d
+        case .float(let f):
+            timestamp = Double(f)
+        case .uint(let u):
+            timestamp = Double(u)
+        case .int(let i):
+            timestamp = Double(i)
+        default:
+            throw LXMFError.invalidMessageFormat("Invalid timestamp type: \(payloadArray[0])")
         }
 
-        guard case .binary(let title) = payloadArray[1] else {
-            throw LXMFError.invalidMessageFormat("Invalid title")
+        // Accept title as binary or string (Python packs as bytes, but some might use str)
+        let title: Data
+        switch payloadArray[1] {
+        case .binary(let d):
+            title = d
+        case .string(let s):
+            title = Data(s.utf8)
+        default:
+            throw LXMFError.invalidMessageFormat("Invalid title type: \(payloadArray[1])")
         }
 
-        guard case .binary(let content) = payloadArray[2] else {
-            throw LXMFError.invalidMessageFormat("Invalid content")
+        // Accept content as binary or string
+        let content: Data
+        switch payloadArray[2] {
+        case .binary(let d):
+            content = d
+        case .string(let s):
+            content = Data(s.utf8)
+        default:
+            throw LXMFError.invalidMessageFormat("Invalid content type: \(payloadArray[2])")
         }
 
         // Fields can be nil or map

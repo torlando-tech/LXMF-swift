@@ -18,6 +18,7 @@ import os.log
 
 private let routerLogger = Logger(subsystem: "com.columba.app", category: "LXMRouter")
 
+
 /// LXMF message router actor.
 ///
 /// Manages outbound message queues, processes delivery attempts, handles incoming messages,
@@ -287,58 +288,36 @@ public actor LXMRouter {
     /// Reference: Python LXMRouter.lxmf_delivery() lines 1714-1799
     @discardableResult
     public func lxmfDelivery(_ data: Data, physicalStats: PhysicalStats? = nil) async -> Bool {
-        let dataHex = data.prefix(32).map { String(format: "%02x", $0) }.joined()
-        print("[LXMF_INBOUND] lxmfDelivery called: \(data.count) bytes, data[0:32]=\(dataHex)")
-
         do {
             // Extract source hash to look up identity for signature validation
             // LXMF format: [dest_hash 16B][src_hash 16B][signature 64B][payload...]
             guard data.count >= 32 else {
-                print("[LXMF_INBOUND] Message too short (<32 bytes), rejecting")
-                return false  // Invalid message
+                return false
             }
             let sourceHash = data.subdata(in: 16..<32)
-            let sourceHashHex = sourceHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-            print("[LXMF_INBOUND] sourceHash=\(sourceHashHex)")
 
             // Self-echo detection: relay broadcasts our own outbound messages back to us.
-            // Skip any message whose source is our own LXMF delivery destination hash.
             let localDeliveryHash = Destination.hash(identity: identity, appName: "lxmf", aspects: ["delivery"])
             if sourceHash == localDeliveryHash {
-                print("[LXMF_INBOUND] Self-echo detected (sourceHash matches local delivery hash), ignoring")
                 return false
             }
 
             // Look up source identity from cache for signature validation
             let sourceIdentity = identityCache[sourceHash]
-            print("[LXMF_INBOUND] sourceIdentity from cache: \(sourceIdentity != nil ? "FOUND" : "NOT FOUND")")
 
             // Unpack message from wire format, passing source identity if known
-            print("[LXMF_INBOUND] Calling LXMessage.unpackFromBytes()...")
             var message = try LXMessage.unpackFromBytes(data, sourceIdentity: sourceIdentity)
-            print("[LXMF_INBOUND] Unpacked message: hash=\(message.hash.prefix(8).map { String(format: "%02x", $0) }.joined()), content len=\(message.content.count)")
 
-            // Validate signature (silent drop if invalid)
-            // Python silently drops invalid signatures to prevent DOS
-            // NOTE: If source identity is unknown, we can't validate signature - accept but mark unverified
-            // Only reject if signature was actually validated and failed
+            // Validate signature (silent drop if invalid, per Python behavior)
+            // If source identity is unknown, accept but mark unverified
             if message.signatureValidated == false && message.unverifiedReason == .signatureInvalid {
-                // Signature validation was attempted and failed
-                print("[LXMF_INBOUND] Signature validation FAILED, rejecting")
                 return false
             }
-            print("[LXMF_INBOUND] Signature check passed (validated=\(message.signatureValidated), reason=\(String(describing: message.unverifiedReason)))")
 
             // Check duplicate (transient ID = message hash)
-            if let cachedTime = deliveredTransientIDs[message.hash] {
-                // Already delivered, ignore
-                print("[LXMF_INBOUND] Duplicate message detected (cached at \(cachedTime)), rejecting")
+            if deliveredTransientIDs[message.hash] != nil {
                 return false
             }
-            print("[LXMF_INBOUND] Not a duplicate, proceeding")
-
-            // TODO: Validate stamp if required (deferred to stamping integration)
-            // For now, accept all messages without stamp validation
 
             // Add to duplicate cache with current timestamp
             deliveredTransientIDs[message.hash] = Date()
@@ -358,32 +337,25 @@ public actor LXMRouter {
 
             // Store in database and await completion so message is persisted
             // before the delegate callback triggers UI reload.
-            // Previously used Task.detached (fire-and-forget) which raced with
-            // the delegate's own DB writes, causing "database is locked" errors.
             do {
                 try await database.saveMessage(message)
             } catch {
-                print("[LXMF_INBOUND] Failed to persist message: \(error)")
+                routerLogger.error("[LXMF_INBOUND] Failed to persist message: \(error)")
             }
 
             // Invoke delegate callback on main actor
-            print("[LXMF_INBOUND] Checking for delegate: wrapper=\(delegateWrapper != nil), delegate=\(delegateWrapper?.delegate != nil)")
             if let wrapper = delegateWrapper, let delegate = wrapper.delegate {
-                print("[LXMF_INBOUND] Invoking delegate.router(didReceiveMessage:) on main actor")
                 Task { @MainActor in
                     delegate.router(self, didReceiveMessage: message)
                 }
-            } else {
-                print("[LXMF_INBOUND] NO DELEGATE SET - message will not be delivered to app!")
             }
 
-            print("[LXMF_INBOUND] Message accepted successfully")
             return true
 
         } catch {
             // Invalid message format, signature failed, etc.
             // Python silently drops malformed messages
-            print("[LXMF_INBOUND] Exception during processing: \(error)")
+            routerLogger.error("[LXMF_INBOUND] Delivery failed: \(error)")
             return false
         }
     }

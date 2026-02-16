@@ -36,8 +36,8 @@ public enum PropagationConstants {
 
     // MARK: - Transfer Limits
 
-    /// Default maximum messages per transfer if not announced.
-    public static let DEFAULT_PER_TRANSFER_LIMIT = 5
+    /// Default maximum messages per transfer (in KB). Matches Python's DELIVERY_LIMIT.
+    public static let DEFAULT_PER_TRANSFER_LIMIT = 1000
 
     /// Default maximum messages per sync request if not announced.
     public static let DEFAULT_PER_SYNC_LIMIT = 20

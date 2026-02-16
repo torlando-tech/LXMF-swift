@@ -12,6 +12,9 @@
 
 import Foundation
 import ReticulumSwift
+import os.log
+
+private let syncLogger = Logger(subsystem: "com.columba.core", category: "Sync")
 
 extension LXMRouter {
 
@@ -24,17 +27,22 @@ extension LXMRouter {
     /// 2. **WANT/HAVE**: Send lists of wanted and already-have IDs, receive message data
     /// 3. **ACK**: Acknowledge received messages so node can delete them
     ///
-    /// Each received message is fed through `lxmfDelivery()` for unified inbound handling.
+    /// Propagated messages are encrypted at the LXMF layer (Python LXMRouter.py lines 434-438).
+    /// Format: `dest_hash(16) + encrypt(source_hash + signature + packed_payload)`.
+    /// The server strips the stamp before sending (line 1492).
+    /// We decrypt each message using our identity before passing to `lxmfDelivery()`.
     ///
     /// - Throws: LXMFError if propagation node not set, link fails, or sync fails
     public func syncFromPropagationNode() async throws {
         guard let propagationNode = outboundPropagationNode else {
+            syncLogger.error("[SYNC] No outboundPropagationNode set")
             syncState.state = .noPath
             syncState.errorDescription = "No propagation node configured"
             throw LXMFError.propagationNodeNotSet
         }
 
         guard let transport = self.transport else {
+            syncLogger.error("[SYNC] Transport not available")
             syncState.state = .linkFailed
             syncState.errorDescription = "Transport not available"
             throw LXMFError.transportNotAvailable
@@ -46,6 +54,7 @@ extension LXMRouter {
         notifySyncStateUpdate()
 
         let nodeHex = propagationNode.prefix(8).map { String(format: "%02x", $0) }.joined()
+        syncLogger.info("[SYNC] Establishing link to \(nodeHex)")
 
         // Establish link to propagation node
         let link: Link
@@ -54,6 +63,7 @@ extension LXMRouter {
             syncState.state = .linkEstablished
             notifySyncStateUpdate()
         } catch {
+            syncLogger.error("[SYNC] Link failed to \(nodeHex): \(error)")
             syncState.state = .linkFailed
             syncState.errorDescription = error.localizedDescription
             notifySyncStateUpdate()
@@ -64,22 +74,22 @@ extension LXMRouter {
         do {
             try await link.identify(identity: identity)
         } catch {
-            // Non-fatal
+            syncLogger.warning("[SYNC] Link identify failed (non-fatal): \(error)")
         }
 
         // Step 1: LIST - get transient IDs from node
         syncState.state = .requestSent
         notifySyncStateUpdate()
 
-        let listRequestData = packLXMF(.array([.null, .null]))
         let listReceipt: RequestReceipt
         do {
             listReceipt = try await link.request(
                 path: PropagationConstants.SYNC_PATH,
-                data: listRequestData,
+                data: .array([.null, .null]),
                 timeout: PropagationConstants.SYNC_TIMEOUT
             )
         } catch {
+            syncLogger.error("[SYNC] LIST request failed: \(error)")
             syncState.state = .transferFailed
             syncState.errorDescription = "List request failed: \(error.localizedDescription)"
             notifySyncStateUpdate()
@@ -89,6 +99,7 @@ extension LXMRouter {
         // Wait for LIST response
         let listResponse = try await waitForRequestResponse(listReceipt)
         let transientIds = parseTransientIdList(listResponse)
+        syncLogger.info("[SYNC] LIST: \(transientIds.count) messages on node")
 
         if transientIds.isEmpty {
             syncState.state = .complete
@@ -117,16 +128,18 @@ extension LXMRouter {
         }
 
         // Step 2: WANT/HAVE - request messages we need
-        let wantArray = LXMFMessagePackValue.array(wantIds.map { .binary($0) })
-        let haveArray = LXMFMessagePackValue.array(haveIds.map { .binary($0) })
-        let limit = LXMFMessagePackValue.uint(UInt64(PropagationConstants.DEFAULT_PER_TRANSFER_LIMIT))
-        let wantRequestData = packLXMF(.array([wantArray, haveArray, limit]))
+        syncLogger.info("[SYNC] WANT: \(wantIds.count) new, \(haveIds.count) have")
+        let wantMsgpackArray: MessagePackValue = .array([
+            .array(wantIds.map { .binary($0) }),
+            .array(haveIds.map { .binary($0) }),
+            .uint(UInt64(PropagationConstants.DEFAULT_PER_TRANSFER_LIMIT))
+        ])
 
         let wantReceipt: RequestReceipt
         do {
             wantReceipt = try await link.request(
                 path: PropagationConstants.SYNC_PATH,
-                data: wantRequestData,
+                data: wantMsgpackArray,
                 timeout: PropagationConstants.SYNC_TIMEOUT
             )
         } catch {
@@ -139,28 +152,51 @@ extension LXMRouter {
         // Wait for WANT response (array of message data)
         let wantResponse = try await waitForRequestResponse(wantReceipt)
         let receivedMessages = parseMessageDataArray(wantResponse)
+        syncLogger.info("[SYNC] Received \(receivedMessages.count) messages (\(wantResponse.count) bytes)")
 
         // Process received messages through lxmfDelivery
         var newMessageCount = 0
-        var ackIds: [Data] = []
 
-        for messageData in receivedMessages {
-            let accepted = await lxmfDelivery(messageData)
+        for (i, messageData) in receivedMessages.enumerated() {
+            // Propagated messages are encrypted at the LXMF layer:
+            // Format: dest_hash(16) + encrypt(source_hash + signature + packed_payload)
+            // The stamp was already stripped by the server before sending.
+            // We must decrypt before unpacking.
+            // Reference: Python LXMRouter.py lines 2322-2328
+            guard messageData.count > LXMFConstants.DESTINATION_LENGTH else {
+                continue
+            }
+
+            let destHash = Data(messageData.prefix(LXMFConstants.DESTINATION_LENGTH))
+            let encryptedPayload = Data(messageData.dropFirst(LXMFConstants.DESTINATION_LENGTH))
+
+            let decryptedPayload: Data
+            do {
+                decryptedPayload = try identity.decrypt(encryptedPayload, identityHash: identity.hash)
+            } catch {
+                syncLogger.error("[SYNC] Message[\(i)] decryption failed: \(error)")
+                continue
+            }
+
+            // Reconstruct plaintext LXMF message: dest_hash + source_hash + signature + payload
+            let decryptedMessage = destHash + decryptedPayload
+
+            let accepted = await lxmfDelivery(decryptedMessage)
             if accepted {
                 newMessageCount += 1
             }
-            // Compute transient ID for ACK
-            let transientId = computeTransientId(messageData)
-            ackIds.append(transientId)
 
             syncState.receivedMessages += 1
             notifySyncStateUpdate()
         }
 
-        // Also ACK messages we already had
-        ackIds.append(contentsOf: haveIds)
+        // ACK ALL transient IDs from LIST (both wanted and already-had).
+        // Use the server's own IDs, not recomputed ones, since the server
+        // computed them from data-with-stamp but sent us data-without-stamp.
+        let ackIds = transientIds
 
         // Step 3: ACK - tell node to delete received messages
+        syncLogger.info("[SYNC] ACK \(ackIds.count) messages (\(newMessageCount) new)")
         try await sendSyncAck(link: link, ackIds: ackIds)
 
         // Complete
@@ -168,15 +204,12 @@ extension LXMRouter {
         syncState.lastSync = Date()
         notifySyncStateUpdate()
         notifySyncCompletion(newMessageCount: newMessageCount)
+        syncLogger.info("[SYNC] Complete: \(newMessageCount) new messages")
     }
 
     // MARK: - Sync Helpers
 
     /// Wait for a request response with timeout.
-    ///
-    /// - Parameter receipt: RequestReceipt to wait on
-    /// - Returns: Response data
-    /// - Throws: LXMFError on timeout or failure
     private func waitForRequestResponse(_ receipt: RequestReceipt) async throws -> Data {
         let deadline = Date().addingTimeInterval(PropagationConstants.SYNC_TIMEOUT)
 
@@ -203,9 +236,6 @@ extension LXMRouter {
     /// Parse the LIST response into transient IDs.
     ///
     /// The response is a msgpack array of binary transient IDs (32 bytes each).
-    ///
-    /// - Parameter data: Response data from LIST request
-    /// - Returns: Array of transient ID Data values
     private func parseTransientIdList(_ data: Data) -> [Data] {
         guard let value = try? unpackLXMF(data),
               case .array(let elements) = value else {
@@ -221,9 +251,6 @@ extension LXMRouter {
     }
 
     /// Parse the WANT response into message data blobs.
-    ///
-    /// - Parameter data: Response data from WANT request
-    /// - Returns: Array of packed LXMF message data
     private func parseMessageDataArray(_ data: Data) -> [Data] {
         guard let value = try? unpackLXMF(data),
               case .array(let elements) = value else {
@@ -240,11 +267,7 @@ extension LXMRouter {
 
     /// Filter transient IDs against known messages.
     ///
-    /// Returns only IDs that we don't already have in:
-    /// - The in-memory deliveredTransientIDs cache
-    ///
-    /// - Parameter ids: Transient IDs from propagation node
-    /// - Returns: IDs we want to receive
+    /// Returns only IDs that we don't already have in the in-memory deliveredTransientIDs cache.
     private func filterTransientIds(_ ids: [Data]) -> [Data] {
         return ids.filter { id in
             deliveredTransientIDs[id] == nil
@@ -255,9 +278,6 @@ extension LXMRouter {
     ///
     /// Transient ID = SHA256 full hash (32 bytes) of the packed message data.
     /// This matches Python `RNS.Identity.full_hash(lxmf_data)`.
-    ///
-    /// - Parameter messageData: Packed LXMF message data
-    /// - Returns: 32-byte transient ID
     private func computeTransientId(_ messageData: Data) -> Data {
         return Hashing.fullHash(messageData)
     }
@@ -265,17 +285,15 @@ extension LXMRouter {
     /// Send ACK to propagation node (Step 3).
     ///
     /// Tells the node to delete messages we've received.
-    ///
-    /// - Parameters:
-    ///   - link: Active link to propagation node
-    ///   - ackIds: Transient IDs to acknowledge
     private func sendSyncAck(link: Link, ackIds: [Data]) async throws {
-        let ackArray = LXMFMessagePackValue.array(ackIds.map { .binary($0) })
-        let ackData = packLXMF(.array([.null, ackArray]))
+        let ackMsgpackValue: MessagePackValue = .array([
+            .null,
+            .array(ackIds.map { .binary($0) })
+        ])
 
         _ = try await link.request(
             path: PropagationConstants.SYNC_PATH,
-            data: ackData,
+            data: ackMsgpackValue,
             timeout: PropagationConstants.SYNC_TIMEOUT
         )
     }

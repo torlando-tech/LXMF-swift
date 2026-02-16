@@ -10,6 +10,9 @@
 
 import Foundation
 import ReticulumSwift
+import os.log
+
+private let propLogger = Logger(subsystem: "com.columba.core", category: "Propagation")
 
 extension LXMRouter {
 
@@ -185,24 +188,31 @@ extension LXMRouter {
     /// - Throws: LXMFError if link establishment fails
     func getOrEstablishPropagationLink(to nodeHash: Data, transport: ReticuLumTransport) async throws -> Link {
         let nodeHex = nodeHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+        propLogger.error("[PROP_LINK] getOrEstablishPropagationLink to \(nodeHex)")
 
         // Check for existing active propagation link
         if let link = propagationLinks[nodeHash] {
             let state = await link.state
             if state == .active {
+                propLogger.error("[PROP_LINK] Reusing active link to \(nodeHex)")
                 return link
             }
+            propLogger.error("[PROP_LINK] Existing link state=\(String(describing: state)), removing")
             propagationLinks.removeValue(forKey: nodeHash)
         }
 
         // Look up path entry for the propagation node
         guard let pathTable = self.pathTable else {
+            propLogger.error("[PROP_LINK] No pathTable available")
             throw LXMFError.transportNotAvailable
         }
 
         guard let pathEntry = await pathTable.lookup(destinationHash: nodeHash) else {
+            propLogger.error("[PROP_LINK] No path entry for \(nodeHex)")
             throw LXMFError.noPath
         }
+
+        propLogger.error("[PROP_LINK] Path entry found: hops=\(pathEntry.hopCount), pubkeys=\(pathEntry.publicKeys.count) bytes")
 
         // Create Identity from path entry's public keys
         let nodeIdentity = try Identity(publicKeyBytes: pathEntry.publicKeys)
@@ -215,10 +225,12 @@ extension LXMRouter {
             type: .single,
             direction: .out
         )
+        propLogger.error("[PROP_LINK] Destination hash=\(destination.hash.prefix(8).map { String(format: "%02x", $0) }.joined()), initiating link...")
 
         // Initiate link
         let link = try await transport.initiateLink(to: destination, identity: identity)
         propagationLinks[nodeHash] = link
+        propLogger.error("[PROP_LINK] Link initiated, waiting for active state...")
 
         // Wait for link to become active
         try await waitForPropagationLinkActive(link, timeout: PropagationConstants.LINK_TIMEOUT)
@@ -229,9 +241,15 @@ extension LXMRouter {
     /// Wait for propagation link to become active with timeout.
     private func waitForPropagationLinkActive(_ link: Link, timeout: TimeInterval) async throws {
         let deadline = Date().addingTimeInterval(timeout)
+        var lastLoggedState = ""
 
         while Date() < deadline {
             let state = await link.state
+            let stateStr = String(describing: state)
+            if stateStr != lastLoggedState {
+                propLogger.error("[PROP_LINK] Link state: \(stateStr)")
+                lastLoggedState = stateStr
+            }
             switch state {
             case .active:
                 try? await Task.sleep(for: .milliseconds(100))
@@ -242,6 +260,7 @@ extension LXMRouter {
                 try? await Task.sleep(for: .milliseconds(100))
             }
         }
+        propLogger.error("[PROP_LINK] Link timed out after \(timeout)s")
 
         throw LXMFError.linkFailed("Propagation link establishment timed out")
     }
