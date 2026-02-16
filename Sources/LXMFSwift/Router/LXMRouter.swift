@@ -356,9 +356,14 @@ public actor LXMRouter {
             // Mark as incoming
             message.incoming = true
 
-            // Store in database
-            Task.detached { [database, message] in
-                try? await database.saveMessage(message)
+            // Store in database and await completion so message is persisted
+            // before the delegate callback triggers UI reload.
+            // Previously used Task.detached (fire-and-forget) which raced with
+            // the delegate's own DB writes, causing "database is locked" errors.
+            do {
+                try await database.saveMessage(message)
+            } catch {
+                print("[LXMF_INBOUND] Failed to persist message: \(error)")
             }
 
             // Invoke delegate callback on main actor
