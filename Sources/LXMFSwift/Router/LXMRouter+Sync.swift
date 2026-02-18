@@ -172,7 +172,21 @@ extension LXMRouter {
 
             let decryptedPayload: Data
             do {
-                decryptedPayload = try identity.decrypt(encryptedPayload, identityHash: identity.hash)
+                // Use ratchet fallback chain if available
+                if let ratchetMgr = ratchetManager {
+                    let ratchetKeys = await ratchetMgr.allRatchetPrivateKeys()
+                    if !ratchetKeys.isEmpty {
+                        decryptedPayload = try identity.decrypt(
+                            encryptedPayload,
+                            identityHash: identity.hash,
+                            ratchets: ratchetKeys
+                        )
+                    } else {
+                        decryptedPayload = try identity.decrypt(encryptedPayload, identityHash: identity.hash)
+                    }
+                } else {
+                    decryptedPayload = try identity.decrypt(encryptedPayload, identityHash: identity.hash)
+                }
             } catch {
                 syncLogger.error("[SYNC] Message[\(i)] decryption failed: \(error)")
                 continue

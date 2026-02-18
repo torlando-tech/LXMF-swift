@@ -106,6 +106,10 @@ public actor LXMRouter {
     /// Registered delivery destinations
     public var deliveryDestinations: [Data: (Destination, Int?)] = [:]
 
+    /// Ratchet manager for forward secrecy on inbound message decryption.
+    /// Set from AppServices after enabling ratchets on the delivery destination.
+    public var ratchetManager: RatchetManager?
+
     /// Identity recall cache: identity hash -> Identity
     /// Used to look up source identities for signature validation during unpack.
     /// Populated by registerIdentity() or from announces.
@@ -193,6 +197,13 @@ public actor LXMRouter {
         self.transport = transport
         // Access path table from transport for route lookups
         self.pathTable = await transport.getPathTable()
+    }
+
+    /// Set the ratchet manager for forward secrecy on sync decryption.
+    ///
+    /// - Parameter manager: The ratchet manager (or nil to disable)
+    public func setRatchetManager(_ manager: RatchetManager?) {
+        self.ratchetManager = manager
     }
 
     // MARK: - Identity Management
