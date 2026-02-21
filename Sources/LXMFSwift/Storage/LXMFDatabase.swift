@@ -346,10 +346,11 @@ public actor LXMFDatabase {
     ///   - offset: Number of records to skip
     /// - Returns: Array of MessageRecord
     /// - Throws: DatabaseError
-    public func getMessageRecords(forConversation hash: Data, limit: Int = 50, offset: Int = 0) throws -> [MessageRecord] {
+    public func getMessageRecords(forConversation hash: Data, limit: Int = 200, offset: Int = 0) throws -> [MessageRecord] {
         try dbPool.read { db in
             try MessageRecord
                 .filter(Column("conversation_hash") == hash)
+                .filter(Column("content") != Data())
                 .order(Column("timestamp").desc)
                 .limit(limit, offset: offset)
                 .fetchAll(db)
