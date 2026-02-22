@@ -352,46 +352,77 @@ public struct LXMessage {
         }
 
         // Fields can be nil or map
+        // DEBUG: Log raw fields value from msgpack to diagnose telemetry loss
+        let fieldsRaw = payloadArray[3]
+        switch fieldsRaw {
+        case .map(let m):
+            let keys = m.keys.map { "\($0)" }.joined(separator: ",")
+            print("[LXMF_UNPACK] payloadArray[3] is .map with \(m.count) entries, keys=[\(keys)]")
+        case .null:
+            print("[LXMF_UNPACK] payloadArray[3] is .null → fields will be nil")
+        default:
+            print("[LXMF_UNPACK] payloadArray[3] unexpected type: \(fieldsRaw)")
+        }
+        // Also log raw payload hex for the fields portion
+        do {
+            let fieldsRepacked = packLXMF(fieldsRaw)
+            let fieldsHex = fieldsRepacked.prefix(64).map { String(format: "%02x", $0) }.joined()
+            print("[LXMF_UNPACK] fields raw msgpack (\(fieldsRepacked.count)B): \(fieldsHex)")
+        }
+
         var fields: [UInt8: Any]? = nil
         if case .map(let fieldsMap) = payloadArray[3] {
             var extractedFields: [UInt8: Any] = [:]
             for (key, value) in fieldsMap {
-                if case .uint(let keyInt) = key {
-                    let keyByte = UInt8(keyInt)
-                    // Extract value
-                    switch value {
-                    case .binary(let data):
-                        extractedFields[keyByte] = data
-                    case .string(let str):
-                        extractedFields[keyByte] = str
-                    case .int(let int):
-                        extractedFields[keyByte] = int
-                    case .array(let arr):
-                        // Convert msgpack array to [Any] with recursive nested array support
-                        // Handles flat arrays (Field 4 icon appearance) and nested arrays
-                        // (Field 5 file attachments: [[filename, data], ...])
-                        extractedFields[keyByte] = Self.convertMsgpackArrayToSwift(arr)
-                    case .map(let nestedMap):
-                        // Convert nested map to [String: Any]
-                        var nestedDict: [String: Any] = [:]
-                        for (nk, nv) in nestedMap {
-                            if case .string(let nkStr) = nk {
-                                switch nv {
-                                case .double(let dbl):
-                                    nestedDict[nkStr] = dbl
-                                case .int(let int):
-                                    nestedDict[nkStr] = int
-                                case .string(let str):
-                                    nestedDict[nkStr] = str
-                                default:
-                                    break
-                                }
+                // Extract field key — handle both .uint and .int keys
+                let keyByte: UInt8
+                switch key {
+                case .uint(let keyInt):
+                    keyByte = UInt8(keyInt)
+                case .int(let keyInt) where keyInt >= 0 && keyInt <= 255:
+                    keyByte = UInt8(keyInt)
+                default:
+                    continue
+                }
+                // Extract value
+                switch value {
+                case .binary(let data):
+                    extractedFields[keyByte] = data
+                case .string(let str):
+                    extractedFields[keyByte] = str
+                case .int(let int):
+                    extractedFields[keyByte] = int
+                case .uint(let uint):
+                    extractedFields[keyByte] = Int64(uint)
+                case .double(let dbl):
+                    extractedFields[keyByte] = dbl
+                case .bool(let b):
+                    extractedFields[keyByte] = b
+                case .array(let arr):
+                    // Convert msgpack array to [Any] with recursive nested array support
+                    // Handles flat arrays (Field 4 icon appearance) and nested arrays
+                    // (Field 5 file attachments: [[filename, data], ...])
+                    extractedFields[keyByte] = Self.convertMsgpackArrayToSwift(arr)
+                case .map(let nestedMap):
+                    // Convert nested map to [String: Any]
+                    var nestedDict: [String: Any] = [:]
+                    for (nk, nv) in nestedMap {
+                        if case .string(let nkStr) = nk {
+                            switch nv {
+                            case .double(let dbl):
+                                nestedDict[nkStr] = dbl
+                            case .int(let int):
+                                nestedDict[nkStr] = int
+                            case .string(let str):
+                                nestedDict[nkStr] = str
+                            default:
+                                break
                             }
                         }
-                        extractedFields[keyByte] = nestedDict
-                    default:
-                        break
                     }
+                    extractedFields[keyByte] = nestedDict
+                default:
+                    break
                 }
             }
             fields = extractedFields

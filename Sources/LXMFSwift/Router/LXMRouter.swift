@@ -18,6 +18,25 @@ import os.log
 
 private let routerLogger = Logger(subsystem: "com.columba.app", category: "LXMRouter")
 
+/// File-based debug log for LXMF delivery diagnostics.
+/// Writes to /tmp/columba_lxmf_delivery.log to survive syslog drops.
+private func lxmfDeliveryLog(_ msg: String) {
+    let ts = ISO8601DateFormatter().string(from: Date())
+    let line = "[\(ts)] \(msg)\n"
+    let url = URL(fileURLWithPath: "/tmp/columba_lxmf_delivery.log")
+    if let data = line.data(using: .utf8) {
+        if FileManager.default.fileExists(atPath: url.path) {
+            if let handle = try? FileHandle(forWritingTo: url) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                handle.closeFile()
+            }
+        } else {
+            try? data.write(to: url)
+        }
+    }
+}
+
 
 /// LXMF message router actor.
 ///
@@ -299,34 +318,53 @@ public actor LXMRouter {
     /// Reference: Python LXMRouter.lxmf_delivery() lines 1714-1799
     @discardableResult
     public func lxmfDelivery(_ data: Data, physicalStats: PhysicalStats? = nil) async -> Bool {
+        let dataHex = data.prefix(16).map { String(format: "%02x", $0) }.joined()
+        lxmfDeliveryLog("ENTRY: \(data.count)B prefix=\(dataHex)")
+        routerLogger.info("[LXMF_DELIVERY] Entry: \(data.count) bytes, prefix=\(dataHex)")
+
         do {
             // Extract source hash to look up identity for signature validation
             // LXMF format: [dest_hash 16B][src_hash 16B][signature 64B][payload...]
             guard data.count >= 32 else {
+                lxmfDeliveryLog("REJECTED: too short (\(data.count) < 32)")
+                routerLogger.warning("[LXMF_DELIVERY] REJECTED: too short (\(data.count) < 32)")
                 return false
             }
             let sourceHash = data.subdata(in: 16..<32)
+            let srcHex = sourceHash.prefix(4).map { String(format: "%02x", $0) }.joined()
 
             // Self-echo detection: relay broadcasts our own outbound messages back to us.
             let localDeliveryHash = Destination.hash(identity: identity, appName: "lxmf", aspects: ["delivery"])
             if sourceHash == localDeliveryHash {
+                lxmfDeliveryLog("REJECTED: self-echo src=\(srcHex)")
+                routerLogger.info("[LXMF_DELIVERY] REJECTED: self-echo from \(srcHex)")
                 return false
             }
 
             // Look up source identity from cache for signature validation
             let sourceIdentity = identityCache[sourceHash]
+            lxmfDeliveryLog("source=\(srcHex) identityCached=\(sourceIdentity != nil)")
+            routerLogger.info("[LXMF_DELIVERY] source=\(srcHex), identityCached=\(sourceIdentity != nil)")
 
             // Unpack message from wire format, passing source identity if known
             var message = try LXMessage.unpackFromBytes(data, sourceIdentity: sourceIdentity)
+            let msgHashHex = message.hash.prefix(4).map { String(format: "%02x", $0) }.joined()
+            let fieldsDesc = message.fields?.keys.map { String(format: "0x%02x", $0) }.joined(separator: ",") ?? "nil"
+            lxmfDeliveryLog("UNPACKED: hash=\(msgHashHex) contentLen=\(message.content.count) fields=[\(fieldsDesc)] sigValid=\(message.signatureValidated)")
+            routerLogger.info("[LXMF_DELIVERY] Unpacked: hash=\(msgHashHex) contentLen=\(message.content.count) fields=[\(fieldsDesc)] sigValid=\(message.signatureValidated) unverified=\(String(describing: message.unverifiedReason))")
 
             // Validate signature (silent drop if invalid, per Python behavior)
             // If source identity is unknown, accept but mark unverified
             if message.signatureValidated == false && message.unverifiedReason == .signatureInvalid {
+                lxmfDeliveryLog("REJECTED: invalid signature src=\(srcHex)")
+                routerLogger.warning("[LXMF_DELIVERY] REJECTED: invalid signature from \(srcHex)")
                 return false
             }
 
             // Check duplicate (transient ID = message hash)
             if deliveredTransientIDs[message.hash] != nil {
+                lxmfDeliveryLog("REJECTED: duplicate hash=\(msgHashHex)")
+                routerLogger.info("[LXMF_DELIVERY] REJECTED: duplicate hash=\(msgHashHex)")
                 return false
             }
 
@@ -355,6 +393,9 @@ public actor LXMRouter {
             }
 
             // Invoke delegate callback on main actor
+            let hasDelegate = delegateWrapper?.delegate != nil
+            lxmfDeliveryLog("ACCEPTED: hash=\(msgHashHex) contentLen=\(message.content.count) fields=[\(fieldsDesc)] hasDelegate=\(hasDelegate)")
+            routerLogger.info("[LXMF_DELIVERY] ACCEPTED: hash=\(msgHashHex) contentLen=\(message.content.count) fields=[\(fieldsDesc)] hasDelegate=\(hasDelegate)")
             if let wrapper = delegateWrapper, let delegate = wrapper.delegate {
                 Task { @MainActor in
                     delegate.router(self, didReceiveMessage: message)
@@ -366,7 +407,8 @@ public actor LXMRouter {
         } catch {
             // Invalid message format, signature failed, etc.
             // Python silently drops malformed messages
-            routerLogger.error("[LXMF_INBOUND] Delivery failed: \(error)")
+            lxmfDeliveryLog("REJECTED: error: \(error)")
+            routerLogger.error("[LXMF_DELIVERY] REJECTED: unpack/validation error: \(error)")
             return false
         }
     }
