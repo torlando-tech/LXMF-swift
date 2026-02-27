@@ -99,7 +99,7 @@ public actor LXMRouter {
     public var delegateWrapper: DelegateWrapper?
 
     /// Transport for message delivery (optional, set via setTransport)
-    public var transport: ReticuLumTransport?
+    public var transport: ReticulumTransport?
 
     /// Path table for route lookup (accessed via transport)
     public var pathTable: PathTable?
@@ -211,8 +211,8 @@ public actor LXMRouter {
 
     /// Set the transport for message delivery.
     ///
-    /// - Parameter transport: ReticuLumTransport instance for sending packets
-    public func setTransport(_ transport: ReticuLumTransport) async {
+    /// - Parameter transport: ReticulumTransport instance for sending packets
+    public func setTransport(_ transport: ReticulumTransport) async {
         self.transport = transport
         // Access path table from transport for route lookups
         self.pathTable = await transport.getPathTable()

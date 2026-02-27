@@ -186,7 +186,7 @@ extension LXMRouter {
     ///   - transport: Transport for link packet delivery
     /// - Returns: Active link to propagation node
     /// - Throws: LXMFError if link establishment fails
-    func getOrEstablishPropagationLink(to nodeHash: Data, transport: ReticuLumTransport) async throws -> Link {
+    func getOrEstablishPropagationLink(to nodeHash: Data, transport: ReticulumTransport) async throws -> Link {
         let nodeHex = nodeHash.prefix(8).map { String(format: "%02x", $0) }.joined()
         propLogger.error("[PROP_LINK] getOrEstablishPropagationLink to \(nodeHex)")
 

@@ -3,7 +3,7 @@
 //  LXMFSwift
 //
 //  LXMF message delivery methods: opportunistic and direct.
-//  Integrates with ReticuLumTransport for packet sending and Link for direct delivery.
+//  Integrates with ReticulumTransport for packet sending and Link for direct delivery.
 //
 //  Reference: LXMF/LXMRouter.py lines 2496-2700
 //
@@ -281,7 +281,7 @@ extension LXMRouter {
     /// - Throws: LXMFError if link establishment fails
     ///
     /// Reference: RNS Link.py, Python LXMF LXMRouter direct delivery
-    private func getOrEstablishLink(to destinationHash: Data, transport: ReticuLumTransport) async throws -> Link {
+    private func getOrEstablishLink(to destinationHash: Data, transport: ReticulumTransport) async throws -> Link {
         let destHex = destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
 
         // Check for existing delivery link
