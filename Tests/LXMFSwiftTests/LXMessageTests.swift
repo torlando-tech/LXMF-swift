@@ -349,3 +349,205 @@ extension Data {
         map { String(format: "%02x", $0) }.joined()
     }
 }
+
+// MARK: - Image Message Crash Reproduction Tests
+
+final class LXMessageImageCrashTests: XCTestCase {
+
+    /// Test: pack and unpack a message with a 77KB JPEG image field
+    /// This reproduces the crash loop that occurred when pending outbound
+    /// image messages were loaded from the database on startup.
+    func testLargeImageMessagePackUnpack() throws {
+        let sourceIdentity = Identity()
+        let destIdentity = Identity()
+
+        // Create ~77KB of fake JPEG data (JPEG header + random)
+        var jpegData = Data([0xFF, 0xD8, 0xFF, 0xE0])  // JPEG SOI + APP0 marker
+        jpegData.append(Data(repeating: 0xAB, count: 77400))
+
+        // Build fields with image + icon appearance (matching real message)
+        let fields: [UInt8: Any] = [
+            LXMessage.FIELD_IMAGE: ["jpeg", jpegData] as [Any],
+            0x04: ["food-apple", Data([0xFF, 0xFF, 0xFF]), Data([0x1E, 0x88, 0xE5])] as [Any]
+        ]
+
+        var message = LXMessage(
+            destinationHash: destIdentity.hash,
+            sourceIdentity: sourceIdentity,
+            content: Data(),  // image-only, no text
+            title: Data(),
+            fields: fields,
+            desiredMethod: .direct
+        )
+
+        // Step 1: Pack (should produce ~77.5KB)
+        let packed = try message.pack()
+        XCTAssertGreaterThan(packed.count, 77000, "Packed message should be >77KB")
+        print("[TEST] Packed size: \(packed.count) bytes")
+
+        // Step 2: Unpack (simulates loadPendingOutbound → toLXMessage)
+        let unpacked = try LXMessage.unpackFromBytes(packed)
+        XCTAssertNotNil(unpacked.fields)
+
+        // Step 3: Verify image field survived round-trip
+        let imageField = unpacked.fields?[LXMessage.FIELD_IMAGE] as? [Any]
+        XCTAssertNotNil(imageField, "Image field should be present after unpack")
+        XCTAssertEqual(imageField?.count, 2, "Image field should have [format, data]")
+
+        let format = imageField?[0] as? String
+        XCTAssertEqual(format, "jpeg")
+
+        let data = imageField?[1] as? Data
+        XCTAssertEqual(data?.count, 77404, "Image data should be 77404 bytes")
+    }
+
+    /// Test: create MessageRecord from packed image message and convert back
+    /// This exercises the DB persist/restore path
+    func testImageMessageRecordRoundTrip() throws {
+        let sourceIdentity = Identity()
+        let destIdentity = Identity()
+
+        var jpegData = Data([0xFF, 0xD8, 0xFF, 0xE0])
+        jpegData.append(Data(repeating: 0xCD, count: 77400))
+
+        let fields: [UInt8: Any] = [
+            LXMessage.FIELD_IMAGE: ["jpeg", jpegData] as [Any]
+        ]
+
+        var message = LXMessage(
+            destinationHash: destIdentity.hash,
+            sourceIdentity: sourceIdentity,
+            content: Data(),
+            title: Data(),
+            fields: fields,
+            desiredMethod: .direct
+        )
+        _ = try message.pack()
+
+        // Simulate DB storage
+        let record = try MessageRecord(from: message)
+        XCTAssertEqual(record.packedLxmf.count, message.packed!.count)
+
+        // Simulate DB restore (loadPendingOutbound → toLXMessage)
+        let restored = try record.toLXMessage()
+        XCTAssertNotNil(restored.packed)
+        XCTAssertEqual(restored.packed?.count, message.packed?.count)
+
+        // Verify fields survived
+        let restoredImage = restored.fields?[LXMessage.FIELD_IMAGE] as? [Any]
+        XCTAssertNotNil(restoredImage)
+        XCTAssertEqual((restoredImage?[1] as? Data)?.count, 77404)
+    }
+
+    /// Test: handleOutbound with a large image message
+    /// Verifies the opportunistic→direct fallback for messages exceeding packet size
+    func testHandleOutboundImageFallback() async throws {
+        let sourceIdentity = Identity()
+        let destIdentity = Identity()
+
+        var jpegData = Data([0xFF, 0xD8, 0xFF, 0xE0])
+        jpegData.append(Data(repeating: 0xEF, count: 77400))
+
+        let fields: [UInt8: Any] = [
+            LXMessage.FIELD_IMAGE: ["jpeg", jpegData] as [Any]
+        ]
+
+        var message = LXMessage(
+            destinationHash: destIdentity.hash,
+            sourceIdentity: sourceIdentity,
+            content: Data(),
+            title: Data(),
+            fields: fields,
+            desiredMethod: .opportunistic
+        )
+        message.fallbackMethod = .direct
+
+        // Use temp file DB (DatabasePool requires WAL mode, :memory: doesn't support it)
+        let tmpDir = FileManager.default.temporaryDirectory
+        let dbPath = tmpDir.appendingPathComponent("test_outbound_\(UUID().uuidString).db").path
+        defer { try? FileManager.default.removeItem(atPath: dbPath) }
+
+        let router = try await LXMRouter(identity: sourceIdentity, databasePath: dbPath)
+        try await router.handleOutbound(&message)
+
+        // Should have fallen back to direct (77KB > ENCRYPTED_PACKET_MAX_CONTENT)
+        XCTAssertEqual(message.method, .direct, "Should fallback from opportunistic to direct")
+        XCTAssertNotNil(message.packed)
+        // Without transport, processOutbound can't actually send, but the message
+        // should be packed and queued
+        XCTAssertTrue(message.state == .outbound || message.state == .sent)
+
+        await router.shutdown()
+    }
+
+    /// Test: simulate startup with 8 pending image messages in DB
+    /// This is the exact path that caused the crash loop:
+    /// 1. Save 8 packed image messages to DB with state=outbound
+    /// 2. Create new LXMRouter (loads pending, starts processOutbound)
+    /// 3. Run processOutbound cycle (transport=nil, so no delivery)
+    /// 4. Verify no crash occurs
+    func testStartupWith8PendingImageMessages() async throws {
+        let sourceIdentity = Identity()
+        let destIdentity = Identity()
+
+        let tmpDir = FileManager.default.temporaryDirectory
+        let dbPath = tmpDir.appendingPathComponent("test_startup_\(UUID().uuidString).db").path
+        defer { try? FileManager.default.removeItem(atPath: dbPath) }
+
+        // Phase 1: Create a DB with 8 pending image messages (simulates the crash state)
+        do {
+            let db = try LXMFDatabase(path: dbPath)
+
+            for i in 0..<8 {
+                var jpegData = Data([0xFF, 0xD8, 0xFF, 0xE0])
+                jpegData.append(Data(repeating: UInt8(i), count: 77400))
+
+                let fields: [UInt8: Any] = [
+                    LXMessage.FIELD_IMAGE: ["jpeg", jpegData] as [Any],
+                    0x04: ["food-apple", Data([0xFF, 0xFF, 0xFF]), Data([0x1E, 0x88, 0xE5])] as [Any]
+                ]
+
+                var message = LXMessage(
+                    destinationHash: destIdentity.hash,
+                    sourceIdentity: sourceIdentity,
+                    content: Data(),
+                    title: Data(),
+                    fields: fields,
+                    desiredMethod: .direct
+                )
+                _ = try message.pack()
+
+                // Save as outbound (state=1)
+                try await db.saveMessage(message)
+            }
+
+            // Verify 8 messages in DB
+            let pending = try await db.loadPendingOutbound()
+            XCTAssertEqual(pending.count, 8, "Should have 8 pending messages")
+
+            // Verify each message has packed data and image field
+            for msg in pending {
+                XCTAssertNotNil(msg.packed, "Loaded message should have packed data")
+                XCTAssertGreaterThan(msg.packed!.count, 77000)
+                let imageField = msg.fields?[LXMessage.FIELD_IMAGE] as? [Any]
+                XCTAssertNotNil(imageField, "Image field should survive DB round-trip")
+            }
+        }
+
+        // Phase 2: Simulate app restart — create new router from same DB
+        // This is the exact path: LXMRouter.init loads pending, starts processOutbound
+        let router = try await LXMRouter(identity: sourceIdentity, databasePath: dbPath)
+
+        // Phase 3: Run a few processOutbound cycles (transport=nil, so all deliveries skip)
+        for _ in 0..<3 {
+            await router.processOutbound()
+        }
+
+        // Phase 4: Verify no crash — if we got here, the bug is reproduced and fixed
+        // The messages should still be in pending (can't deliver without transport)
+        // or moved to failed (MAX_OUTBOUND_AGE exceeded, though unlikely in test)
+        print("[TEST] Startup with 8 pending image messages completed without crash")
+
+        await router.shutdown()
+    }
+}

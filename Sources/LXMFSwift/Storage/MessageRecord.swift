@@ -148,7 +148,7 @@ public struct MessageRecord: Codable, FetchableRecord, PersistableRecord {
         // This column is retained for potential future use in database queries.
         self.fields = nil
 
-        self.deliveryAttempts = 0
+        self.deliveryAttempts = message.deliveryAttempts
         self.progress = 0.0
         self.rssi = message.rssi
         self.snr = message.snr
@@ -185,6 +185,9 @@ public struct MessageRecord: Codable, FetchableRecord, PersistableRecord {
 
         // Restore incoming flag (unpackFromBytes hardcodes incoming=true)
         message.incoming = incoming
+
+        // Restore delivery attempts (prevents infinite retry across restarts)
+        message.deliveryAttempts = deliveryAttempts
 
         return message
     }

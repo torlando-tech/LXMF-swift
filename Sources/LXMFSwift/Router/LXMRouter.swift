@@ -67,6 +67,10 @@ public actor LXMRouter {
     /// Duplicate detection cache expiry (1 hour)
     public static let DUPLICATE_CACHE_EXPIRY: TimeInterval = 3600
 
+    /// Maximum age (seconds) for pending outbound messages before marking as failed.
+    /// Prevents crash loops from stuck messages that can never be delivered.
+    public static let MAX_OUTBOUND_AGE: TimeInterval = 300  // 5 minutes
+
     // MARK: - Properties
 
     /// Local identity for signing outbound messages
@@ -161,16 +165,27 @@ public actor LXMRouter {
         self.database = try LXMFDatabase(path: databasePath)
 
         // Load pending outbound from database (restore after crash/restart)
-        let pending = try await database.loadPendingOutbound()
-        self.pendingOutbound = pending
+        // Wrapped in do/catch to prevent corrupt messages from crashing init
+        do {
+            let pending = try await database.loadPendingOutbound()
+            self.pendingOutbound = pending
+        } catch {
+            print("[LXMF_ROUTER] WARNING: Failed to load pending outbound: \(error). Starting with empty queue.")
+            self.pendingOutbound = []
+        }
 
         // Load failed outbound from database
-        let failed = try await database.loadFailedOutbound()
-        self.failedOutbound = failed
+        do {
+            let failed = try await database.loadFailedOutbound()
+            self.failedOutbound = failed
+        } catch {
+            print("[LXMF_ROUTER] WARNING: Failed to load failed outbound: \(error). Starting with empty queue.")
+            self.failedOutbound = []
+        }
 
         // Start the outbound processing loop if there are pending messages
-        if !pending.isEmpty {
-            print("[LXMF_ROUTER] Starting outbound processor with \(pending.count) pending messages")
+        if !pendingOutbound.isEmpty {
+            print("[LXMF_ROUTER] Starting outbound processor with \(pendingOutbound.count) pending messages")
             Task {
                 await processOutbound()
             }
@@ -455,6 +470,22 @@ public actor LXMRouter {
                 continue
             }
 
+            // Check if message has been pending too long (prevents crash loops from stuck messages)
+            let messageAge = Date().timeIntervalSince1970 - pendingOutbound[i].timestamp
+            if messageAge > Self.MAX_OUTBOUND_AGE {
+                pendingOutbound[i].state = .failed
+                let expiredMsg = pendingOutbound[i]
+                indicesToRemove.insert(i)
+                failedOutbound.append(expiredMsg)
+                Task.detached { [database] in
+                    try? await database.updateMessageState(id: expiredMsg.hash, state: .failed)
+                }
+                let destHex = expiredMsg.destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+                print("[LXMF_ROUTER] Message expired (age=\(Int(messageAge))s): dest=\(destHex)")
+                notifyFailure(expiredMsg, reason: .maxAttemptsExceeded)
+                continue
+            }
+
             // Check if max delivery attempts exceeded
             if pendingOutbound[i].deliveryAttempts >= Self.MAX_DELIVERY_ATTEMPTS {
                 pendingOutbound[i].state = .failed
@@ -686,9 +717,14 @@ public actor LXMRouter {
     }
 
     /// Persist pending message state to database.
+    ///
+    /// Batches all saves into a single detached Task to avoid memory accumulation
+    /// from N captured message copies (important for large image messages).
     public func persistPendingState() async {
-        for message in pendingOutbound {
-            Task.detached { [database, message] in
+        guard !pendingOutbound.isEmpty else { return }
+        let messages = pendingOutbound  // Single copy of the array
+        Task.detached { [database] in
+            for message in messages {
                 try? await database.saveMessage(message)
             }
         }
