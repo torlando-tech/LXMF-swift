@@ -379,6 +379,7 @@ public actor LXMRouter {
                 message.rssi = stats.rssi
                 message.snr = stats.snr
                 message.q = stats.q
+                message.receivingInterface = stats.receivingInterface
             }
 
             // Mark as incoming
@@ -722,9 +723,13 @@ public struct PhysicalStats: Sendable {
     /// Link quality indicator (0.0 to 1.0)
     public var q: Double?
 
-    public init(rssi: Double? = nil, snr: Double? = nil, q: Double? = nil) {
+    /// Human-readable name of the interface that received this message
+    public var receivingInterface: String?
+
+    public init(rssi: Double? = nil, snr: Double? = nil, q: Double? = nil, receivingInterface: String? = nil) {
         self.rssi = rssi
         self.snr = snr
         self.q = q
+        self.receivingInterface = receivingInterface
     }
 }

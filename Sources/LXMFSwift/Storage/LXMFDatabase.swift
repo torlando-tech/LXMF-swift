@@ -114,6 +114,13 @@ public actor LXMFDatabase {
             }
         }
 
+        // v4: Add receiving_interface column to messages
+        migrator.registerMigration("v4_add_receiving_interface") { db in
+            try db.alter(table: "messages") { t in
+                t.add(column: "receiving_interface", .text)
+            }
+        }
+
         try migrator.migrate(dbPool)
     }
 

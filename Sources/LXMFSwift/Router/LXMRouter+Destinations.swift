@@ -139,8 +139,9 @@ extension LXMRouter {
         }
 
         // STEP 3: Route to delivery handler for unpacking and validation
-        print("[LXMF_INBOUND] Calling lxmfDelivery() with \(lxmfData.count) bytes")
-        let accepted = await lxmfDelivery(lxmfData)
+        let stats = PhysicalStats(receivingInterface: packet.receivingInterface)
+        print("[LXMF_INBOUND] Calling lxmfDelivery() with \(lxmfData.count) bytes, interface=\(packet.receivingInterface ?? "nil")")
+        let accepted = await lxmfDelivery(lxmfData, physicalStats: stats)
         print("[LXMF_INBOUND] lxmfDelivery() returned accepted=\(accepted)")
     }
 

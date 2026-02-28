@@ -75,6 +75,9 @@ public struct MessageRecord: Codable, FetchableRecord, PersistableRecord {
     /// Ratchet ID (optional)
     public var ratchetId: Data?
 
+    /// Human-readable name of the interface that received this message
+    public var receivingInterface: String?
+
     /// Packed LXMF wire format (for retransmission)
     public var packedLxmf: Data
 
@@ -106,6 +109,7 @@ public struct MessageRecord: Codable, FetchableRecord, PersistableRecord {
         case snr
         case q
         case ratchetId = "ratchet_id"
+        case receivingInterface = "receiving_interface"
         case packedLxmf = "packed_lxmf"
         case createdAt = "created_at"
         case updatedAt = "updated_at"
@@ -146,10 +150,11 @@ public struct MessageRecord: Codable, FetchableRecord, PersistableRecord {
 
         self.deliveryAttempts = 0
         self.progress = 0.0
-        self.rssi = nil
-        self.snr = nil
-        self.q = nil
+        self.rssi = message.rssi
+        self.snr = message.snr
+        self.q = message.q
         self.ratchetId = nil
+        self.receivingInterface = message.receivingInterface
 
         let now = Date().timeIntervalSince1970
         self.createdAt = now

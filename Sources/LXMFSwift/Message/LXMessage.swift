@@ -102,6 +102,9 @@ public struct LXMessage {
     public var snr: Double?
     public var q: Double?
 
+    /// Human-readable name of the interface that received this message
+    public var receivingInterface: String?
+
     // MARK: - Initialization
 
     /// Create new outbound message.
