@@ -131,10 +131,23 @@ extension LXMRouter {
         // Update message state
         message.state = .sending
 
+        // Register proof callback BEFORE sending to avoid race condition.
+        // The proof might arrive before we get a chance to register after send.
+        let packetTruncatedHash = packet.getTruncatedHash()
+        let truncHashHex = packetTruncatedHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+        let msgHash = message.hash
+        let msgHashHex = msgHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+        print("[LXMF_PROOF] Registering proof callback: packetHash=\(truncHashHex), msgHash=\(msgHashHex)")
+        await transport.registerProofCallback(truncatedHash: packetTruncatedHash) { [weak self] in
+            await self?.handleDeliveryProofReceived(messageHash: msgHash)
+        }
+
         // Send via transport
         do {
             try await transport.send(packet: packet)
         } catch {
+            // Remove proof callback on send failure
+            await transport.removeProofCallback(truncatedHash: packetTruncatedHash)
             throw error
         }
 

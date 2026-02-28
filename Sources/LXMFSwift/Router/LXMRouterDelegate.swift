@@ -48,6 +48,16 @@ public protocol LXMRouterDelegate: AnyObject, Sendable {
     ///   - reason: The error causing failure
     func router(_ router: LXMRouter, didFailMessage message: LXMessage, reason: LXMFError)
 
+    /// Called when a delivery proof is received for a sent message.
+    ///
+    /// This indicates the recipient has received the message. The message's
+    /// state has been updated to `.delivered` in the database.
+    ///
+    /// - Parameters:
+    ///   - router: The router managing the message
+    ///   - messageHash: The hash of the delivered message (32 bytes)
+    func router(_ router: LXMRouter, didConfirmDelivery messageHash: Data)
+
     /// Called when propagation sync state changes.
     ///
     /// Provides progress updates during sync operations for UI display.
@@ -80,6 +90,10 @@ public extension LXMRouterDelegate {
     }
 
     func router(_ router: LXMRouter, didFailMessage message: LXMessage, reason: LXMFError) {
+        // Default: no-op
+    }
+
+    func router(_ router: LXMRouter, didConfirmDelivery messageHash: Data) {
         // Default: no-op
     }
 

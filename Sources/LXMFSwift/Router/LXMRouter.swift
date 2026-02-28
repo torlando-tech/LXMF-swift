@@ -637,6 +637,32 @@ public actor LXMRouter {
         }
     }
 
+    // MARK: - Delivery Proof Handling
+
+    /// Handle delivery proof received for a sent message.
+    ///
+    /// Updates the message state to `.delivered` in the database and notifies
+    /// the delegate to trigger UI refresh (single checkmark → double checkmark).
+    ///
+    /// - Parameter messageHash: The LXMF message hash (32 bytes)
+    public func handleDeliveryProofReceived(messageHash: Data) {
+        let hashHex = messageHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+        routerLogger.error("[PROOF] Delivery proof received for message \(hashHex, privacy: .public)")
+
+        // Update database state to delivered
+        Task.detached { [database] in
+            try? await database.updateMessageState(id: messageHash, state: .delivered)
+        }
+
+        // Notify delegate for UI refresh
+        if let wrapper = delegateWrapper, let delegate = wrapper.delegate {
+            let hash = messageHash
+            Task { @MainActor in
+                delegate.router(self, didConfirmDelivery: hash)
+            }
+        }
+    }
+
     // MARK: - Path Management
 
     /// Check if path exists for destination.
