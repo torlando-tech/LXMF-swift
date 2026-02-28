@@ -269,6 +269,19 @@ public actor LXMFDatabase {
         }
     }
 
+    /// Delete a single message by its ID hash.
+    ///
+    /// - Parameter messageId: Message hash (32 bytes)
+    /// - Throws: DatabaseError
+    public func deleteMessage(id messageId: Data) throws {
+        try dbPool.write { db in
+            try db.execute(
+                sql: "DELETE FROM messages WHERE message_id = ?",
+                arguments: [messageId]
+            )
+        }
+    }
+
     /// Ensure a conversation exists for a destination.
     ///
     /// Creates a new conversation record if one doesn't exist.
