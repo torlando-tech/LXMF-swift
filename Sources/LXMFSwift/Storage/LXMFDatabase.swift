@@ -370,7 +370,6 @@ public actor LXMFDatabase {
         try dbPool.read { db in
             try MessageRecord
                 .filter(Column("conversation_hash") == hash)
-                .filter(Column("content") != Data())
                 .order(Column("timestamp").desc)
                 .limit(limit, offset: offset)
                 .fetchAll(db)

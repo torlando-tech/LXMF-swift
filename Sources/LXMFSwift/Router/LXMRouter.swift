@@ -69,7 +69,8 @@ public actor LXMRouter {
 
     /// Maximum age (seconds) for pending outbound messages before marking as failed.
     /// Prevents crash loops from stuck messages that can never be delivered.
-    public static let MAX_OUTBOUND_AGE: TimeInterval = 300  // 5 minutes
+    /// Set high (24h) to avoid prematurely failing messages on slow mesh networks.
+    public static let MAX_OUTBOUND_AGE: TimeInterval = 86400  // 24 hours
 
     // MARK: - Properties
 
@@ -309,9 +310,11 @@ public actor LXMRouter {
         // Add to pending outbound queue
         pendingOutbound.append(message)
 
-        // Persist to database (async, non-blocking)
-        Task.detached { [database, message] in
-            try? await database.saveMessage(message)
+        // Persist to database before processing so the message survives force-quit
+        do {
+            try await database.saveMessage(message)
+        } catch {
+            routerLogger.error("[OUTBOUND] Failed to persist message: \(error)")
         }
 
         // Trigger outbound processing
