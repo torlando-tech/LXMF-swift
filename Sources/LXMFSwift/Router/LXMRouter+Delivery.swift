@@ -15,6 +15,38 @@ import os.log
 
 private let directSendLogger = Logger(subsystem: "com.columba.app", category: "DirectSend")
 
+// MARK: - Outbound Resource Handler
+
+/// Resource callback handler for outbound LXMF direct delivery over links.
+///
+/// When a resource transfer completes (RESOURCE_PRF received from receiver),
+/// maps the resource hash back to the LXMF message hash and marks it delivered.
+/// This is what triggers the double checkmark in the UI.
+///
+/// Reference: Python LXMF/LXMRouter.py resource_concluded()
+final class LXMFOutboundResourceHandler: ResourceCallbacks, @unchecked Sendable {
+    private let router: LXMRouter
+
+    init(router: LXMRouter) {
+        self.router = router
+    }
+
+    func resourceConcluded(_ resource: Resource) async {
+        let state = await resource.state
+        guard state == .complete else {
+            print("[LXMF_RESOURCE_OUT] Resource concluded in state \(state), not complete")
+            return
+        }
+        guard let resourceHash = await resource.hash else {
+            print("[LXMF_RESOURCE_OUT] Resource concluded but no hash")
+            return
+        }
+        let resHex = resourceHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+        print("[LXMF_RESOURCE_OUT] Resource \(resHex) transfer confirmed by receiver")
+        await router.handleResourceTransferComplete(resourceHash: resourceHash)
+    }
+}
+
 /// LXMF message context byte for link packets
 public enum LXMFContext {
     /// LXMF message context (value from Python: 0xF2)
@@ -260,11 +292,26 @@ extension LXMRouter {
         } else {
             // Need Resource for large message
             directSendLogger.info("[DIRECT] Message too large for link packet (\(packed.count) > \(LXMFConstants.LINK_PACKET_MAX_CONTENT)), using Resource transfer")
+
+            // Set up outbound resource handler for delivery confirmation (double checkmark).
+            // When RESOURCE_PRF is received, this handler maps resource hash → message hash
+            // and calls handleDeliveryProofReceived() to update the DB and UI.
+            let outboundHandler = LXMFOutboundResourceHandler(router: self)
+            await link.setResourceCallbacks(outboundHandler)
+
             let resource = try await link.sendResource(data: packed, requestId: nil, isResponse: false)
             let numParts = await resource.numParts
             let resHash = await resource.hash
             let resHashHex = resHash?.prefix(8).map { String(format: "%02x", $0) }.joined() ?? "nil"
             directSendLogger.info("[DIRECT] Resource created: hash=\(resHashHex), parts=\(numParts), advertisement sent")
+
+            // Register resource hash → message hash for delivery confirmation
+            if let resHash = resHash {
+                let msgHash = message.hash
+                let msgHashHex = msgHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+                directSendLogger.info("[DIRECT] Registered resource \(resHashHex) → message \(msgHashHex) for delivery confirmation")
+                pendingResourceDeliveries[resHash] = msgHash
+            }
         }
 
         // Mark as sent

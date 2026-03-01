@@ -112,6 +112,10 @@ public actor LXMRouter {
     /// Active and pending links for direct delivery
     public var deliveryLinks: [Data: Link] = [:]
 
+    /// Map outbound resource hash → message hash for delivery confirmation.
+    /// When RESOURCE_PRF is received, we look up the message hash here to mark it delivered.
+    public var pendingResourceDeliveries: [Data: Data] = [:]
+
     /// Active propagation links (separate cache from delivery links)
     public var propagationLinks: [Data: Link] = [:]
 
@@ -696,6 +700,23 @@ public actor LXMRouter {
                 delegate.router(self, didConfirmDelivery: hash)
             }
         }
+    }
+
+    /// Handle outbound resource transfer completion (RESOURCE_PRF received).
+    ///
+    /// Called by `LXMFOutboundResourceHandler` when a resource proof is received.
+    /// Looks up the corresponding message hash and marks it as delivered.
+    ///
+    /// - Parameter resourceHash: The 32-byte resource hash
+    public func handleResourceTransferComplete(resourceHash: Data) {
+        let resHex = resourceHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+        guard let messageHash = pendingResourceDeliveries.removeValue(forKey: resourceHash) else {
+            routerLogger.info("[PROOF] Resource \(resHex, privacy: .public) completed but no pending message mapping")
+            return
+        }
+        let msgHex = messageHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+        routerLogger.info("[PROOF] Resource \(resHex, privacy: .public) → message \(msgHex, privacy: .public), marking delivered")
+        handleDeliveryProofReceived(messageHash: messageHash)
     }
 
     // MARK: - Path Management
