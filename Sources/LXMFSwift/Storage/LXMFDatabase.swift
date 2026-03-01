@@ -473,10 +473,12 @@ public actor LXMFDatabase {
                 conversation.lastMessageTimestamp = message.timestamp
                 conversation.updatedAt = Date().timeIntervalSince1970
 
-                // Generate preview (first 100 chars of content as UTF-8 string)
-                if let contentStr = String(data: message.content, encoding: .utf8) {
-                    let preview = String(contentStr.prefix(100))
-                    conversation.lastMessagePreview = preview
+                // Generate preview (first 100 chars of content as UTF-8 string).
+                // Skip empty content (e.g. telemetry-only messages) to preserve previous preview.
+                if !message.content.isEmpty,
+                   let contentStr = String(data: message.content, encoding: .utf8),
+                   !contentStr.isEmpty {
+                    conversation.lastMessagePreview = String(contentStr.prefix(100))
                 }
             }
 
