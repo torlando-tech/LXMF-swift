@@ -85,18 +85,6 @@ public struct LocationTelemetry: Equatable, Sendable {
         self.lastUpdate = lastUpdate
     }
 
-    /// True when all values are zero (cease signal).
-    public var isCeased: Bool {
-        latitude == 0 && longitude == 0 && altitude == 0 &&
-        speed == 0 && bearing == 0 && accuracy == 0 && lastUpdate == 0
-    }
-
-    /// Create a cease signal (all zeros).
-    public static func ceaseSignal() -> LocationTelemetry {
-        LocationTelemetry(latitude: 0, longitude: 0, altitude: 0,
-                          speed: 0, bearing: 0, accuracy: 0, lastUpdate: 0)
-    }
-
     // MARK: - Encoding
 
     /// Encode to the 7-element Sideband sensor array format.

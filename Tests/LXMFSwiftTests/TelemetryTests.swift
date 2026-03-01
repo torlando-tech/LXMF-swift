@@ -30,9 +30,6 @@ final class TelemetryTests: XCTestCase {
     /// {SID_TIME: 1703980800, SID_LOCATION: [lat, lon, alt, spd, brg, acc, ts]}
     private let pythonPackedHex = "8201ce6590af000297c40402406634c404f8b40738c40400002710c40400000226c40400004650c40203e8ce6590af00"
 
-    /// Cease signal: all zeros
-    private let pythonCeaseHex = "8201000297c40400000000c40400000000c40400000000c40400000000c40400000000c402000000"
-
     /// Sydney, Australia: lat=-33.8688, lon=151.2093
     private let pythonSydneyHex = "8201ce6590af640297c404fdfb3400c40409034554c404000016a8c40400000000c40400000000c40205dcce6590af64"
 
@@ -162,27 +159,6 @@ final class TelemetryTests: XCTestCase {
         XCTAssertEqual(loc.bearing, 180.0, accuracy: 0.01)
         XCTAssertEqual(loc.accuracy, 10.0, accuracy: 0.01)
         XCTAssertEqual(loc.lastUpdate, 1703980800)
-    }
-
-    func testCeaseSignalMatchesPython() {
-        let cease = LocationTelemetry.ceaseSignal()
-        let packet = TelemetryPacket(timestamp: 0, location: cease)
-        let encoded = packet.encode()
-
-        let expectedBytes = Data(hexString: pythonCeaseHex)!
-        XCTAssertEqual(encoded, expectedBytes,
-                       "Cease signal must match Python output.\n" +
-                       "Swift:  \(encoded.map { String(format: "%02x", $0) }.joined())\n" +
-                       "Python: \(pythonCeaseHex)")
-    }
-
-    func testCeaseSignalDetection() {
-        let pythonBytes = Data(hexString: pythonCeaseHex)!
-        let packet = TelemetryPacket.decode(from: pythonBytes)
-
-        XCTAssertNotNil(packet)
-        XCTAssertNotNil(packet!.location)
-        XCTAssertTrue(packet!.location!.isCeased, "All-zero location should be detected as cease signal")
     }
 
     func testSydneyNegativeLatitudeMatchesPython() {
