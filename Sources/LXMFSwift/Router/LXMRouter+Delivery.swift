@@ -379,6 +379,15 @@ extension LXMRouter {
         do {
             try await waitForLinkActive(link, timeout: LXMFConstants.LINK_ESTABLISHMENT_TIMEOUT)
         } catch {
+            // Clean up stale pending link from transport to prevent accumulation.
+            // Without this, each failed attempt leaves a stale entry in pendingLinks,
+            // causing link establishment delay (each retry creates a new link_id but
+            // old ones are never cleaned up, and the receiver may respond to an old one).
+            let linkId = await link.linkId
+            let linkIdHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
+            print("[LXMF_LINK] Cleaning up stale pending link \(linkIdHex)")
+            await transport.unregisterLink(linkId: linkId)
+            deliveryLinks.removeValue(forKey: destinationHash)
             throw error
         }
 
