@@ -54,6 +54,9 @@ public struct ConversationRecord: Codable, FetchableRecord, PersistableRecord {
     /// Background color hex for peer's icon (6 chars, e.g., "1E88E5")
     public var iconBgColor: String?
 
+    /// Whether this conversation is pinned to the top
+    public var isPinned: Int = 0
+
     // MARK: - Column Mapping (snake_case to camelCase)
 
     enum CodingKeys: String, CodingKey {
@@ -69,6 +72,7 @@ public struct ConversationRecord: Codable, FetchableRecord, PersistableRecord {
         case iconName = "icon_name"
         case iconFgColor = "icon_fg_color"
         case iconBgColor = "icon_bg_color"
+        case isPinned = "is_pinned"
     }
 
     // MARK: - Computed Properties

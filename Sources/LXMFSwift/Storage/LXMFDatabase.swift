@@ -121,6 +121,13 @@ public actor LXMFDatabase {
             }
         }
 
+        // v5: Add is_pinned column to conversations
+        migrator.registerMigration("v5_add_pinned") { db in
+            try db.alter(table: "conversations") { t in
+                t.add(column: "is_pinned", .integer).defaults(to: 0)
+            }
+        }
+
         try migrator.migrate(dbPool)
     }
 
@@ -320,6 +327,44 @@ public actor LXMFDatabase {
                 )
                 try conversation.insert(db)
             }
+        }
+    }
+
+    /// Set pinned status for a conversation.
+    ///
+    /// - Parameters:
+    ///   - hash: Destination hash (16 bytes)
+    ///   - isPinned: Whether to pin the conversation
+    /// - Throws: DatabaseError
+    public func setPinned(hash: Data, isPinned: Bool) throws {
+        try dbPool.write { db in
+            try db.execute(
+                sql: """
+                    UPDATE conversations
+                    SET is_pinned = ?, updated_at = ?
+                    WHERE destination_hash = ?
+                    """,
+                arguments: [isPinned ? 1 : 0, Date().timeIntervalSince1970, hash]
+            )
+        }
+    }
+
+    /// Update display name for a conversation.
+    ///
+    /// - Parameters:
+    ///   - hash: Destination hash (16 bytes)
+    ///   - displayName: New display name (nil to clear)
+    /// - Throws: DatabaseError
+    public func updateDisplayName(hash: Data, displayName: String?) throws {
+        try dbPool.write { db in
+            try db.execute(
+                sql: """
+                    UPDATE conversations
+                    SET display_name = ?, updated_at = ?
+                    WHERE destination_hash = ?
+                    """,
+                arguments: [displayName, Date().timeIntervalSince1970, hash]
+            )
         }
     }
 
