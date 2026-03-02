@@ -72,11 +72,12 @@ public struct PropagationTransferState: Sendable {
 /// Parsed propagation node information from announce appData.
 ///
 /// Python LXMF propagation nodes announce with a 7-element msgpack array:
-/// `[enabled, timebase, isPropagationNode, perTransferLimit, perSyncLimit, stampCost, stampFlexibility]`
+/// `[enabled, timebase, isPropagationNode, perTransferLimit, perSyncLimit, stampCost, metadata]`
 ///
-/// Some implementations extend this with additional fields (peeringCost, metadata).
+/// Element [5] may be a single int (stamp cost) or array `[stampCost, flexibility, peeringCost]`.
+/// Element [6] is a metadata dict containing `{PN_META_NAME(0x01): name_bytes}`.
 ///
-/// Reference: LXMF/LXMRouter.py propagation_announce_handler
+/// Reference: LXMF/LXMRouter.py propagation_announce_handler, LXMF/LXMF.py pn_name_from_app_data
 public struct PropagationNodeInfo: Sendable {
     /// Whether the propagation node is enabled.
     public let enabled: Bool
@@ -98,6 +99,12 @@ public struct PropagationNodeInfo: Sendable {
 
     /// Stamp flexibility (acceptable variance in stamp difficulty).
     public let stampFlexibility: Int
+
+    /// Display name from metadata dict (element [6], key PN_META_NAME = 0x01).
+    public let displayName: String?
+
+    /// Python LXMF constant: key for propagation node name in metadata dict.
+    private static let PN_META_NAME: UInt64 = 0x01
 
     /// Parse propagation node info from announce appData.
     ///
@@ -175,6 +182,26 @@ public struct PropagationNodeInfo: Sendable {
             stampFlexibility = 0
         }
 
+        // Element [6] is metadata dict containing {PN_META_NAME: name_bytes}
+        let displayName: String?
+        if elements.count > 6, case .map(let metadata) = elements[6] {
+            let nameKey = LXMFMessagePackValue.uint(PN_META_NAME)
+            if let nameVal = metadata[nameKey] {
+                switch nameVal {
+                case .binary(let d):
+                    displayName = String(data: d, encoding: .utf8)
+                case .string(let s):
+                    displayName = s
+                default:
+                    displayName = nil
+                }
+            } else {
+                displayName = nil
+            }
+        } else {
+            displayName = nil
+        }
+
         return PropagationNodeInfo(
             enabled: enabled,
             timebase: timebase,
@@ -182,7 +209,8 @@ public struct PropagationNodeInfo: Sendable {
             perTransferLimit: perTransferLimit,
             perSyncLimit: perSyncLimit,
             stampCost: stampCost,
-            stampFlexibility: stampFlexibility
+            stampFlexibility: stampFlexibility,
+            displayName: displayName
         )
     }
 }
