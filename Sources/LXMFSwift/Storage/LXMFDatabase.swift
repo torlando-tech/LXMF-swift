@@ -268,6 +268,20 @@ public actor LXMFDatabase {
         }
     }
 
+    /// Set the unread count for a conversation (e.g. mark as unread with count=1).
+    public func setUnreadCount(hash: Data, count: Int) throws {
+        try dbPool.write { db in
+            try db.execute(
+                sql: """
+                    UPDATE conversations
+                    SET unread_count = ?, is_unread = ?, updated_at = ?
+                    WHERE destination_hash = ?
+                    """,
+                arguments: [count, count > 0 ? 1 : 0, Date().timeIntervalSince1970, hash]
+            )
+        }
+    }
+
     /// Delete conversation and all its messages.
     ///
     /// Messages are automatically deleted via CASCADE foreign key constraint.
