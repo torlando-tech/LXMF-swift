@@ -16,27 +16,7 @@ import CryptoKit
 import ReticulumSwift
 import os.log
 
-private let routerLogger = Logger(subsystem: "com.columba.app", category: "LXMRouter")
-
-/// File-based debug log for LXMF delivery diagnostics.
-/// Writes to /tmp/columba_lxmf_delivery.log to survive syslog drops.
-private func lxmfDeliveryLog(_ msg: String) {
-    let ts = ISO8601DateFormatter().string(from: Date())
-    let line = "[\(ts)] \(msg)\n"
-    let url = URL(fileURLWithPath: "/tmp/columba_lxmf_delivery.log")
-    if let data = line.data(using: .utf8) {
-        if FileManager.default.fileExists(atPath: url.path) {
-            if let handle = try? FileHandle(forWritingTo: url) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                handle.closeFile()
-            }
-        } else {
-            try? data.write(to: url)
-        }
-    }
-}
-
+private let routerLogger = Logger(subsystem: "net.reticulum.lxmf", category: "LXMRouter")
 
 /// LXMF message router actor.
 ///
@@ -175,7 +155,7 @@ public actor LXMRouter {
             let pending = try await database.loadPendingOutbound()
             self.pendingOutbound = pending
         } catch {
-            print("[LXMF_ROUTER] WARNING: Failed to load pending outbound: \(error). Starting with empty queue.")
+            routerLogger.warning("Failed to load pending outbound: \(error). Starting with empty queue.")
             self.pendingOutbound = []
         }
 
@@ -184,13 +164,13 @@ public actor LXMRouter {
             let failed = try await database.loadFailedOutbound()
             self.failedOutbound = failed
         } catch {
-            print("[LXMF_ROUTER] WARNING: Failed to load failed outbound: \(error). Starting with empty queue.")
+            routerLogger.warning("Failed to load failed outbound: \(error). Starting with empty queue.")
             self.failedOutbound = []
         }
 
         // Start the outbound processing loop if there are pending messages
         if !pendingOutbound.isEmpty {
-            print("[LXMF_ROUTER] Starting outbound processor with \(pendingOutbound.count) pending messages")
+            routerLogger.info("Starting outbound processor with \(self.pendingOutbound.count) pending messages")
             Task {
                 await processOutbound()
             }
@@ -303,11 +283,10 @@ public actor LXMRouter {
             let packedPayloadSize = packed.count - (2 * LXMFConstants.DESTINATION_LENGTH + LXMFConstants.SIGNATURE_LENGTH)
             if packedPayloadSize > LXMFConstants.ENCRYPTED_PACKET_MAX_CONTENT {
                 let fallback = message.fallbackMethod ?? .direct
-                routerLogger.info("[OUTBOUND] Message too large for opportunistic (\(packedPayloadSize) > \(LXMFConstants.ENCRYPTED_PACKET_MAX_CONTENT)), falling back to \(String(describing: fallback))")
-                print("[LXMF] Message too large for opportunistic (\(packedPayloadSize) > \(LXMFConstants.ENCRYPTED_PACKET_MAX_CONTENT)), falling back to \(fallback)")
+                routerLogger.info("Message too large for opportunistic (\(packedPayloadSize) > \(LXMFConstants.ENCRYPTED_PACKET_MAX_CONTENT)), falling back to \(String(describing: fallback))")
                 message.method = fallback
             } else {
-                routerLogger.info("[OUTBOUND] Message fits in opportunistic: \(packedPayloadSize) bytes")
+                routerLogger.info("Message fits in opportunistic: \(packedPayloadSize) bytes")
             }
         }
 
@@ -318,7 +297,7 @@ public actor LXMRouter {
         do {
             try await database.saveMessage(message)
         } catch {
-            routerLogger.error("[OUTBOUND] Failed to persist message: \(error)")
+            routerLogger.error("Failed to persist message: \(error)")
         }
 
         // Trigger outbound processing
@@ -341,15 +320,13 @@ public actor LXMRouter {
     @discardableResult
     public func lxmfDelivery(_ data: Data, physicalStats: PhysicalStats? = nil) async -> Bool {
         let dataHex = data.prefix(16).map { String(format: "%02x", $0) }.joined()
-        lxmfDeliveryLog("ENTRY: \(data.count)B prefix=\(dataHex)")
-        routerLogger.info("[LXMF_DELIVERY] Entry: \(data.count) bytes, prefix=\(dataHex)")
+        routerLogger.info("Entry: \(data.count) bytes, prefix=\(dataHex)")
 
         do {
             // Extract source hash to look up identity for signature validation
             // LXMF format: [dest_hash 16B][src_hash 16B][signature 64B][payload...]
             guard data.count >= 32 else {
-                lxmfDeliveryLog("REJECTED: too short (\(data.count) < 32)")
-                routerLogger.warning("[LXMF_DELIVERY] REJECTED: too short (\(data.count) < 32)")
+                routerLogger.warning("REJECTED: too short (\(data.count) < 32)")
                 return false
             }
             let sourceHash = data.subdata(in: 16..<32)
@@ -358,35 +335,30 @@ public actor LXMRouter {
             // Self-echo detection: relay broadcasts our own outbound messages back to us.
             let localDeliveryHash = Destination.hash(identity: identity, appName: "lxmf", aspects: ["delivery"])
             if sourceHash == localDeliveryHash {
-                lxmfDeliveryLog("REJECTED: self-echo src=\(srcHex)")
-                routerLogger.info("[LXMF_DELIVERY] REJECTED: self-echo from \(srcHex)")
+                routerLogger.info("REJECTED: self-echo from \(srcHex)")
                 return false
             }
 
             // Look up source identity from cache for signature validation
             let sourceIdentity = identityCache[sourceHash]
-            lxmfDeliveryLog("source=\(srcHex) identityCached=\(sourceIdentity != nil)")
-            routerLogger.info("[LXMF_DELIVERY] source=\(srcHex), identityCached=\(sourceIdentity != nil)")
+            routerLogger.info("source=\(srcHex), identityCached=\(sourceIdentity != nil)")
 
             // Unpack message from wire format, passing source identity if known
             var message = try LXMessage.unpackFromBytes(data, sourceIdentity: sourceIdentity)
             let msgHashHex = message.hash.prefix(4).map { String(format: "%02x", $0) }.joined()
             let fieldsDesc = message.fields?.keys.map { String(format: "0x%02x", $0) }.joined(separator: ",") ?? "nil"
-            lxmfDeliveryLog("UNPACKED: hash=\(msgHashHex) contentLen=\(message.content.count) fields=[\(fieldsDesc)] sigValid=\(message.signatureValidated)")
-            routerLogger.info("[LXMF_DELIVERY] Unpacked: hash=\(msgHashHex) contentLen=\(message.content.count) fields=[\(fieldsDesc)] sigValid=\(message.signatureValidated) unverified=\(String(describing: message.unverifiedReason))")
+            routerLogger.info("Unpacked: hash=\(msgHashHex) contentLen=\(message.content.count) fields=[\(fieldsDesc)] sigValid=\(message.signatureValidated) unverified=\(String(describing: message.unverifiedReason))")
 
             // Validate signature (silent drop if invalid, per Python behavior)
             // If source identity is unknown, accept but mark unverified
             if message.signatureValidated == false && message.unverifiedReason == .signatureInvalid {
-                lxmfDeliveryLog("REJECTED: invalid signature src=\(srcHex)")
-                routerLogger.warning("[LXMF_DELIVERY] REJECTED: invalid signature from \(srcHex)")
+                routerLogger.warning("REJECTED: invalid signature from \(srcHex)")
                 return false
             }
 
             // Check duplicate (transient ID = message hash)
             if deliveredTransientIDs[message.hash] != nil {
-                lxmfDeliveryLog("REJECTED: duplicate hash=\(msgHashHex)")
-                routerLogger.info("[LXMF_DELIVERY] REJECTED: duplicate hash=\(msgHashHex)")
+                routerLogger.info("REJECTED: duplicate hash=\(msgHashHex)")
                 return false
             }
 
@@ -412,13 +384,12 @@ public actor LXMRouter {
             do {
                 try await database.saveMessage(message)
             } catch {
-                routerLogger.error("[LXMF_INBOUND] Failed to persist message: \(error)")
+                routerLogger.error("Failed to persist message: \(error)")
             }
 
             // Invoke delegate callback on main actor
             let hasDelegate = delegateWrapper?.delegate != nil
-            lxmfDeliveryLog("ACCEPTED: hash=\(msgHashHex) contentLen=\(message.content.count) fields=[\(fieldsDesc)] hasDelegate=\(hasDelegate)")
-            routerLogger.info("[LXMF_DELIVERY] ACCEPTED: hash=\(msgHashHex) contentLen=\(message.content.count) fields=[\(fieldsDesc)] hasDelegate=\(hasDelegate)")
+            routerLogger.info("ACCEPTED: hash=\(msgHashHex) contentLen=\(message.content.count) fields=[\(fieldsDesc)] hasDelegate=\(hasDelegate)")
             if let wrapper = delegateWrapper, let delegate = wrapper.delegate {
                 Task { @MainActor in
                     delegate.router(self, didReceiveMessage: message)
@@ -430,8 +401,7 @@ public actor LXMRouter {
         } catch {
             // Invalid message format, signature failed, etc.
             // Python silently drops malformed messages
-            lxmfDeliveryLog("REJECTED: error: \(error)")
-            routerLogger.error("[LXMF_DELIVERY] REJECTED: unpack/validation error: \(error)")
+            routerLogger.error("REJECTED: unpack/validation error: \(error)")
             return false
         }
     }
@@ -488,7 +458,7 @@ public actor LXMRouter {
                     try? await database.updateMessageState(id: expiredMsg.hash, state: .failed)
                 }
                 let destHex = expiredMsg.destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-                print("[LXMF_ROUTER] Message expired (age=\(Int(messageAge))s): dest=\(destHex)")
+                routerLogger.warning("Message expired (age=\(Int(messageAge))s): dest=\(destHex)")
                 notifyFailure(expiredMsg, reason: .maxAttemptsExceeded)
                 continue
             }
@@ -526,7 +496,7 @@ public actor LXMRouter {
                 case .opportunistic:
                     // Opportunistic delivery: single packet via transport
                     let destHashHex = pendingOutbound[i].destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-                    print("[LXMF_OPP] Processing opportunistic to \(destHashHex), attempts=\(pendingOutbound[i].deliveryAttempts)")
+                    routerLogger.info("Processing opportunistic to \(destHashHex), attempts=\(self.pendingOutbound[i].deliveryAttempts)")
 
                     // Check if we need path and don't have one
                     let hasPathForOpp = await hasPath(pendingOutbound[i].destinationHash)
@@ -537,11 +507,11 @@ public actor LXMRouter {
                         pendingOutbound[i].nextDeliveryAttempt = Date().addingTimeInterval(Self.PATH_REQUEST_WAIT)
                     } else {
                         // Attempt send (copy out for inout async call, then write back)
-                        print("[LXMF_OPP] Calling sendOpportunistic for \(destHashHex)")
+                        routerLogger.debug("Calling sendOpportunistic for \(destHashHex)")
                         var msg = pendingOutbound[i]
                         try await sendOpportunistic(&msg)
                         pendingOutbound[i] = msg
-                        print("[LXMF_OPP] sendOpportunistic completed for \(destHashHex)")
+                        routerLogger.info("sendOpportunistic completed for \(destHashHex)")
                         indicesToRemove.insert(i)
 
                         // Update database
@@ -556,15 +526,15 @@ public actor LXMRouter {
                     let destHashHex = pendingOutbound[i].destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
                     let hasPathToRecipient = await hasPath(pendingOutbound[i].destinationHash)
                     let attempt = pendingOutbound[i].deliveryAttempts
-                    routerLogger.info("[PROCESS] Direct delivery: dest=\(destHashHex), hasPath=\(hasPathToRecipient), attempt=\(attempt)")
-                    print("[LXMF_DIRECT] Checking path to \(destHashHex), hasPath=\(hasPathToRecipient)")
+                    routerLogger.info("Direct delivery: dest=\(destHashHex), hasPath=\(hasPathToRecipient), attempt=\(attempt)")
+                    routerLogger.debug("Checking path to \(destHashHex), hasPath=\(hasPathToRecipient)")
                     if hasPathToRecipient {
                         // Attempt link-based send (copy out for inout async call)
-                        routerLogger.info("[PROCESS] Starting sendDirect to \(destHashHex)")
+                        routerLogger.info("Starting sendDirect to \(destHashHex)")
                         var msg = pendingOutbound[i]
                         try await sendDirect(&msg)
                         pendingOutbound[i] = msg
-                        routerLogger.info("[PROCESS] sendDirect completed to \(destHashHex)")
+                        routerLogger.info("sendDirect completed to \(destHashHex)")
                         indicesToRemove.insert(i)
 
                         // Update database
@@ -574,8 +544,8 @@ public actor LXMRouter {
                         }
                     } else {
                         // Need path first
-                        routerLogger.warning("[PROCESS] No path to \(destHashHex), requesting path")
-                        print("[LXMF_DIRECT] No path to \(destHashHex), requesting path")
+                        routerLogger.warning("No path to \(destHashHex), requesting path")
+                        routerLogger.debug("No path to \(destHashHex), requesting path")
                         requestPath(pendingOutbound[i].destinationHash)
                         pendingOutbound[i].nextDeliveryAttempt = Date().addingTimeInterval(Self.PATH_REQUEST_WAIT)
                     }
@@ -617,7 +587,7 @@ public actor LXMRouter {
                 let backoffSeconds = min(Double(pendingOutbound[i].deliveryAttempts) * Self.PATH_REQUEST_WAIT, 300.0)
                 pendingOutbound[i].nextDeliveryAttempt = Date().addingTimeInterval(backoffSeconds)
                 let destHex = pendingOutbound[i].destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-                routerLogger.error("[PROCESS] Delivery failed for \(destHex): \(error.localizedDescription), retrying in \(backoffSeconds)s")
+                routerLogger.error("Delivery failed for \(destHex): \(error.localizedDescription), retrying in \(backoffSeconds)s")
             }
         }
 
@@ -686,7 +656,7 @@ public actor LXMRouter {
     /// - Parameter messageHash: The LXMF message hash (32 bytes)
     public func handleDeliveryProofReceived(messageHash: Data) {
         let hashHex = messageHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-        routerLogger.error("[PROOF] Delivery proof received for message \(hashHex, privacy: .public)")
+        routerLogger.error("Delivery proof received for message \(hashHex, privacy: .public)")
 
         // Update database state to delivered
         Task.detached { [database] in
@@ -711,11 +681,11 @@ public actor LXMRouter {
     public func handleResourceTransferComplete(resourceHash: Data) {
         let resHex = resourceHash.prefix(8).map { String(format: "%02x", $0) }.joined()
         guard let messageHash = pendingResourceDeliveries.removeValue(forKey: resourceHash) else {
-            routerLogger.info("[PROOF] Resource \(resHex, privacy: .public) completed but no pending message mapping")
+            routerLogger.info("Resource \(resHex, privacy: .public) completed but no pending message mapping")
             return
         }
         let msgHex = messageHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-        routerLogger.info("[PROOF] Resource \(resHex, privacy: .public) → message \(msgHex, privacy: .public), marking delivered")
+        routerLogger.info("Resource \(resHex, privacy: .public) → message \(msgHex, privacy: .public), marking delivered")
         handleDeliveryProofReceived(messageHash: messageHash)
     }
 

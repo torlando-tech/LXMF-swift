@@ -13,7 +13,8 @@ import CryptoKit
 import ReticulumSwift
 import os.log
 
-private let directSendLogger = Logger(subsystem: "com.columba.app", category: "DirectSend")
+private let directSendLogger = Logger(subsystem: "net.reticulum.lxmf", category: "DirectSend")
+private let routerLogger = Logger(subsystem: "net.reticulum.lxmf", category: "LXMRouter")
 
 // MARK: - Outbound Resource Handler
 
@@ -34,15 +35,15 @@ final class LXMFOutboundResourceHandler: ResourceCallbacks, @unchecked Sendable 
     func resourceConcluded(_ resource: Resource) async {
         let state = await resource.state
         guard state == .complete else {
-            print("[LXMF_RESOURCE_OUT] Resource concluded in state \(state), not complete")
+            routerLogger.warning("Outbound resource concluded in state \(String(describing: state)), not complete")
             return
         }
         guard let resourceHash = await resource.hash else {
-            print("[LXMF_RESOURCE_OUT] Resource concluded but no hash")
+            routerLogger.warning("Outbound resource concluded but no hash")
             return
         }
         let resHex = resourceHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-        print("[LXMF_RESOURCE_OUT] Resource \(resHex) transfer confirmed by receiver")
+        routerLogger.info("Outbound resource \(resHex) transfer confirmed by receiver")
         await router.handleResourceTransferComplete(resourceHash: resourceHash)
     }
 }
@@ -102,7 +103,7 @@ extension LXMRouter {
         let effectiveKey = pathEntry.effectiveEncryptionKey
         let hasRatchet = pathEntry.ratchet != nil && pathEntry.ratchet!.count == 32
         let keyHex = effectiveKey.prefix(8).map { String(format: "%02x", $0) }.joined()
-        print("[LXMF_SEND] Using encryption key[0:8]=\(keyHex), hasRatchet=\(hasRatchet)")
+        routerLogger.debug("Using encryption key[0:8]=\(keyHex), hasRatchet=\(hasRatchet)")
 
         let recipientEncryptionPubKey: Curve25519.KeyAgreement.PublicKey
         do {
@@ -118,7 +119,7 @@ extension LXMRouter {
         // This must match Python RNS Identity.get_salt() which returns self.hash
         let identityHash = Hashing.truncatedHash(pathEntry.publicKeys)
         let identityHashHex = identityHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-        print("[LXMF_SEND] Using identityHash[0:8]=\(identityHashHex) as HKDF salt")
+        routerLogger.debug("Using identityHash[0:8]=\(identityHashHex) as HKDF salt")
 
         // For opportunistic: destination is in packet header, not data
         // Packed format: dest_hash (16) + source_hash (16) + signature (64) + msgpack
@@ -169,7 +170,7 @@ extension LXMRouter {
         let truncHashHex = packetTruncatedHash.prefix(8).map { String(format: "%02x", $0) }.joined()
         let msgHash = message.hash
         let msgHashHex = msgHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-        print("[LXMF_PROOF] Registering proof callback: packetHash=\(truncHashHex), msgHash=\(msgHashHex)")
+        routerLogger.info("Registering proof callback: packetHash=\(truncHashHex), msgHash=\(msgHashHex)")
         await transport.registerProofCallback(truncatedHash: packetTruncatedHash) { [weak self] in
             await self?.handleDeliveryProofReceived(messageHash: msgHash)
         }
@@ -207,43 +208,43 @@ extension LXMRouter {
 
         let packedSize = message.packed?.count ?? 0
         let method = String(describing: message.method)
-        directSendLogger.info("[DIRECT] sendDirect called: dest=\(destHashHex), packed=\(packedSize) bytes, method=\(method)")
+        directSendLogger.info("sendDirect called: dest=\(destHashHex), packed=\(packedSize) bytes, method=\(method)")
 
         guard let transport = self.transport else {
-            directSendLogger.error("[DIRECT] transport not available")
+            directSendLogger.error("transport not available")
             throw LXMFError.transportNotAvailable
         }
 
         guard let packed = message.packed else {
-            directSendLogger.error("[DIRECT] message not packed")
+            directSendLogger.error("message not packed")
             throw LXMFError.notPacked
         }
 
         // Get or establish link to destination
-        directSendLogger.info("[DIRECT] getting/establishing link to \(destHashHex)")
+        directSendLogger.info("getting/establishing link to \(destHashHex)")
         let link: Link
         do {
             link = try await getOrEstablishLink(to: message.destinationHash, transport: transport)
             let linkId = await link.linkId
             let linkIdHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
-            directSendLogger.info("[DIRECT] link established: linkId=\(linkIdHex)")
+            directSendLogger.info("link established: linkId=\(linkIdHex)")
         } catch {
-            directSendLogger.error("[DIRECT] link establishment failed: \(error)")
+            directSendLogger.error("link establishment failed: \(error)")
             throw error
         }
 
         // Identify ourselves to the remote peer so they can respond
         do {
             try await link.identify(identity: identity)
-            directSendLogger.info("[DIRECT] identified to remote peer")
+            directSendLogger.info("identified to remote peer")
         } catch {
-            directSendLogger.warning("[DIRECT] identify failed (non-fatal): \(error)")
+            directSendLogger.warning("identify failed (non-fatal): \(error)")
         }
 
         // Update message state
         message.state = .sending
 
-        directSendLogger.info("[DIRECT] packed size=\(packed.count), LINK_PACKET_MAX=\(LXMFConstants.LINK_PACKET_MAX_CONTENT)")
+        directSendLogger.info("packed size=\(packed.count), LINK_PACKET_MAX=\(LXMFConstants.LINK_PACKET_MAX_CONTENT)")
 
         // Send based on message size
         if packed.count <= LXMFConstants.LINK_PACKET_MAX_CONTENT {
@@ -252,7 +253,7 @@ extension LXMRouter {
             let encrypted: Data
             do {
                 encrypted = try await link.encrypt(packed)
-                print("[LXMF_DIRECT] Encrypted \(packed.count) bytes to \(encrypted.count) bytes for link")
+                directSendLogger.debug("Encrypted \(packed.count) bytes to \(encrypted.count) bytes for link")
             } catch {
                 throw error
             }
@@ -291,7 +292,7 @@ extension LXMRouter {
             try await transport.sendLinkData(packet: packet, destinationHash: destHash)
         } else {
             // Need Resource for large message
-            directSendLogger.info("[DIRECT] Message too large for link packet (\(packed.count) > \(LXMFConstants.LINK_PACKET_MAX_CONTENT)), using Resource transfer")
+            directSendLogger.info("Message too large for link packet (\(packed.count) > \(LXMFConstants.LINK_PACKET_MAX_CONTENT)), using Resource transfer")
 
             // Set up outbound resource handler for delivery confirmation (double checkmark).
             // When RESOURCE_PRF is received, this handler maps resource hash → message hash
@@ -303,20 +304,20 @@ extension LXMRouter {
             let numParts = await resource.numParts
             let resHash = await resource.hash
             let resHashHex = resHash?.prefix(8).map { String(format: "%02x", $0) }.joined() ?? "nil"
-            directSendLogger.info("[DIRECT] Resource created: hash=\(resHashHex), parts=\(numParts), advertisement sent")
+            directSendLogger.info("Resource created: hash=\(resHashHex), parts=\(numParts), advertisement sent")
 
             // Register resource hash → message hash for delivery confirmation
             if let resHash = resHash {
                 let msgHash = message.hash
                 let msgHashHex = msgHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-                directSendLogger.info("[DIRECT] Registered resource \(resHashHex) → message \(msgHashHex) for delivery confirmation")
+                directSendLogger.info("Registered resource \(resHashHex) → message \(msgHashHex) for delivery confirmation")
                 pendingResourceDeliveries[resHash] = msgHash
             }
         }
 
         // Mark as sent
         message.state = .sent
-        directSendLogger.info("[DIRECT] Message marked sent for dest=\(destHashHex)")
+        directSendLogger.info("Message marked sent for dest=\(destHashHex)")
 
         // Notify delegate
         notifyUpdate(message)
@@ -374,7 +375,7 @@ extension LXMRouter {
 
         // Debug: print identity hash
         let identityHashHex = recipientIdentity.hash.prefix(8).map { String(format: "%02x", $0) }.joined()
-        print("[LXMF_LINK] Identity hash from public keys: \(identityHashHex)")
+        routerLogger.debug("Identity hash from public keys: \(identityHashHex)")
 
         // Create LXMF delivery Destination for the recipient
         // LXMF uses appName="lxmf", aspects=["delivery"]
@@ -388,7 +389,7 @@ extension LXMRouter {
 
         // Debug: print intermediate values
         let nameHashHex = destination.nameHash.map { String(format: "%02x", $0) }.joined()
-        print("[LXMF_LINK] Name hash (lxmf.delivery): \(nameHashHex.prefix(32))... (len=\(destination.nameHash.count))")
+        routerLogger.debug("Name hash (lxmf.delivery): \(nameHashHex.prefix(32))... (len=\(destination.nameHash.count))")
 
         // Verify destination hash matches what we expect
         // (ensures public keys map to the correct LXMF address)
@@ -398,8 +399,8 @@ extension LXMRouter {
         guard computedHash == destinationHash else {
             // The public keys don't map to the expected LXMF destination
             // This can happen if the path entry is for a different destination type
-            print("[LXMF_LINK] Hash mismatch: expected=\(expectedHex), computed=\(computedHex)")
-            print("[LXMF_LINK] Public keys from path entry don't match LXMF delivery destination")
+            routerLogger.error("Hash mismatch: expected=\(expectedHex), computed=\(computedHex)")
+            routerLogger.error("Public keys from path entry don't match LXMF delivery destination")
             throw LXMFError.invalidDestination
         }
 
@@ -432,7 +433,7 @@ extension LXMRouter {
             // old ones are never cleaned up, and the receiver may respond to an old one).
             let linkId = await link.linkId
             let linkIdHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
-            print("[LXMF_LINK] Cleaning up stale pending link \(linkIdHex)")
+            routerLogger.warning("Cleaning up stale pending link \(linkIdHex)")
             await transport.unregisterLink(linkId: linkId)
             deliveryLinks.removeValue(forKey: destinationHash)
             throw error
@@ -460,7 +461,7 @@ extension LXMRouter {
         let deadline = Date().addingTimeInterval(timeout)
         let linkId = await link.linkId
         let linkIdHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
-        print("[LXMF_LINK] Waiting for link \(linkIdHex) to become active (timeout=\(timeout)s)")
+        routerLogger.info("Waiting for link \(linkIdHex) to become active (timeout=\(timeout)s)")
 
         // Poll link state until active or timeout
         var lastState: LinkState = .pending
@@ -469,23 +470,23 @@ extension LXMRouter {
             let state = await link.state
             pollCount += 1
             if pollCount % 10 == 0 {
-                print("[LXMF_LINK] Poll #\(pollCount): link \(linkIdHex) state=\(state)")
+                routerLogger.debug("Poll #\(pollCount): link \(linkIdHex) state=\(String(describing: state))")
             }
             if state != lastState {
-                print("[LXMF_LINK] Link \(linkIdHex) state changed: \(lastState) -> \(state)")
+                routerLogger.info("Link \(linkIdHex) state changed: \(String(describing: lastState)) -> \(String(describing: state))")
                 lastState = state
             }
             switch state {
             case .active:
-                print("[LXMF_LINK] Link \(linkIdHex) is now active!")
+                routerLogger.info("Link \(linkIdHex) is now active")
                 // Wait a bit for remote to set up its packet callback
                 // This is needed because Python's LXMF sets up packet_callback
                 // in link_established callback, which might race with our send
                 try? await Task.sleep(for: .milliseconds(100))
-                print("[LXMF_LINK] Link \(linkIdHex) ready to send")
+                routerLogger.debug("Link \(linkIdHex) ready to send")
                 return
             case .closed:
-                print("[LXMF_LINK] Link \(linkIdHex) closed unexpectedly")
+                routerLogger.warning("Link \(linkIdHex) closed unexpectedly")
                 throw LXMFError.linkFailed("Link closed unexpectedly")
             default:
                 // Still pending or handshaking, wait and retry
@@ -494,7 +495,7 @@ extension LXMRouter {
         }
 
         // Timeout - link didn't become active
-        print("[LXMF_LINK] Link \(linkIdHex) establishment timed out (state=\(lastState), polls=\(pollCount))")
+        routerLogger.error("Link \(linkIdHex) establishment timed out (state=\(String(describing: lastState)), polls=\(pollCount))")
         throw LXMFError.linkFailed("Link establishment timed out after \(timeout) seconds")
     }
 }

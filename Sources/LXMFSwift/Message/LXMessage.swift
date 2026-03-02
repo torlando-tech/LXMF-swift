@@ -11,6 +11,9 @@
 import Foundation
 import CryptoKit
 import ReticulumSwift
+import os.log
+
+private let messageLogger = Logger(subsystem: "net.reticulum.lxmf", category: "LXMessage")
 
 /// LXMF message structure.
 ///
@@ -361,17 +364,17 @@ public struct LXMessage {
         switch fieldsRaw {
         case .map(let m):
             let keys = m.keys.map { "\($0)" }.joined(separator: ",")
-            print("[LXMF_UNPACK] payloadArray[3] is .map with \(m.count) entries, keys=[\(keys)]")
+            messageLogger.debug("payloadArray[3] is .map with \(m.count) entries, keys=[\(keys)]")
         case .null:
-            print("[LXMF_UNPACK] payloadArray[3] is .null → fields will be nil")
+            messageLogger.debug("payloadArray[3] is .null, fields will be nil")
         default:
-            print("[LXMF_UNPACK] payloadArray[3] unexpected type: \(fieldsRaw)")
+            messageLogger.warning("payloadArray[3] unexpected type: \(String(describing: fieldsRaw))")
         }
         // Also log raw payload hex for the fields portion
         do {
             let fieldsRepacked = packLXMF(fieldsRaw)
             let fieldsHex = fieldsRepacked.prefix(64).map { String(format: "%02x", $0) }.joined()
-            print("[LXMF_UNPACK] fields raw msgpack (\(fieldsRepacked.count)B): \(fieldsHex)")
+            messageLogger.debug("fields raw msgpack (\(fieldsRepacked.count)B): \(fieldsHex)")
         }
 
         var fields: [UInt8: Any]? = nil

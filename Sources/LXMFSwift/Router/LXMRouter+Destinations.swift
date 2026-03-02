@@ -10,6 +10,9 @@
 
 import Foundation
 import ReticulumSwift
+import os.log
+
+private let routerLogger = Logger(subsystem: "net.reticulum.lxmf", category: "LXMRouter")
 
 // MARK: - LXMF Resource Handler
 
@@ -29,13 +32,13 @@ final class LXMFResourceHandler: ResourceCallbacks, @unchecked Sendable {
     func resourceConcluded(_ resource: Resource) async {
         // Get assembled data from the completed resource
         guard let data = await resource.assembledData else {
-            print("[LXMF_RESOURCE] Resource concluded but no assembled data available")
+            routerLogger.warning("Resource concluded but no assembled data available")
             return
         }
 
-        print("[LXMF_RESOURCE] Resource transfer complete, delivering \(data.count) bytes to LXMF")
+        routerLogger.info("Resource transfer complete, delivering \(data.count) bytes to LXMF")
         let accepted = await router.lxmfDelivery(data)
-        print("[LXMF_RESOURCE] lxmfDelivery returned accepted=\(accepted)")
+        routerLogger.info("lxmfDelivery returned accepted=\(accepted)")
     }
 }
 
@@ -58,36 +61,36 @@ extension LXMRouter {
     ///   - stampCost: Optional stamp cost to enforce (nil = no stamping required)
     public func registerDeliveryDestination(_ destination: Destination, stampCost: Int? = nil) async throws {
         let destHex = destination.hash.prefix(8).map { String(format: "%02x", $0) }.joined()
-        print("[LXMF_INBOUND] registerDeliveryDestination: destHash=\(destHex)")
+        routerLogger.info("registerDeliveryDestination: destHash=\(destHex)")
 
         // Store destination and optional stamp cost
         deliveryDestinations[destination.hash] = (destination, stampCost)
-        print("[LXMF_INBOUND] Stored in deliveryDestinations, count=\(deliveryDestinations.count)")
+        routerLogger.debug("Stored in deliveryDestinations, count=\(self.deliveryDestinations.count)")
 
         // Register destination with transport if available
         guard let transport = transport else {
-            print("[LXMF_INBOUND] ERROR: transport not available!")
+            routerLogger.error("Transport not available for delivery registration")
             throw LXMFError.transportNotAvailable
         }
 
         await transport.registerDestination(destination)
-        print("[LXMF_INBOUND] Registered destination with transport")
+        routerLogger.info("Registered destination with transport")
 
         // Register callback to receive packets for this destination
         // IMPORTANT: Use registerAsync to ensure callback is registered before returning
         let callbackManager = await transport.getCallbackManager()
-        print("[LXMF_INBOUND] Got callbackManager, registering callback for \(destHex)")
+        routerLogger.debug("Got callbackManager, registering callback for \(destHex)")
         await callbackManager.registerAsync(destinationHash: destination.hash) { [weak self] (data: Data, packet: Packet) in
-            print("[LXMF_INBOUND] *** CALLBACK INVOKED *** for dest=\(destHex), dataLen=\(data.count)")
+            routerLogger.info("Delivery callback invoked for dest=\(destHex), dataLen=\(data.count)")
             guard let self = self else {
-                print("[LXMF_INBOUND] ERROR: self is nil in callback!")
+                routerLogger.error("Router deallocated in delivery callback")
                 return
             }
             Task {
                 await self.deliveryPacket(data, packet)
             }
         }
-        print("[LXMF_INBOUND] Callback registered successfully")
+        routerLogger.debug("Callback registered successfully")
 
         // Register link callback for resource-based direct delivery
         // When a remote peer establishes a link to our delivery destination,
@@ -95,12 +98,12 @@ extension LXMRouter {
         // Reference: Python LXMF/LXMRouter.py delivery_link_established() lines 1847-1852
         let resourceHandler = LXMFResourceHandler(router: self)
         await transport.registerDestinationLinkCallback(for: destination.hash) { [resourceHandler] (link: Link) async in
-            print("[LXMF_RESOURCE] Inbound link established, configuring resource handling")
+            routerLogger.info("Inbound link established, configuring resource handling")
             await link.setResourceStrategy(.acceptAll)
             await link.setResourceCallbacks(resourceHandler)
-            print("[LXMF_RESOURCE] Resource strategy=acceptAll, callbacks set")
+            routerLogger.debug("Resource strategy=acceptAll, callbacks set")
         }
-        print("[LXMF_INBOUND] Link callback registered for resource handling")
+        routerLogger.debug("Link callback registered for resource handling")
     }
 
     /// Handle delivery packet received for LXMF destination.
@@ -116,7 +119,7 @@ extension LXMRouter {
     ///   - packet: Parsed packet header and metadata
     public func deliveryPacket(_ data: Data, _ packet: Packet) async {
         let destHex = packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined()
-        print("[LXMF_INBOUND] deliveryPacket called: destType=\(packet.header.destinationType), destHash=\(destHex), dataLen=\(data.count)")
+        routerLogger.info("deliveryPacket: destType=\(String(describing: packet.header.destinationType)), destHash=\(destHex), dataLen=\(data.count)")
 
         // STEP 1: Send delivery proof IMMEDIATELY (before unpacking)
         // Reference: Python Packet.prove() -> Identity.prove()
@@ -131,18 +134,18 @@ extension LXMRouter {
             // Prepend destination hash from packet
             lxmfData.append(packet.destination)
             lxmfData.append(data)
-            print("[LXMF_INBOUND] Opportunistic: prepended destHash, lxmfData len=\(lxmfData.count)")
+            routerLogger.debug("Opportunistic: prepended destHash, lxmfData len=\(lxmfData.count)")
         } else {
             // Direct over link: data is complete LXMF message
             lxmfData = data
-            print("[LXMF_INBOUND] Link delivery: using data as-is, lxmfData len=\(lxmfData.count)")
+            routerLogger.debug("Link delivery: using data as-is, lxmfData len=\(lxmfData.count)")
         }
 
         // STEP 3: Route to delivery handler for unpacking and validation
         let stats = PhysicalStats(receivingInterface: packet.receivingInterface)
-        print("[LXMF_INBOUND] Calling lxmfDelivery() with \(lxmfData.count) bytes, interface=\(packet.receivingInterface ?? "nil")")
+        routerLogger.info("Calling lxmfDelivery() with \(lxmfData.count) bytes, interface=\(packet.receivingInterface ?? "nil")")
         let accepted = await lxmfDelivery(lxmfData, physicalStats: stats)
-        print("[LXMF_INBOUND] lxmfDelivery() returned accepted=\(accepted)")
+        routerLogger.info("lxmfDelivery() returned accepted=\(accepted)")
     }
 
     /// Send a delivery proof for a received packet.
@@ -160,7 +163,7 @@ extension LXMRouter {
     /// - Parameter packet: The received packet to prove
     private func sendDeliveryProof(for packet: Packet) async {
         guard let transport = transport else {
-            print("[LXMF_PROOF] Cannot send proof: transport not available")
+            routerLogger.error("Cannot send proof: transport not available")
             return
         }
 
@@ -170,16 +173,16 @@ extension LXMRouter {
 
         let hashHex = packetHash.prefix(8).map { String(format: "%02x", $0) }.joined()
         let destHex = proofDestination.prefix(8).map { String(format: "%02x", $0) }.joined()
-        print("[LXMF_PROOF] Generating proof: packetHash=\(hashHex), proofDest=\(destHex)")
+        routerLogger.info("Generating proof: packetHash=\(hashHex), proofDest=\(destHex)")
 
         // Sign the packet hash with our identity
         let signature: Data
         do {
             signature = try identity.sign(packetHash)
             let sigHex = signature.prefix(8).map { String(format: "%02x", $0) }.joined()
-            print("[LXMF_PROOF] Signed with identity, signature[0:8]=\(sigHex)")
+            routerLogger.debug("Signed with identity, signature[0:8]=\(sigHex)")
         } catch {
-            print("[LXMF_PROOF] Failed to sign packet hash: \(error)")
+            routerLogger.error("Failed to sign packet hash: \(error)")
             return
         }
 
@@ -207,9 +210,9 @@ extension LXMRouter {
         // Send proof via transport
         do {
             try await transport.send(packet: proofPacket)
-            print("[LXMF_PROOF] Delivery proof sent successfully to \(destHex)")
+            routerLogger.info("Delivery proof sent successfully to \(destHex)")
         } catch {
-            print("[LXMF_PROOF] Failed to send delivery proof: \(error)")
+            routerLogger.error("Failed to send delivery proof: \(error)")
         }
     }
 
