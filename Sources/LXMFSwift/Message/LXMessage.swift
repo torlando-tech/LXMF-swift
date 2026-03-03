@@ -31,6 +31,7 @@ public struct LXMessage {
     public static let FIELD_FILE_ATTACHMENTS: UInt8 = 0x05
     public static let FIELD_IMAGE: UInt8 = 0x06
     public static let FIELD_AUDIO: UInt8 = 0x07
+    public static let FIELD_APP_DATA: UInt8 = 0x10  // Field 16: app extensions (replies, reactions)
     public static let FIELD_COLUMBA_META: UInt8 = 0x70
 
     // MARK: - Properties
