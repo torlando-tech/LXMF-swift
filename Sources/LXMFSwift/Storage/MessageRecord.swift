@@ -78,6 +78,12 @@ public struct MessageRecord: Codable, FetchableRecord, PersistableRecord {
     /// Human-readable name of the interface that received this message
     public var receivingInterface: String?
 
+    /// ID of the message this is a reply to (optional)
+    public var replyToId: String?
+
+    /// JSON-encoded reactions for this message (optional)
+    public var reactionsJson: String?
+
     /// Packed LXMF wire format (for retransmission)
     public var packedLxmf: Data
 
@@ -110,6 +116,8 @@ public struct MessageRecord: Codable, FetchableRecord, PersistableRecord {
         case q
         case ratchetId = "ratchet_id"
         case receivingInterface = "receiving_interface"
+        case replyToId = "reply_to_id"
+        case reactionsJson = "reactions_json"
         case packedLxmf = "packed_lxmf"
         case createdAt = "created_at"
         case updatedAt = "updated_at"
@@ -155,6 +163,15 @@ public struct MessageRecord: Codable, FetchableRecord, PersistableRecord {
         self.q = message.q
         self.ratchetId = nil
         self.receivingInterface = message.receivingInterface
+
+        // Extract reply_to from FIELD_APP_DATA (field 0x10)
+        if let appData = message.fields?[LXMessage.FIELD_APP_DATA] as? [String: Any],
+           let replyTo = appData["reply_to"] as? String {
+            self.replyToId = replyTo
+        } else {
+            self.replyToId = nil
+        }
+        self.reactionsJson = nil  // Accumulated separately via updateReactions
 
         let now = Date().timeIntervalSince1970
         self.createdAt = now

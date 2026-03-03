@@ -128,6 +128,15 @@ public actor LXMFDatabase {
             }
         }
 
+        // v6: Add reply and reaction columns to messages
+        migrator.registerMigration("v6_add_replies_reactions") { db in
+            try db.alter(table: "messages") { t in
+                t.add(column: "reply_to_id", .text)
+                t.add(column: "reactions_json", .text)
+            }
+            try db.create(index: "idx_messages_reply_to", on: "messages", columns: ["reply_to_id"])
+        }
+
         try migrator.migrate(dbPool)
     }
 
@@ -466,6 +475,65 @@ public actor LXMFDatabase {
                 .fetchAll(db)
 
             return try records.map { try $0.toLXMessage() }
+        }
+    }
+
+    // MARK: - Reply & Reaction Operations
+
+    /// Update reply-to ID for a message.
+    ///
+    /// - Parameters:
+    ///   - messageId: Message hash (32 bytes)
+    ///   - replyToId: The message ID being replied to
+    /// - Throws: DatabaseError
+    public func updateReplyToId(messageId: Data, replyToId: String) throws {
+        try dbPool.write { db in
+            try db.execute(
+                sql: "UPDATE messages SET reply_to_id = ?, updated_at = ? WHERE message_id = ?",
+                arguments: [replyToId, Date().timeIntervalSince1970, messageId]
+            )
+        }
+    }
+
+    /// Update reactions JSON for a message.
+    ///
+    /// - Parameters:
+    ///   - messageId: Message hash (32 bytes)
+    ///   - reactionsJson: JSON string encoding the reactions
+    /// - Throws: DatabaseError
+    public func updateReactions(messageId: Data, reactionsJson: String) throws {
+        try dbPool.write { db in
+            try db.execute(
+                sql: "UPDATE messages SET reactions_json = ?, updated_at = ? WHERE message_id = ?",
+                arguments: [reactionsJson, Date().timeIntervalSince1970, messageId]
+            )
+        }
+    }
+
+    /// Get reactions JSON for a message.
+    ///
+    /// - Parameter messageId: Message hash (32 bytes)
+    /// - Returns: JSON string if reactions exist, nil otherwise
+    /// - Throws: DatabaseError
+    public func getReactionsJson(messageId: Data) throws -> String? {
+        try dbPool.read { db in
+            try String.fetchOne(db,
+                sql: "SELECT reactions_json FROM messages WHERE message_id = ?",
+                arguments: [messageId]
+            )
+        }
+    }
+
+    /// Get a single message record by ID (no LXMessage unpacking).
+    ///
+    /// - Parameter id: Message hash (32 bytes)
+    /// - Returns: MessageRecord if found, nil otherwise
+    /// - Throws: DatabaseError
+    public func getMessageRecord(id: Data) throws -> MessageRecord? {
+        try dbPool.read { db in
+            try MessageRecord
+                .filter(Column("message_id") == id)
+                .fetchOne(db)
         }
     }
 
