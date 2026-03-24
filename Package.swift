@@ -21,7 +21,7 @@ let package = Package(
         )
     ],
     dependencies: [
-        .package(path: "../reticulum-swift-lib"),
+        .package(url: "https://github.com/torlando-tech/reticulum-swift.git", branch: "main"),
         .package(url: "https://github.com/groue/GRDB.swift.git", from: "6.0.0"),
         .package(url: "https://github.com/tsolomko/SWCompression.git", from: "4.8.0"),
     ],
@@ -29,7 +29,7 @@ let package = Package(
         .target(
             name: "LXMFSwift",
             dependencies: [
-                .product(name: "ReticulumSwift", package: "reticulum-swift-lib"),
+                .product(name: "ReticulumSwift", package: "reticulum-swift"),
                 .product(name: "GRDB", package: "GRDB.swift"),
                 "SWCompression",
             ],
