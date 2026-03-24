@@ -17,12 +17,21 @@ import XCTest
 import ReticulumSwift
 
 final class LXMFDatabaseTests: XCTestCase {
+    private func makeDatabase() throws -> LXMFDatabase {
+        let dbPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lxmf-db-tests-\(UUID().uuidString).db")
+            .path
+        addTeardownBlock {
+            try? FileManager.default.removeItem(atPath: dbPath)
+        }
+        return try LXMFDatabase(path: dbPath)
+    }
 
     // MARK: - Database Creation Tests
 
     /// Test database creation with WAL mode
     func testDatabaseCreation() async throws {
-        let db = try LXMFDatabase(path: ":memory:")
+        let db = try makeDatabase()
 
         // Verify database was created (no error means success)
         _ = db  // Suppress unused warning
@@ -32,7 +41,7 @@ final class LXMFDatabaseTests: XCTestCase {
 
     /// Test save and retrieve message
     func testSaveRetrieveMessage() async throws {
-        let db = try LXMFDatabase(path: ":memory:")
+        let db = try makeDatabase()
 
         let sourceIdentity = Identity()
         let destIdentity = Identity()
@@ -65,7 +74,7 @@ final class LXMFDatabaseTests: XCTestCase {
 
     /// Test hasMessage returns false for unknown ID
     func testMessageNotFound() async throws {
-        let db = try LXMFDatabase(path: ":memory:")
+        let db = try makeDatabase()
 
         let nonExistentId = Data(repeating: 0xFF, count: 32)
         let hasMessage = try await db.hasMessage(id: nonExistentId)
@@ -75,7 +84,7 @@ final class LXMFDatabaseTests: XCTestCase {
 
     /// Test update message state
     func testUpdateMessageState() async throws {
-        let db = try LXMFDatabase(path: ":memory:")
+        let db = try makeDatabase()
 
         let sourceIdentity = Identity()
         let destIdentity = Identity()
@@ -103,7 +112,7 @@ final class LXMFDatabaseTests: XCTestCase {
 
     /// Test conversation creation on message save
     func testConversationCreation() async throws {
-        let db = try LXMFDatabase(path: ":memory:")
+        let db = try makeDatabase()
 
         let sourceIdentity = Identity()
         let destIdentity = Identity()
@@ -131,7 +140,7 @@ final class LXMFDatabaseTests: XCTestCase {
 
     /// Test conversation update with multiple messages
     func testConversationUpdate() async throws {
-        let db = try LXMFDatabase(path: ":memory:")
+        let db = try makeDatabase()
 
         let sourceIdentity = Identity()
         let destIdentity = Identity()
@@ -175,7 +184,7 @@ final class LXMFDatabaseTests: XCTestCase {
 
     /// Test load pending outbound messages
     func testLoadPendingOutbound() async throws {
-        let db = try LXMFDatabase(path: ":memory:")
+        let db = try makeDatabase()
 
         let sourceIdentity = Identity()
         let destIdentity = Identity()
@@ -203,7 +212,7 @@ final class LXMFDatabaseTests: XCTestCase {
 
     /// Test load failed outbound messages
     func testLoadFailedOutbound() async throws {
-        let db = try LXMFDatabase(path: ":memory:")
+        let db = try makeDatabase()
 
         let sourceIdentity = Identity()
         let destIdentity = Identity()
@@ -233,7 +242,7 @@ final class LXMFDatabaseTests: XCTestCase {
 
     /// Test get messages with pagination
     func testGetMessagesPagination() async throws {
-        let db = try LXMFDatabase(path: ":memory:")
+        let db = try makeDatabase()
 
         let sourceIdentity = Identity()
         let destIdentity = Identity()
@@ -265,7 +274,7 @@ final class LXMFDatabaseTests: XCTestCase {
 
     /// Test unread count for incoming messages
     func testUnreadCount() async throws {
-        let db = try LXMFDatabase(path: ":memory:")
+        let db = try makeDatabase()
 
         // Create incoming message by unpacking
         let sourceIdentity = Identity()
