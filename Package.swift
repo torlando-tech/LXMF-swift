@@ -21,7 +21,7 @@ let package = Package(
         )
     ],
     dependencies: [
-        .package(url: "https://github.com/torlando-tech/reticulum-swift.git", branch: "main"),
+        .package(path: "../reticulum-swift"),
         .package(url: "https://github.com/groue/GRDB.swift.git", from: "6.0.0"),
         .package(url: "https://github.com/tsolomko/SWCompression.git", from: "4.8.0"),
     ],
