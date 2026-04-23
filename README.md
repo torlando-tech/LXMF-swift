@@ -16,6 +16,18 @@ dependencies: [
 ]
 ```
 
+### Development layout
+
+This package currently declares its `reticulum-swift` dependency by relative path (`../reticulum-swift`) for mono-repo-style development alongside sibling packages. To build from source you must clone `reticulum-swift` next to this repo:
+
+```
+~/repos/
+  reticulum-swift/
+  LXMF-swift/      ← this repo
+```
+
+Published releases (tags) should point `reticulum-swift` at its GitHub URL so URL-based SwiftPM consumers don't require the sibling layout.
+
 ## Overview
 
 - **LXMRouter** — Message routing with direct, propagated, and opportunistic delivery
