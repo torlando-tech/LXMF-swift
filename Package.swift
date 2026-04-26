@@ -42,6 +42,25 @@ let package = Package(
             ],
             path: "Sources/LXMFSwift"
         ),
+        // Cross-impl conformance harness for the
+        // torlando-tech/lxmf-conformance test suite. Speaks JSON-RPC
+        // over stdio against the Python (and eventually Kotlin)
+        // bridges so cross-impl tests can drive Swift LXMF through
+        // the same scenarios. Build with:
+        //
+        //   swift build -c release --product LXMFConformanceBridge
+        //
+        // The lxmf-conformance pytest fixture auto-detects the
+        // resulting binary at .build/release/LXMFConformanceBridge
+        // (or honors CONFORMANCE_SWIFT_BRIDGE_CMD).
+        .executableTarget(
+            name: "LXMFConformanceBridge",
+            dependencies: [
+                "LXMFSwift",
+                .product(name: "ReticulumSwift", package: "reticulum-swift"),
+            ],
+            path: "Sources/LXMFConformanceBridge"
+        ),
         .testTarget(
             name: "LXMFSwiftTests",
             dependencies: ["LXMFSwift"],
