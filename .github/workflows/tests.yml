@@ -1,0 +1,68 @@
+name: Tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -1)
+          echo "Using $XCODE"
+          sudo xcode-select -s "$XCODE"
+          xcodebuild -version
+          swift --version
+
+      - name: Cache SwiftPM build artifacts
+        uses: actions/cache@v4
+        with:
+          path: .build
+          key: ${{ runner.os }}-spm-${{ hashFiles('Package.resolved', 'Package.swift') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+
+      - name: Resolve dependencies
+        run: swift package resolve
+
+      - name: Build and run tests with coverage
+        run: swift test --enable-code-coverage
+
+      - name: Export coverage report (lcov)
+        run: |
+          XCTEST_BIN=$(find .build -type d -name '*.xctest' | head -1)
+          # On macOS the actual executable lives inside the bundle.
+          if [ -d "$XCTEST_BIN/Contents/MacOS" ]; then
+            BIN_PATH="$XCTEST_BIN/Contents/MacOS/$(basename "$XCTEST_BIN" .xctest)"
+          else
+            BIN_PATH="$XCTEST_BIN"
+          fi
+          PROF_DATA=$(find .build -name 'default.profdata' | head -1)
+          echo "Test binary: $BIN_PATH"
+          echo "Profile data: $PROF_DATA"
+          xcrun llvm-cov export \
+            "$BIN_PATH" \
+            -instr-profile="$PROF_DATA" \
+            -ignore-filename-regex='\.build|Tests' \
+            -format=lcov \
+            > coverage.lcov
+          xcrun llvm-cov report \
+            "$BIN_PATH" \
+            -instr-profile="$PROF_DATA" \
+            -ignore-filename-regex='\.build|Tests'
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.lcov
+          fail_ci_if_error: false

@@ -43,7 +43,10 @@ final class LXMFResourceHandler: ResourceCallbacks, @unchecked Sendable {
         }
 
         routerLogger.info("Resource transfer complete, delivering \(data.count) bytes to LXMF")
-        let accepted = await router.lxmfDelivery(data)
+        // Resource transfers always travel over an established link, so this is
+        // unambiguously a DIRECT delivery. Python: delivery_resource_concluded()
+        // calls lxmf_delivery(..., method=LXMessage.DIRECT). LXMRouter.py:1878.
+        let accepted = await router.lxmfDelivery(data, method: .direct)
         routerLogger.info("lxmfDelivery returned accepted=\(accepted)")
     }
 }
@@ -132,25 +135,33 @@ extension LXMRouter {
         // The proof proves we received the packet by signing its hash
         await sendDeliveryProof(for: packet)
 
-        // STEP 2: Reconstruct full LXMF data based on packet type
+        // STEP 2: Reconstruct full LXMF data based on packet type and classify the
+        // delivery method. Mirrors Python LXMRouter.delivery_packet() lines 1820-1828:
+        //   if packet.destination_type != RNS.Destination.LINK: method = OPPORTUNISTIC
+        //   else:                                                method = DIRECT
         var lxmfData = Data()
+        let method: LXDeliveryMethod
 
         if packet.header.destinationType != .link {
             // Opportunistic: data is missing destination hash prefix
             // Prepend destination hash from packet
             lxmfData.append(packet.destination)
             lxmfData.append(data)
+            method = .opportunistic
             routerLogger.debug("Opportunistic: prepended destHash, lxmfData len=\(lxmfData.count)")
         } else {
-            // Direct over link: data is complete LXMF message
+            // Direct over link: data is complete LXMF message (small, fits in a single
+            // link DATA packet — large messages take the resource path which is handled
+            // by LXMFResourceHandler.resourceConcluded above).
             lxmfData = data
+            method = .direct
             routerLogger.debug("Link delivery: using data as-is, lxmfData len=\(lxmfData.count)")
         }
 
         // STEP 3: Route to delivery handler for unpacking and validation
         let stats = PhysicalStats(receivingInterface: packet.receivingInterface)
-        routerLogger.info("Calling lxmfDelivery() with \(lxmfData.count) bytes, interface=\(packet.receivingInterface ?? "nil")")
-        let accepted = await lxmfDelivery(lxmfData, physicalStats: stats)
+        routerLogger.info("Calling lxmfDelivery() with \(lxmfData.count) bytes, method=\(String(describing: method)), interface=\(packet.receivingInterface ?? "nil")")
+        let accepted = await lxmfDelivery(lxmfData, physicalStats: stats, method: method)
         routerLogger.info("lxmfDelivery() returned accepted=\(accepted)")
     }
 
