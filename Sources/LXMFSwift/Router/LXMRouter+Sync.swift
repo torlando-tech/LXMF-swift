@@ -201,7 +201,8 @@ extension LXMRouter {
             // Reconstruct plaintext LXMF message: dest_hash + source_hash + signature + payload
             let decryptedMessage = destHash + decryptedPayload
 
-            let accepted = await lxmfDelivery(decryptedMessage)
+            // Messages pulled from a propagation node are PROPAGATED by definition.
+            let accepted = await lxmfDelivery(decryptedMessage, method: .propagated)
             if accepted {
                 newMessageCount += 1
             }

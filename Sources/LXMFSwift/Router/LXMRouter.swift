@@ -320,13 +320,22 @@ public actor LXMRouter {
     /// - Parameters:
     ///   - data: Packed LXMF wire format
     ///   - physicalStats: Optional physical layer statistics (RSSI, SNR, Q)
+    ///   - method: Delivery method actually used to receive this message
+    ///     (`.opportunistic` for single-packet delivery, `.direct` for link delivery,
+    ///     `.propagated` for messages pulled from a propagation node). When nil,
+    ///     the value defaulted by `LXMessage.unpackFromBytes` is preserved.
     /// - Returns: True if message was accepted, false if rejected (duplicate, invalid signature, etc.)
     ///
-    /// Reference: Python LXMRouter.lxmf_delivery() lines 1714-1799
+    /// Reference: Python LXMRouter.lxmf_delivery() lines 1730-1815 (which takes a `method` kwarg
+    /// and assigns `message.method = method` when provided).
     @discardableResult
-    public func lxmfDelivery(_ data: Data, physicalStats: PhysicalStats? = nil) async -> Bool {
+    public func lxmfDelivery(
+        _ data: Data,
+        physicalStats: PhysicalStats? = nil,
+        method: LXDeliveryMethod? = nil
+    ) async -> Bool {
         let dataHex = data.prefix(16).map { String(format: "%02x", $0) }.joined()
-        routerLogger.info("Entry: \(data.count) bytes, prefix=\(dataHex)")
+        routerLogger.info("Entry: \(data.count) bytes, prefix=\(dataHex), method=\(String(describing: method))")
 
         do {
             // Extract source hash to look up identity for signature validation
@@ -354,6 +363,13 @@ public actor LXMRouter {
             let msgHashHex = message.hash.prefix(4).map { String(format: "%02x", $0) }.joined()
             let fieldsDesc = message.fields?.keys.map { String(format: "0x%02x", $0) }.joined(separator: ",") ?? "nil"
             routerLogger.info("Unpacked: hash=\(msgHashHex) contentLen=\(message.content.count) fields=[\(fieldsDesc)] sigValid=\(message.signatureValidated) unverified=\(String(describing: message.unverifiedReason))")
+
+            // Override the default method (which `unpackFromBytes` always sets to `.direct`)
+            // with the actual delivery method observed by the caller. This matches Python
+            // LXMRouter.lxmf_delivery(): `if method: message.method = method`.
+            if let method = method {
+                message.method = method
+            }
 
             // Validate signature (silent drop if invalid, per Python behavior)
             // If source identity is unknown, accept but mark unverified
