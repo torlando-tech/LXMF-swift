@@ -155,6 +155,14 @@ final class BridgeState: @unchecked Sendable {
     var router: LXMRouter?
     var deliveryDestination: Destination?
     var deliveryDestinationHash: Data?
+    /// Display name passed to `lxmf_init`; emitted in announce app-data
+    /// to match the Python bridge, which forwards `display_name` into
+    /// `register_delivery_identity` so it lands on every announce.
+    var displayName: String?
+    /// Tempdir created in `lxmf_init` for the SQLite database. Stored
+    /// so `lxmf_shutdown` can clean it up; otherwise a long-running
+    /// harness accumulates one stale `lxmf_conf_swift_<UUID>` per test.
+    var tmpDir: URL?
 
     // Inbox: appended on every received LXMessage. Sequence number is
     // monotonic per bridge process so polling tests can drain
@@ -359,11 +367,12 @@ func cmdLxmfInit(_ params: [String: JSONValue]) throws -> [String: JSONValue] {
         state.router = router
         state.deliveryDestination = deliveryDestination
         state.deliveryDestinationHash = deliveryDestination.hash
+        // Store display name + tmp dir so cmdLxmfAnnounce can include
+        // the name in announce app-data and cmdLxmfShutdown can clean
+        // up the SQLite tempdir.
+        state.displayName = displayName
+        state.tmpDir = tmpDir
         state.lock.unlock()
-
-        // Display name announcement only happens on lxmf_announce —
-        // matching the Python bridge's deferred-announce semantics.
-        _ = displayName
 
         return [
             "identity_hash": .string(bytesToHex(identity.hash)),
@@ -490,11 +499,14 @@ func cmdLxmfAnnounce(_ params: [String: JSONValue]) throws -> [String: JSONValue
           let dest = state.deliveryDestination else {
         throw BridgeError.notInitialised("lxmf_announce")
     }
+    // Match the python bridge: `display_name` from lxmf_init is
+    // emitted as the announce app-data so cross-impl tests that read
+    // announces see the configured name, not the default.
+    state.lock.lock()
+    let appData = state.displayName.flatMap { Data($0.utf8) }
+    state.lock.unlock()
     return try blockingAsync {
-        // Build and send an Announce packet for the delivery
-        // destination. Same path Columba uses when refreshing its
-        // own announce state.
-        let announce = Announce(destination: dest)
+        let announce = Announce(destination: dest, appData: appData)
         let packet = try announce.buildPacket()
         try await transport.send(packet: packet)
 
@@ -527,8 +539,21 @@ func cmdLxmfSendOpportunistic(_ params: [String: JSONValue]) throws -> [String: 
         )
 
         // Pack first so we can detect any silent OPPORTUNISTIC ->
-        // DIRECT upgrade, matching the Python bridge guard.
-        _ = try message.pack()
+        // DIRECT upgrade, matching the Python bridge guard. The Swift
+        // router's outbound path falls back to a different method
+        // when packed payload exceeds ENCRYPTED_PACKET_MAX_CONTENT
+        // (LXMRouter.handleOutbound applies the same formula). Surface
+        // that as an explicit error so the harness sees a typed
+        // failure instead of a silent method change.
+        let packed = try message.pack()
+        let packedPayloadSize = packed.count
+            - (2 * LXMFConstants.DESTINATION_LENGTH + LXMFConstants.SIGNATURE_LENGTH)
+        if packedPayloadSize > LXMFConstants.ENCRYPTED_PACKET_MAX_CONTENT {
+            throw BridgeError.invalidParam(
+                "content",
+                "opportunistic content would silently upgrade: packedPayloadSize=\(packedPayloadSize) > ENCRYPTED_PACKET_MAX_CONTENT=\(LXMFConstants.ENCRYPTED_PACKET_MAX_CONTENT)"
+            )
+        }
 
         // sendOpportunistic is the direct path; handleOutbound queues
         // through the LXMRouter's outbound thread which respects the
@@ -594,7 +619,15 @@ func cmdLxmfShutdown(_ params: [String: JSONValue]) throws -> [String: JSONValue
     state.transport = nil
     state.deliveryDestination = nil
     state.deliveryDestinationHash = nil
+    state.displayName = nil
+    let tmpDir = state.tmpDir
+    state.tmpDir = nil
     state.lock.unlock()
+    // Remove the SQLite tempdir so a long-running harness doesn't
+    // accumulate one stale `lxmf_conf_swift_<UUID>` per test pair.
+    if let tmpDir {
+        try? FileManager.default.removeItem(at: tmpDir)
+    }
     return ["stopped": .bool(stopped)]
 }
 
@@ -631,16 +664,18 @@ func dispatch(_ req: Request) throws -> [String: JSONValue] {
 
 DispatchQueue.global(qos: .userInitiated).async {
     // Initialize the delegate from a non-main thread so we don't
-    // tangle with MainActor.run's main-thread requirement. The
-    // semaphore loop below polls until the delegate is published
-    // by the Task, then prints READY and enters the JSON-RPC loop.
+    // tangle with MainActor.run's main-thread requirement. Use a
+    // DispatchSemaphore for hand-off: the semaphore wait/signal pair
+    // gives a real happens-before edge from the writer to the reader,
+    // unlike a plain spin-wait on a `nonisolated(unsafe) var` which
+    // relies on incidental syscall-as-barrier behaviour.
+    let delegateReady = DispatchSemaphore(value: 0)
     Task.detached {
         let d = await MainActor.run { BridgeDelegate() }
         bridgeDelegate = d
+        delegateReady.signal()
     }
-    while bridgeDelegate == nil {
-        usleep(10_000)
-    }
+    delegateReady.wait()
 
     print("READY")
     fflush(stdout)
