@@ -532,9 +532,11 @@ func cmdLxmfSendOpportunistic(_ params: [String: JSONValue]) throws -> [String: 
           let identity = state.identity else {
         throw BridgeError.notInitialised("lxmf_send_opportunistic")
     }
-    guard let destHashHex = params["destination_hash"]?.stringValue,
-          let destHash = hexToBytes(destHashHex) else {
+    guard let destHashHex = params["destination_hash"]?.stringValue else {
         throw BridgeError.missingParam("destination_hash")
+    }
+    guard let destHash = hexToBytes(destHashHex) else {
+        throw BridgeError.invalidParam("destination_hash", "invalid hex string: \(destHashHex)")
     }
     let content = params["content"]?.stringValue ?? ""
     let title = params["title"]?.stringValue ?? ""
