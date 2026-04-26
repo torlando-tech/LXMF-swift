@@ -200,6 +200,17 @@ final class BridgeState: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         return outboundState[hashHex] ?? "unknown"
     }
+
+    /// Wipe inbox + outbound state. Called from `cmdLxmfShutdown` so a
+    /// harness that reuses a bridge process across test cases doesn't
+    /// see stale messages from the previous session on the next
+    /// `lxmf_get_received_messages` / `lxmf_get_message_state` call.
+    func resetMessaging() {
+        lock.lock(); defer { lock.unlock() }
+        inbox.removeAll()
+        inboxSeq = 0
+        outboundState.removeAll()
+    }
 }
 
 let state = BridgeState()
@@ -623,6 +634,10 @@ func cmdLxmfShutdown(_ params: [String: JSONValue]) throws -> [String: JSONValue
     let tmpDir = state.tmpDir
     state.tmpDir = nil
     state.lock.unlock()
+    // Wipe inbox + outbound state so a subsequent lxmf_init in the
+    // same bridge process doesn't surface stale messages from the
+    // previous session.
+    state.resetMessaging()
     // Remove the SQLite tempdir so a long-running harness doesn't
     // accumulate one stale `lxmf_conf_swift_<UUID>` per test pair.
     if let tmpDir {
@@ -700,6 +715,14 @@ DispatchQueue.global(qos: .userInitiated).async {
         if let data = try? JSONEncoder().encode(response),
            let s = String(data: data, encoding: .utf8) {
             print(s)
+            fflush(stdout)
+        } else {
+            // Encoding the structured response failed. The harness is
+            // line-blocked waiting for *something*, so emit a hand-
+            // rolled minimal error frame rather than silently dropping
+            // the line and hanging the test.
+            let id = response.id.replacingOccurrences(of: "\"", with: "\\\"")
+            print("{\"id\":\"\(id)\",\"success\":false,\"error\":\"response encode failed\"}")
             fflush(stdout)
         }
     }
