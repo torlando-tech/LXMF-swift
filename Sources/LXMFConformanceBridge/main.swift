@@ -369,7 +369,7 @@ func cmdLxmfInit(_ params: [String: JSONValue]) throws -> [String: JSONValue] {
             "identity_hash": .string(bytesToHex(identity.hash)),
             "delivery_destination_hash": .string(bytesToHex(deliveryDestination.hash)),
             "config_dir": .string(""),
-            "storage_path": .string(":memory:"),
+            "storage_path": .string(dbPath),
         ]
     }
 }
@@ -379,7 +379,20 @@ func cmdLxmfAddTcpServerInterface(_ params: [String: JSONValue]) throws -> [Stri
         throw BridgeError.notInitialised("lxmf_add_tcp_server_interface")
     }
     let bindPort = params["bind_port"]?.intValue ?? 0
-    let actualPort = bindPort != 0 ? UInt16(bindPort) : UInt16(allocateFreePort())
+    // Range-check explicitly so an out-of-range port from the harness
+    // returns a JSON error instead of trapping in `UInt16(_:)`.
+    guard (0...65535).contains(bindPort) else {
+        throw BridgeError.invalidParam("bind_port", "must be in 0...65535, got \(bindPort)")
+    }
+    let actualPort: UInt16
+    if bindPort != 0 {
+        actualPort = UInt16(bindPort)
+    } else {
+        guard let allocated = allocateFreePort() else {
+            throw BridgeError.unknown("allocateFreePort failed")
+        }
+        actualPort = UInt16(allocated)
+    }
     let name = params["name"]?.stringValue ?? "tcpserver"
 
     return try blockingAsync {
@@ -412,6 +425,12 @@ func cmdLxmfAddTcpClientInterface(_ params: [String: JSONValue]) throws -> [Stri
     guard let targetPort = params["target_port"]?.intValue else {
         throw BridgeError.missingParam("target_port")
     }
+    // Range-check explicitly so an out-of-range port from the harness
+    // returns a JSON error instead of trapping in `UInt16(_:)`.
+    guard (0...65535).contains(targetPort) else {
+        throw BridgeError.invalidParam("target_port", "must be in 0...65535, got \(targetPort)")
+    }
+    let portU16 = UInt16(targetPort)
     let name = params["name"]?.stringValue ?? "tcpclient"
 
     return try blockingAsync {
@@ -422,7 +441,7 @@ func cmdLxmfAddTcpClientInterface(_ params: [String: JSONValue]) throws -> [Stri
             enabled: true,
             mode: .full,
             host: targetHost,
-            port: UInt16(targetPort),
+            port: portU16,
             ifacSize: 0,
             ifacKey: nil
         )
@@ -436,8 +455,14 @@ func cmdLxmfAddTcpClientInterface(_ params: [String: JSONValue]) throws -> [Stri
 /// OS-assigned port. Same trick reticulum-conformance uses; the
 /// close-then-rebind window is technically a race but doesn't fire
 /// in practice on loopback in single-test runs.
-func allocateFreePort() -> Int {
+///
+/// Returns nil (rather than 0) on bind/getsockname failure so the
+/// caller surfaces a JSON error instead of silently passing port 0
+/// downstream where it would either bind ephemerally or fail in a
+/// hard-to-trace way.
+func allocateFreePort() -> Int? {
     let s = socket(AF_INET, SOCK_STREAM, 0)
+    guard s >= 0 else { return nil }
     defer { close(s) }
     var addr = sockaddr_in()
     addr.sin_family = sa_family_t(AF_INET)
@@ -448,7 +473,7 @@ func allocateFreePort() -> Int {
             bind(s, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
         }
     }
-    guard result == 0 else { return 0 }
+    guard result == 0 else { return nil }
     var bound = sockaddr_in()
     var len = socklen_t(MemoryLayout<sockaddr_in>.size)
     let ok = withUnsafeMutablePointer(to: &bound) { ptr -> Int32 in
@@ -456,7 +481,7 @@ func allocateFreePort() -> Int {
             getsockname(s, sa, &len)
         }
     }
-    guard ok == 0 else { return 0 }
+    guard ok == 0 else { return nil }
     return Int(UInt16(bigEndian: bound.sin_port))
 }
 
@@ -542,11 +567,25 @@ func cmdLxmfGetMessageState(_ params: [String: JSONValue]) throws -> [String: JS
 
 func cmdLxmfShutdown(_ params: [String: JSONValue]) throws -> [String: JSONValue] {
     let stopped: Bool = state.router != nil
-    if let router = state.router {
+    let router = state.router
+    let transport = state.transport
+    if router != nil || transport != nil {
         // Synchronous teardown — the harness expects
-        // lxmf_shutdown to complete before the next test starts.
+        // lxmf_shutdown to complete before the next test starts. The
+        // transport teardown matters when the harness reuses a single
+        // bridge process across multiple test cases: without it,
+        // bound TCP server sockets would remain open and the next
+        // `lxmf_add_tcp_server_interface` on the same port would
+        // fail to bind.
         try blockingAsync {
-            await router.shutdown()
+            await router?.shutdown()
+            if let transport {
+                await transport.stopRetransmissionLoop()
+                let snapshots = await transport.getInterfaceSnapshots()
+                for snapshot in snapshots {
+                    await transport.removeInterface(id: snapshot.id)
+                }
+            }
         }
     }
     state.lock.lock()
