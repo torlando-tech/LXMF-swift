@@ -71,7 +71,13 @@ enum JSONValue: Codable, Equatable {
     var intValue: Int? {
         switch self {
         case .int(let i): return i
-        case .double(let d): return Int(d)
+        case .double(let d):
+            // `Int(_:)` traps on NaN, ±Infinity, and any value outside
+            // [Int.min, Int.max]. JSON floats like 1e300 are valid
+            // input, so guard here to return nil and let the caller's
+            // missing/invalid-param error bubble up.
+            guard d.isFinite, d >= Double(Int.min), d <= Double(Int.max) else { return nil }
+            return Int(d)
         default: return nil
         }
     }
@@ -307,20 +313,30 @@ func stateName(_ state: LXMessageState) -> String {
 /// uses (see ConformanceBridge/main.swift). The bridge command
 /// dispatcher is synchronous because each request must produce a
 /// single response line before the next request is read.
+///
+/// The result is stashed inside a reference-typed `Box` so the
+/// capture stays Swift 6 strict-concurrency-clean: a `var` captured
+/// and mutated from the @Sendable Task closure would error under
+/// `-strict-concurrency=complete`. The semaphore still provides the
+/// happens-before edge between the writer and the reader on the
+/// caller's thread.
+private final class ResultBox<T>: @unchecked Sendable {
+    var value: Result<T, Error> = .failure(BridgeError.unknown("uninitialised"))
+}
+
 func blockingAsync<T: Sendable>(_ work: @escaping @Sendable () async throws -> T) throws -> T {
     let semaphore = DispatchSemaphore(value: 0)
-    var result: Result<T, Error> = .failure(BridgeError.unknown("uninitialised"))
+    let box = ResultBox<T>()
     Task {
         do {
-            let v = try await work()
-            result = .success(v)
+            box.value = .success(try await work())
         } catch {
-            result = .failure(error)
+            box.value = .failure(error)
         }
         semaphore.signal()
     }
     semaphore.wait()
-    return try result.get()
+    return try box.value.get()
 }
 
 // MARK: - Command handlers
