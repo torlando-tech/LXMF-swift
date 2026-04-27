@@ -28,7 +28,7 @@ let package = Package(
         // that drift transitively. `from:` lets SPM pick the latest
         // semver-compatible release tag while still allowing minor/patch
         // upgrades to flow through automatically.
-        .package(url: "https://github.com/torlando-tech/reticulum-swift.git", from: "0.2.0"),
+        .package(url: "https://github.com/torlando-tech/reticulum-swift.git", from: "0.2.2"),
         .package(url: "https://github.com/groue/GRDB.swift.git", from: "6.0.0"),
         .package(url: "https://github.com/tsolomko/SWCompression.git", from: "4.8.0"),
     ],
@@ -41,6 +41,25 @@ let package = Package(
                 "SWCompression",
             ],
             path: "Sources/LXMFSwift"
+        ),
+        // Cross-impl conformance harness for the
+        // torlando-tech/lxmf-conformance test suite. Speaks JSON-RPC
+        // over stdio against the Python (and eventually Kotlin)
+        // bridges so cross-impl tests can drive Swift LXMF through
+        // the same scenarios. Build with:
+        //
+        //   swift build -c release --product LXMFConformanceBridge
+        //
+        // The lxmf-conformance pytest fixture auto-detects the
+        // resulting binary at .build/release/LXMFConformanceBridge
+        // (or honors CONFORMANCE_SWIFT_BRIDGE_CMD).
+        .executableTarget(
+            name: "LXMFConformanceBridge",
+            dependencies: [
+                "LXMFSwift",
+                .product(name: "ReticulumSwift", package: "reticulum-swift"),
+            ],
+            path: "Sources/LXMFConformanceBridge"
         ),
         .testTarget(
             name: "LXMFSwiftTests",

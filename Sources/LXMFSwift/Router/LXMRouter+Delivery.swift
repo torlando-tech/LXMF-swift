@@ -295,7 +295,12 @@ extension LXMRouter {
                 data: encrypted
             )
 
-            try await transport.sendLinkData(packet: packet, destinationHash: destHash)
+            try await sendLinkDataWithProofCallback(
+                packet: packet,
+                destinationHash: destHash,
+                messageHash: message.hash,
+                transport: transport
+            )
         } else {
             // Need Resource for large message
             directSendLogger.info("Message too large for link packet (\(packed.count) > \(LXMFConstants.LINK_PACKET_MAX_CONTENT)), using Resource transfer")
@@ -503,6 +508,54 @@ extension LXMRouter {
         // Timeout - link didn't become active
         routerLogger.error("Link \(linkIdHex) establishment timed out (state=\(String(describing: lastState)), polls=\(pollCount))")
         throw LXMFError.linkFailed("Link establishment timed out after \(timeout) seconds")
+    }
+
+    // MARK: - Proof-callback registration helper
+
+    /// Register a delivery-proof callback on `transport` keyed by the
+    /// truncated hash of `packet`, then send the encrypted link DATA.
+    /// On send failure, remove the callback and rethrow so a stale
+    /// entry doesn't sit in `pendingProofCallbacks` forever.
+    ///
+    /// Mirrors python's
+    /// `lxm_packet.send().set_delivery_callback(__mark_delivered)` for
+    /// the DIRECT/PACKET branch in `LXMessage.send()`. Without this,
+    /// small DIRECT messages stop at `.sent` on the swift sender even
+    /// when the receiver has acked, because the proof comes back over
+    /// the link as a `.proof` packet whose truncated hash matches
+    /// the *outbound* packet — that's what the callback is keyed on.
+    ///
+    /// Extracted from `sendDirect` so the registration / error-cleanup
+    /// path is unit-testable in isolation: a real `sendDirect` test
+    /// would have to drive an active link with derived keys to reach
+    /// this block, but the logic itself is independent of link state.
+    ///
+    /// - Parameters:
+    ///   - packet: encrypted link DATA packet to send.
+    ///   - destinationHash: the recipient's destination hash (used by
+    ///     `transport.sendLinkData` for path-table HEADER_2 routing
+    ///     decisions; the packet itself is addressed to the linkId).
+    ///   - messageHash: hash of the LXMessage; the proof callback
+    ///     calls `handleDeliveryProofReceived(messageHash:)` with
+    ///     this so the right outbound message advances to `.delivered`.
+    ///   - transport: transport actor to register the callback on
+    ///     and send through.
+    internal func sendLinkDataWithProofCallback(
+        packet: Packet,
+        destinationHash: Data,
+        messageHash: Data,
+        transport: ReticulumTransport
+    ) async throws {
+        let packetTruncatedHash = packet.getTruncatedHash()
+        await transport.registerProofCallback(truncatedHash: packetTruncatedHash) { [weak self] in
+            await self?.handleDeliveryProofReceived(messageHash: messageHash)
+        }
+        do {
+            try await transport.sendLinkData(packet: packet, destinationHash: destinationHash)
+        } catch {
+            await transport.removeProofCallback(truncatedHash: packetTruncatedHash)
+            throw error
+        }
     }
 }
 

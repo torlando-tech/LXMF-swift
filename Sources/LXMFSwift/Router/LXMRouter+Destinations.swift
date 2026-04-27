@@ -184,6 +184,27 @@ extension LXMRouter {
             return
         }
 
+        // Link-delivered packets (DIRECT) need a link-context proof
+        // (explicit format: 32-byte hash + 64-byte signature, addressed
+        // to the link, signed with the link's signing key). The
+        // standalone SINGLE-implicit proof we emit for OPPORTUNISTIC
+        // would be silently rejected by python's
+        // PacketReceipt.validate_link_proof (which requires explicit
+        // format and validates against the link's peer_sig_pub), so
+        // DIRECT outbound state would never advance to `delivered`
+        // even though the message arrived.
+        if packet.header.destinationType == .link,
+           let link = await transport.getLink(linkId: packet.destination) {
+            do {
+                try await link.provePacket(packet)
+                let hashHex = packet.getFullHash().prefix(8).map { String(format: "%02x", $0) }.joined()
+                routerLogger.info("Link delivery proof sent for packet \(hashHex)")
+            } catch {
+                routerLogger.error("Failed to send link delivery proof: \(error)")
+            }
+            return
+        }
+
         // Compute packet hash (used as proof destination and signature input)
         let packetHash = packet.getFullHash()
         let proofDestination = packet.getTruncatedHash()
