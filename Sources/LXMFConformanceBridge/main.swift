@@ -150,6 +150,96 @@ func bytesToHex(_ data: Data) -> String {
     data.map { String(format: "%02x", $0) }.joined()
 }
 
+// MARK: - LXMF field encoding
+
+/// Convert an LXMF field value (as it lives inside `LXMessage.fields`)
+/// to a JSON-safe shape for the bridge inbox. `Data` becomes a hex
+/// string at any depth so `JSONEncoder` can render it; lists and dicts
+/// are walked recursively. Mirrors the python bridge's
+/// `_encode_field_value_for_inbox` so both impls serialize attachments
+/// identically for tight cross-impl assertions.
+func encodeFieldValueForInbox(_ value: Any) -> JSONValue {
+    if let data = value as? Data {
+        return .string(bytesToHex(data))
+    }
+    if let str = value as? String {
+        return .string(str)
+    }
+    if let b = value as? Bool {
+        return .bool(b)
+    }
+    if let i = value as? Int {
+        return .int(i)
+    }
+    if let i = value as? Int64 {
+        return .int(Int(i))
+    }
+    if let i = value as? UInt64 {
+        return .int(Int(i))
+    }
+    if let d = value as? Double {
+        return .double(d)
+    }
+    if let arr = value as? [Any] {
+        return .array(arr.map(encodeFieldValueForInbox))
+    }
+    if let dict = value as? [String: Any] {
+        var out: [String: JSONValue] = [:]
+        for (k, v) in dict { out[k] = encodeFieldValueForInbox(v) }
+        return .dict(out)
+    }
+    return .null
+}
+
+/// Decode the wire-format `fields` parameter on a send command into the
+/// `[UInt8: Any]` shape `LXMessage.init(fields:)` expects.
+///
+/// Wire format mirrors reticulum-conformance / python lxmf-conformance:
+///   {"bytes": "<hex>"}  -> Data
+///   {"str": "..."}       -> String
+///   {"int": 123}          -> Int
+///   {"bool": true}        -> Bool
+///   JSON arrays           -> [Any] (recursive)
+///   bare primitives       -> their native type (passthrough)
+func decodeFieldValue(_ value: JSONValue) throws -> Any {
+    switch value {
+    case .dict(let d):
+        if case .string(let hex) = d["bytes"] ?? .null {
+            guard let data = hexToBytes(hex) else {
+                throw BridgeError.invalidParam("fields", "invalid hex in {bytes: ...}: \(hex)")
+            }
+            return data
+        }
+        if case .string(let s) = d["str"] ?? .null { return s }
+        if case .int(let i) = d["int"] ?? .null { return i }
+        if case .double(let dv) = d["int"] ?? .null { return Int(dv) }
+        if case .bool(let b) = d["bool"] ?? .null { return b }
+        throw BridgeError.invalidParam(
+            "fields",
+            "unsupported field object shape; expected {bytes|str|int|bool}"
+        )
+    case .array(let arr):
+        return try arr.map(decodeFieldValue)
+    case .string(let s): return s
+    case .int(let i): return i
+    case .double(let d): return d
+    case .bool(let b): return b
+    case .null: return NSNull()
+    }
+}
+
+func decodeFieldsParam(_ raw: JSONValue?) throws -> [UInt8: Any]? {
+    guard let raw, case .dict(let d) = raw, !d.isEmpty else { return nil }
+    var out: [UInt8: Any] = [:]
+    for (k, v) in d {
+        guard let key = UInt8(k) else {
+            throw BridgeError.invalidParam("fields", "field key must be 0..255: \(k)")
+        }
+        out[key] = try decodeFieldValue(v)
+    }
+    return out
+}
+
 // MARK: - Bridge state
 
 /// Per-process bridge state. Single instance per bridge subprocess —
@@ -263,6 +353,17 @@ final class BridgeDelegate: LXMRouterDelegate, @unchecked Sendable {
             }
         }()
 
+        // LXMF fields surface as a JSON dict keyed by the field id
+        // (decimal string), with leaf bytes hex-encoded — matches the
+        // python bridge's `_encode_message_fields` so cross-impl tests
+        // can compare attachment payloads byte-for-byte.
+        var fieldsJson: [String: JSONValue] = [:]
+        if let fields = message.fields {
+            for (key, value) in fields {
+                fieldsJson[String(key)] = encodeFieldValueForInbox(value)
+            }
+        }
+
         let entry: [String: JSONValue] = [
             "message_hash": .string(bytesToHex(message.hash)),
             "source_hash": .string(bytesToHex(message.sourceHash)),
@@ -272,6 +373,7 @@ final class BridgeDelegate: LXMRouterDelegate, @unchecked Sendable {
             "method": .string(methodName),
             "ack_status": .string("received"),
             "received_at_ms": .int(Int(Date().timeIntervalSince1970 * 1000.0)),
+            "fields": .dict(fieldsJson),
         ]
         _ = state.appendInbox(entry)
     }
@@ -590,6 +692,7 @@ func cmdLxmfSendOpportunistic(_ params: [String: JSONValue]) throws -> [String: 
     }
     let content = params["content"]?.stringValue ?? ""
     let title = params["title"]?.stringValue ?? ""
+    let fields = try decodeFieldsParam(params["fields"])
 
     return try blockingAsync {
         var message = LXMessage(
@@ -597,7 +700,7 @@ func cmdLxmfSendOpportunistic(_ params: [String: JSONValue]) throws -> [String: 
             sourceIdentity: identity,
             content: Data(content.utf8),
             title: Data(title.utf8),
-            fields: nil,
+            fields: fields,
             desiredMethod: .opportunistic
         )
 
@@ -656,6 +759,7 @@ func cmdLxmfSendDirect(_ params: [String: JSONValue]) throws -> [String: JSONVal
     }
     let content = params["content"]?.stringValue ?? ""
     let title = params["title"]?.stringValue ?? ""
+    let fields = try decodeFieldsParam(params["fields"])
 
     return try blockingAsync {
         var message = LXMessage(
@@ -663,7 +767,7 @@ func cmdLxmfSendDirect(_ params: [String: JSONValue]) throws -> [String: JSONVal
             sourceIdentity: identity,
             content: Data(content.utf8),
             title: Data(title.utf8),
-            fields: nil,
+            fields: fields,
             desiredMethod: .direct
         )
         try await router.handleOutbound(&message)
