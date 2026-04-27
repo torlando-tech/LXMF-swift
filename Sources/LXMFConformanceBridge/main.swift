@@ -202,6 +202,20 @@ final class BridgeState: @unchecked Sendable {
         outboundState[hashHex] = state
     }
 
+    /// Set the outbound state only if no entry exists for this hash.
+    /// Used by send commands to seed an initial state without
+    /// clobbering a delegate-driven update that landed first (the
+    /// outbound thread can run sendDirect/sendOpportunistic before
+    /// `handleOutbound` returns to the caller, in which case the
+    /// delegate-updated `.sent` would be overwritten by an unconditional
+    /// seed of `.outbound`).
+    func seedOutboundState(hashHex: String, state: String) {
+        lock.lock(); defer { lock.unlock() }
+        if outboundState[hashHex] == nil {
+            outboundState[hashHex] = state
+        }
+    }
+
     func getOutboundState(hashHex: String) -> String {
         lock.lock(); defer { lock.unlock() }
         return outboundState[hashHex] ?? "unknown"
@@ -610,14 +624,52 @@ func cmdLxmfSendOpportunistic(_ params: [String: JSONValue]) throws -> [String: 
         try await router.handleOutbound(&message)
 
         let hashHex = bytesToHex(message.hash)
-        // Seed the outbound state with the current state so a tight
-        // race between handleOutbound returning and the delegate
-        // callback firing doesn't show "unknown" briefly.
-        state.setOutboundState(hashHex: hashHex, state: stateName(message.state))
+        // Seed the outbound state ONLY if no delegate update has
+        // landed yet. Without the conditional, a fast outbound thread
+        // can call notifyUpdate(message: .sent) before this line runs;
+        // an unconditional set then overwrites `.sent` with `.outbound`
+        // and the test sees the wrong state forever.
+        state.seedOutboundState(hashHex: hashHex, state: stateName(message.state))
 
         return [
             "message_hash": .string(hashHex),
         ]
+    }
+}
+
+/// Send a DIRECT (link-based) LXMF message. Mirrors python bridge's
+/// cmd_lxmf_send_direct: same param shape, same response. The router
+/// establishes an outbound link to the recipient and delivers the
+/// packed message over it. No size guard here — DIRECT links can
+/// fragment via Resource transfer when the message exceeds
+/// LINK_PACKET_MAX_CONTENT.
+func cmdLxmfSendDirect(_ params: [String: JSONValue]) throws -> [String: JSONValue] {
+    guard let router = state.router,
+          let identity = state.identity else {
+        throw BridgeError.notInitialised("lxmf_send_direct")
+    }
+    guard let destHashHex = params["destination_hash"]?.stringValue else {
+        throw BridgeError.missingParam("destination_hash")
+    }
+    guard let destHash = hexToBytes(destHashHex) else {
+        throw BridgeError.invalidParam("destination_hash", "invalid hex string: \(destHashHex)")
+    }
+    let content = params["content"]?.stringValue ?? ""
+    let title = params["title"]?.stringValue ?? ""
+
+    return try blockingAsync {
+        var message = LXMessage(
+            destinationHash: destHash,
+            sourceIdentity: identity,
+            content: Data(content.utf8),
+            title: Data(title.utf8),
+            fields: nil,
+            desiredMethod: .direct
+        )
+        try await router.handleOutbound(&message)
+        let hashHex = bytesToHex(message.hash)
+        state.seedOutboundState(hashHex: hashHex, state: stateName(message.state))
+        return ["message_hash": .string(hashHex)]
     }
 }
 
@@ -693,6 +745,7 @@ func dispatch(_ req: Request) throws -> [String: JSONValue] {
     case "lxmf_add_tcp_client_interface": return try cmdLxmfAddTcpClientInterface(req.params)
     case "lxmf_announce": return try cmdLxmfAnnounce(req.params)
     case "lxmf_send_opportunistic": return try cmdLxmfSendOpportunistic(req.params)
+    case "lxmf_send_direct": return try cmdLxmfSendDirect(req.params)
     case "lxmf_get_received_messages": return try cmdLxmfGetReceivedMessages(req.params)
     case "lxmf_get_message_state": return try cmdLxmfGetMessageState(req.params)
     case "lxmf_shutdown": return try cmdLxmfShutdown(req.params)

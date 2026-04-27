@@ -295,7 +295,28 @@ extension LXMRouter {
                 data: encrypted
             )
 
-            try await transport.sendLinkData(packet: packet, destinationHash: destHash)
+            // Register a delivery-proof callback BEFORE sending so the
+            // proof packet (which mirrors `Identity.prove(packet)` on
+            // the receiver and lands as a `.proof` packet whose
+            // truncated hash matches our outbound packet) can flip the
+            // outbound message state to `.delivered`. Mirrors python's
+            // `lxm_packet.send().set_delivery_callback(__mark_delivered)`
+            // in `LXMessage.send()` for the DIRECT/PACKET branch — and
+            // matches what `sendOpportunistic` already does. Without
+            // this, small DIRECT messages stop at `.sent` even when the
+            // peer has acked.
+            let packetTruncatedHash = packet.getTruncatedHash()
+            let msgHash = message.hash
+            await transport.registerProofCallback(truncatedHash: packetTruncatedHash) { [weak self] in
+                await self?.handleDeliveryProofReceived(messageHash: msgHash)
+            }
+
+            do {
+                try await transport.sendLinkData(packet: packet, destinationHash: destHash)
+            } catch {
+                await transport.removeProofCallback(truncatedHash: packetTruncatedHash)
+                throw error
+            }
         } else {
             // Need Resource for large message
             directSendLogger.info("Message too large for link packet (\(packed.count) > \(LXMFConstants.LINK_PACKET_MAX_CONTENT)), using Resource transfer")
