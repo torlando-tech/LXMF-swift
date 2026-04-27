@@ -68,6 +68,13 @@ enum JSONValue: Codable, Equatable {
     }
 
     var stringValue: String? { if case .string(let s) = self { return s } else { return nil } }
+    var doubleValue: Double? {
+        switch self {
+        case .double(let d): return d
+        case .int(let i): return Double(i)
+        default: return nil
+        }
+    }
     var intValue: Int? {
         switch self {
         case .int(let i): return i
@@ -777,6 +784,122 @@ func cmdLxmfSendDirect(_ params: [String: JSONValue]) throws -> [String: JSONVal
     }
 }
 
+/// Return whether the router's path table currently has a path entry
+/// for `destination_hash`. Lets test fixtures poll for convergence in
+/// multi-bridge topologies instead of guessing a settle time.
+func cmdLxmfHasPath(_ params: [String: JSONValue]) throws -> [String: JSONValue] {
+    guard let router = state.router else {
+        throw BridgeError.notInitialised("lxmf_has_path")
+    }
+    guard let hashHex = params["destination_hash"]?.stringValue,
+          let destHash = hexToBytes(hashHex) else {
+        throw BridgeError.missingParam("destination_hash")
+    }
+    return try blockingAsync {
+        let hasPath = await router.hasPath(destHash)
+        return ["has_path": .bool(hasPath)]
+    }
+}
+
+/// Configure this peer's outbound propagation node. Mirrors python's
+/// `cmd_lxmf_set_outbound_propagation_node`; once set, `lxmf_send_propagated`
+/// will queue messages routed through that node.
+func cmdLxmfSetOutboundPropagationNode(_ params: [String: JSONValue]) throws -> [String: JSONValue] {
+    guard let router = state.router else {
+        throw BridgeError.notInitialised("lxmf_set_outbound_propagation_node")
+    }
+    guard let hashHex = params["destination_hash"]?.stringValue,
+          let destHash = hexToBytes(hashHex) else {
+        throw BridgeError.missingParam("destination_hash")
+    }
+    let stampCost = params["stamp_cost"]?.intValue
+    return try blockingAsync {
+        await router.setOutboundPropagationNode(destHash)
+        if let stampCost {
+            await router.setPropagationStampCost(stampCost)
+        }
+        return ["ok": .bool(true)]
+    }
+}
+
+/// Submit a PROPAGATED LXMF message via the configured propagation node.
+/// Same param shape as `lxmf_send_direct` — the only difference is the
+/// `desiredMethod`, which routes the message through the LXMRouter
+/// outbound propagation queue instead of opening a direct link to the
+/// recipient.
+func cmdLxmfSendPropagated(_ params: [String: JSONValue]) throws -> [String: JSONValue] {
+    guard let router = state.router,
+          let identity = state.identity else {
+        throw BridgeError.notInitialised("lxmf_send_propagated")
+    }
+    guard let destHashHex = params["destination_hash"]?.stringValue else {
+        throw BridgeError.missingParam("destination_hash")
+    }
+    guard let destHash = hexToBytes(destHashHex) else {
+        throw BridgeError.invalidParam("destination_hash", "invalid hex string: \(destHashHex)")
+    }
+    let content = params["content"]?.stringValue ?? ""
+    let title = params["title"]?.stringValue ?? ""
+    let fields = try decodeFieldsParam(params["fields"])
+
+    return try blockingAsync {
+        var message = LXMessage(
+            destinationHash: destHash,
+            sourceIdentity: identity,
+            content: Data(content.utf8),
+            title: Data(title.utf8),
+            fields: fields,
+            desiredMethod: .propagated
+        )
+        try await router.handleOutbound(&message)
+        let hashHex = bytesToHex(message.hash)
+        state.seedOutboundState(hashHex: hashHex, state: stateName(message.state))
+        return ["message_hash": .string(hashHex)]
+    }
+}
+
+/// Pull messages from the configured propagation node.
+///
+/// Wraps `LXMRouter.syncFromPropagationNode` and waits up to
+/// `timeout_sec` for the transfer state to settle. Returns the final
+/// state name so tests can assert success / failure.
+func cmdLxmfSyncInbound(_ params: [String: JSONValue]) throws -> [String: JSONValue] {
+    guard let router = state.router else {
+        throw BridgeError.notInitialised("lxmf_sync_inbound")
+    }
+    let timeoutSec = params["timeout_sec"]?.doubleValue ?? 30.0
+    return try blockingAsync {
+        do {
+            try await router.syncFromPropagationNode()
+        } catch {
+            return [
+                "final_state": .string("failed"),
+                "error": .string("\(error)"),
+            ]
+        }
+        // Poll the actor's syncState until it reaches a terminal value
+        // (`done` / `failed` / `noPath` / `linkFailed`) or the timeout
+        // elapses. The active states (`linkEstablishing`, `transferring`,
+        // …) drive an internal LXMF transfer; we wait on them so the
+        // returned `final_state` reflects the actual outcome.
+        let deadline = Date().addingTimeInterval(timeoutSec)
+        var finalState = await router.syncState.state
+        while Date() < deadline {
+            finalState = await router.syncState.state
+            if isSyncTerminalState(finalState) { break }
+            try await Task.sleep(for: .milliseconds(200))
+        }
+        return ["final_state": .string("\(finalState)")]
+    }
+}
+
+private func isSyncTerminalState(_ state: PropagationState) -> Bool {
+    switch state {
+    case .idle, .complete, .noPath, .linkFailed, .transferFailed: return true
+    default: return false
+    }
+}
+
 func cmdLxmfGetReceivedMessages(_ params: [String: JSONValue]) throws -> [String: JSONValue] {
     let sinceSeq = params["since_seq"]?.intValue ?? 0
     let (messages, lastSeq) = state.drainInbox(sinceSeq: sinceSeq)
@@ -850,6 +973,10 @@ func dispatch(_ req: Request) throws -> [String: JSONValue] {
     case "lxmf_announce": return try cmdLxmfAnnounce(req.params)
     case "lxmf_send_opportunistic": return try cmdLxmfSendOpportunistic(req.params)
     case "lxmf_send_direct": return try cmdLxmfSendDirect(req.params)
+    case "lxmf_has_path": return try cmdLxmfHasPath(req.params)
+    case "lxmf_set_outbound_propagation_node": return try cmdLxmfSetOutboundPropagationNode(req.params)
+    case "lxmf_send_propagated": return try cmdLxmfSendPropagated(req.params)
+    case "lxmf_sync_inbound": return try cmdLxmfSyncInbound(req.params)
     case "lxmf_get_received_messages": return try cmdLxmfGetReceivedMessages(req.params)
     case "lxmf_get_message_state": return try cmdLxmfGetMessageState(req.params)
     case "lxmf_shutdown": return try cmdLxmfShutdown(req.params)

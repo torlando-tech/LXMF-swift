@@ -109,6 +109,22 @@ public actor LXMRouter {
     /// When set, .propagated delivery sends messages to this node.
     public var outboundPropagationNode: Data?
 
+    /// Cross-actor setter for `outboundPropagationNode`. Convenience
+    /// wrapper so callers don't need `await router.outboundPropagationNode = ...`
+    /// (which is not currently allowed for actor-isolated `var`s from
+    /// outside the actor).
+    public func setOutboundPropagationNode(_ destinationHash: Data?) {
+        outboundPropagationNode = destinationHash
+    }
+
+    /// Cross-actor setter for `propagationStampCost`. Same rationale as
+    /// `setOutboundPropagationNode` — exposed so test harnesses can pin
+    /// the stamp cost manually instead of waiting for it to be derived
+    /// from the propagation node's announce app-data.
+    public func setPropagationStampCost(_ cost: Int) {
+        propagationStampCost = cost
+    }
+
     /// Stamp cost required by the selected propagation node.
     /// Set when selecting a propagation node (from PropagationNodeInfo.stampCost).
     /// 0 = no stamp work required (any 32-byte stamp accepted).
