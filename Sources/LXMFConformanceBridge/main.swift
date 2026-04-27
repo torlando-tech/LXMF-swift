@@ -444,6 +444,26 @@ func cmdLxmfAddTcpServerInterface(_ params: [String: JSONValue]) throws -> [Stri
             ifacKey: nil
         )
         let iface = try TCPServerInterface(config: config)
+        // Register every spawned peer with the Transport on connect.
+        // Without this, inbound packets on the spawned child interface
+        // (the python TCPClient's announce, proof, etc.) reach the
+        // Transport's `receive(packet:from:)` with an interfaceId the
+        // Transport doesn't know about → the packet is dropped before
+        // path-table updates run, so the swift server side never learns
+        // the peer's identity. Mirrors reticulum-swift's own
+        // ConformanceBridge/WireTcp.swift:319-343.
+        iface.onClientConnected = { [weak transport] spawned in
+            guard let transport else { return }
+            do {
+                try blockingAsync {
+                    try await transport.addInterface(spawned)
+                }
+            } catch {
+                FileHandle.standardError.write(
+                    Data("[LXMFBridge] Failed to register spawned peer \(spawned.id): \(error)\n".utf8)
+                )
+            }
+        }
         try await transport.addInterface(iface)
 
         return [
