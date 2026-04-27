@@ -182,7 +182,15 @@ func encodeFieldValueForInbox(_ value: Any) -> JSONValue {
         return .int(Int(i))
     }
     if let i = value as? UInt64 {
-        return .int(Int(i))
+        // `Int(UInt64)` traps for values ≥ 2^63. An adversarial peer
+        // can send an LXMF field with a UInt64 in [Int.max+1, UInt64.max]
+        // and crash the bridge. Fall through to a string-encoded
+        // representation of the number so the value is still surfaced
+        // to the harness without blowing up the process.
+        if i <= UInt64(Int.max) {
+            return .int(Int(i))
+        }
+        return .string(String(i))
     }
     if let d = value as? Double {
         return .double(d)
@@ -219,7 +227,20 @@ func decodeFieldValue(_ value: JSONValue) throws -> Any {
         }
         if case .string(let s) = d["str"] ?? .null { return s }
         if case .int(let i) = d["int"] ?? .null { return i }
-        if case .double(let dv) = d["int"] ?? .null { return Int(dv) }
+        if case .double(let dv) = d["int"] ?? .null {
+            // `Int(_:)` is a trapping conversion for any `Double` outside
+            // `[Int.min, Int.max]`, including `NaN` / `±Infinity`. JSON
+            // floats like `1e300` are valid input; `JSONDecoder` falls back
+            // to `.double(_)` when an `Int` overflow happens. Without this
+            // guard a malformed/adversarial field value crashes the bridge.
+            guard dv.isFinite, dv >= Double(Int.min), dv <= Double(Int.max) else {
+                throw BridgeError.invalidParam(
+                    "fields",
+                    "int value out of range or non-finite: \(dv)"
+                )
+            }
+            return Int(dv)
+        }
         if case .bool(let b) = d["bool"] ?? .null { return b }
         throw BridgeError.invalidParam(
             "fields",
