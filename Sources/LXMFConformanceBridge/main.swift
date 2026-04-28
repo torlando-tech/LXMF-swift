@@ -822,6 +822,27 @@ func cmdLxmfHasPath(_ params: [String: JSONValue]) throws -> [String: JSONValue]
     }
 }
 
+/// Solicit an announce for `destination_hash` via Reticulum's path-request
+/// flow. Mirrors python's `cmd_lxmf_request_path`. Used in 3-bridge
+/// propagation fixtures where the propagation node announced once at
+/// startup, before the bridges connected — without an active path-request
+/// each bridge's path table never learns the route and `lxmf_send_propagated`
+/// parks at `outbound` forever. Fire-and-forget at the RNS layer; the
+/// caller should poll `lxmf_has_path` after issuing it.
+func cmdLxmfRequestPath(_ params: [String: JSONValue]) throws -> [String: JSONValue] {
+    guard let router = state.router else {
+        throw BridgeError.notInitialised("lxmf_request_path")
+    }
+    guard let hashHex = params["destination_hash"]?.stringValue,
+          let destHash = hexToBytes(hashHex) else {
+        throw BridgeError.missingParam("destination_hash")
+    }
+    return try blockingAsync {
+        await router.requestPath(destHash)
+        return ["requested": .bool(true)]
+    }
+}
+
 /// Configure this peer's outbound propagation node. Mirrors python's
 /// `cmd_lxmf_set_outbound_propagation_node`; once set, `lxmf_send_propagated`
 /// will queue messages routed through that node.
@@ -995,6 +1016,7 @@ func dispatch(_ req: Request) throws -> [String: JSONValue] {
     case "lxmf_send_opportunistic": return try cmdLxmfSendOpportunistic(req.params)
     case "lxmf_send_direct": return try cmdLxmfSendDirect(req.params)
     case "lxmf_has_path": return try cmdLxmfHasPath(req.params)
+    case "lxmf_request_path": return try cmdLxmfRequestPath(req.params)
     case "lxmf_set_outbound_propagation_node": return try cmdLxmfSetOutboundPropagationNode(req.params)
     case "lxmf_send_propagated": return try cmdLxmfSendPropagated(req.params)
     case "lxmf_sync_inbound": return try cmdLxmfSyncInbound(req.params)
