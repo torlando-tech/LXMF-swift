@@ -404,9 +404,24 @@ extension LXMRouter {
                     if msg.method == .propagated && msg.state == .sending {
                         msg.state = .rejected
                         pendingOutbound[i] = msg
+                        // Persist the terminal `.rejected` state to the
+                        // DB so a background-fetch / app-re-launch
+                        // consumer sees the same outcome the UI does.
+                        // Greptile review (4/5 confidence) flagged the
+                        // earlier in-memory-only flip as a parity gap:
+                        // python's terminal-state handlers (e.g.
+                        // LXMessage.py:597 setting REJECTED) update
+                        // the LXMessage object that's already the DB-
+                        // backing source-of-truth, so persistence is
+                        // implicit. Swift's separate in-memory queue +
+                        // SQLite DB means we must write explicitly.
+                        let msgHash = msg.hash
+                        Task.detached { [database] in
+                            try? await database.updateMessageState(id: msgHash, state: .rejected)
+                        }
                         notifyFailure(msg, reason: .stampValidationFailed)
                         let hashHex = msg.hash.prefix(8).map { String(format: "%02x", $0) }.joined()
-                        propLogger.error("[PROP_SIGNAL] cancelled outbound \(hashHex) as REJECTED")
+                        propLogger.error("[PROP_SIGNAL] cancelled outbound \(hashHex) as REJECTED (DB updated)")
                         return
                     }
                 }

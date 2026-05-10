@@ -886,19 +886,44 @@ public actor LXMRouter {
         }
         let msgHex = messageHash.prefix(8).map { String(format: "%02x", $0) }.joined()
 
+        // Compute the new LXMessage state per python's per-method
+        // semantics. Python `LXMessage.py:592-609` guards the retry
+        // path with `if self.state != CANCELLED` on BOTH the DIRECT
+        // (`__resource_concluded`, line 598) and PROPAGATED
+        // (`__propagation_resource_concluded`, line 607) paths —
+        // meaning `.cancelled` is terminal and the message is NOT
+        // re-queued for retry. The DIRECT path additionally treats
+        // `RNS.Resource.REJECTED` as a distinct terminal state
+        // (LXMessage.py:597). Greptile review (4/5 confidence)
+        // flagged the earlier swift port for retrying on `.cancelled`,
+        // which would silently burn the retry budget on a
+        // peer-cancelled transfer.
         let newState: LXMessageState
-        if wasPropagation {
-            // Python LXMessage.py:607-609: any non-complete →
-            // state=OUTBOUND for retry (no separate REJECTED branch).
+        let isTerminal: Bool
+        if resourceState == .cancelled {
+            // Python: state stays whatever the sender already set it
+            // to (typically CANCELLED if the sender cancelled, or some
+            // other state if peer cancelled mid-transfer). Persist
+            // `.cancelled` so the DB reflects the terminal outcome.
+            newState = .cancelled
+            isTerminal = true
+            routerLogger.info("Outbound resource \(resHex, privacy: .public) → message \(msgHex, privacy: .public) cancelled; terminal (no retry per python LXMessage.py:598/607)")
+        } else if wasPropagation {
+            // Python LXMessage.py:607-609: any non-complete (and not
+            // cancelled, handled above) → state=OUTBOUND for retry.
             newState = .outbound
+            isTerminal = false
             routerLogger.info("Outbound PROPAGATED resource \(resHex, privacy: .public) → message \(msgHex, privacy: .public) failed (\(String(describing: resourceState))); marking outbound for retry")
         } else {
-            // Python LXMessage.py:596-601: REJECTED is its own terminal
-            // state; everything else gets OUTBOUND for retry.
+            // Python LXMessage.py:596-601 (DIRECT): REJECTED is its
+            // own terminal state; everything else (and not cancelled,
+            // handled above) gets OUTBOUND for retry.
             if resourceState == .rejected {
                 newState = .rejected
+                isTerminal = true
             } else {
                 newState = .outbound
+                isTerminal = false
             }
             routerLogger.info("Outbound DIRECT resource \(resHex, privacy: .public) → message \(msgHex, privacy: .public) failed (\(String(describing: resourceState))); → \(String(describing: newState))")
         }
@@ -931,10 +956,12 @@ public actor LXMRouter {
         // doesn't immediately re-fire and burn the retry budget, then
         // append + kick processing.
         //
-        // For `.rejected` (DIRECT terminal), we skip the re-enqueue —
-        // python's REJECTED state is terminal. The DB row stays with
-        // state=.rejected for the UI to render.
-        guard newState == .outbound else {
+        // Terminal states (`.rejected` for DIRECT, `.cancelled` for
+        // either path) skip the re-enqueue — python treats both as
+        // end-of-line. The DB row stays with the terminal state for
+        // the UI to render (and for any background-fetch / app-
+        // re-launch consumer to see).
+        guard !isTerminal else {
             routerLogger.debug("\(msgHex, privacy: .public) is terminal (\(String(describing: newState))); skipping re-enqueue")
             return
         }

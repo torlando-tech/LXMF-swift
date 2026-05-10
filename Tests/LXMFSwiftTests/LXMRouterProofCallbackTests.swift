@@ -404,6 +404,85 @@ final class LXMRouterProofCallbackTests: XCTestCase {
         }
     }
 
+    func testOutboundResourceFailedSkipsReenqueueForCancelledPropagation() async throws {
+        // PROPAGATED path with resourceState=.cancelled → terminal,
+        // NOT retried. Python `__propagation_resource_concluded`
+        // (LXMessage.py:607) guards retry with
+        // `if self.state != CANCELLED`. Greptile review (4/5 conf)
+        // flagged the earlier swift port for blindly retrying on
+        // any non-complete state, which would silently burn the
+        // retry budget on a peer-cancelled transfer.
+        let router = try await makeRouter()
+
+        let srcIdentity = Identity()
+        let destHash = Data((0..<16).map { _ in UInt8.random(in: 0...255) })
+        var msg = LXMessage(
+            destinationHash: destHash,
+            sourceIdentity: srcIdentity,
+            content: Data("cancelled-prop".utf8),
+            title: Data(),
+            fields: nil,
+            desiredMethod: .propagated
+        )
+        _ = try msg.pack()
+        try await router.testSaveMessage(msg)
+
+        let resourceHash = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
+        await router.setPendingResourceDelivery(resourceHash: resourceHash, messageHash: msg.hash)
+        await router.markPendingPropagationResource(resourceHash: resourceHash)
+
+        await router.handleOutboundResourceFailed(
+            resourceHash: resourceHash, resourceState: .cancelled
+        )
+
+        let pendingHashes = await router.pendingOutbound.map { $0.hash }
+        XCTAssertFalse(pendingHashes.contains(msg.hash),
+            "Cancelled PROPAGATED resource MUST NOT be re-enqueued — " +
+            "python LXMessage.py:607 treats CANCELLED as terminal. " +
+            "Got count=\(pendingHashes.count)")
+
+        // Maps still get reclaimed even on cancelled (matching the
+        // unconditional-cleanup invariant from the prior fix).
+        let afterProp = await router.pendingPropagationResources.count
+        let afterDeliveries = await router.pendingResourceDeliveries.count
+        XCTAssertEqual(afterProp, 0,
+            "Cancellation must still reclaim pendingPropagationResources.")
+        XCTAssertEqual(afterDeliveries, 0,
+            "Cancellation must still reclaim pendingResourceDeliveries.")
+    }
+
+    func testOutboundResourceFailedSkipsReenqueueForCancelledDirect() async throws {
+        // Same as above but for the DIRECT path. Python guard at
+        // LXMessage.py:598 (same `if self.state != CANCELLED`).
+        let router = try await makeRouter()
+
+        let srcIdentity = Identity()
+        let destHash = Data((0..<16).map { _ in UInt8.random(in: 0...255) })
+        var msg = LXMessage(
+            destinationHash: destHash,
+            sourceIdentity: srcIdentity,
+            content: Data("cancelled-direct".utf8),
+            title: Data(),
+            fields: nil,
+            desiredMethod: .direct
+        )
+        _ = try msg.pack()
+        try await router.testSaveMessage(msg)
+
+        let resourceHash = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
+        await router.setPendingResourceDelivery(resourceHash: resourceHash, messageHash: msg.hash)
+        // No markPendingPropagationResource — this is the DIRECT path.
+
+        await router.handleOutboundResourceFailed(
+            resourceHash: resourceHash, resourceState: .cancelled
+        )
+
+        let pendingHashes = await router.pendingOutbound.map { $0.hash }
+        XCTAssertFalse(pendingHashes.contains(msg.hash),
+            "Cancelled DIRECT resource MUST NOT be re-enqueued — " +
+            "python LXMessage.py:598. Got count=\(pendingHashes.count)")
+    }
+
     func testOutboundResourceFailedSkipsReenqueueForTerminalRejectedDirect() async throws {
         // DIRECT path with resourceState=.rejected → state=.rejected
         // (python LXMessage.py:597). Rejected is terminal; the message
