@@ -165,6 +165,33 @@ the long-term refactor lands, this entire DB-write block goes away
 (the message stays in `pendingOutbound`, `persistPendingState` covers
 durability, and the callbacks just mutate in-memory state).
 
+**Sub-deviation (PROPAGATED resource path DB write ORDERING, PR #7
+round 3):** The in-flight `.outbound` write in `processOutbound`'s
+PROPAGATED+RESOURCE branch AND the matching `.sent` write in
+`handlePropagationAccepted` are both `await`-ed inside the actor
+(NOT `Task.detached`). The actor's serial mailbox is the
+ordering primitive — without it, the two `Task.detached` writes
+would land on the global executor in indeterminate order, and a
+fast RESOURCE_PRF (where `handlePropagationAccepted` is queued
+before `processOutbound`'s `.outbound` write has even started)
+could see its `.sent` write clobbered by a late-landing
+`.outbound`, leaving a successfully-propagated message marked
+`.outbound` for re-send on next launch.
+
+Python has no analog because (a) python has no DB writes here at
+all, (b) python's `process_outbound` is a single-threaded loop
+with no async callbacks landing on a separate executor. The
+actor-serialized `await` is the swift-runtime equivalent of
+python's "the next process_outbound tick will see the in-memory
+state mutation that just happened". Category (a) — language/
+runtime needs.
+
+**Re-sync note (concurrency):** if the longer-term refactor (above)
+lands and `pendingOutbound` becomes the single source of truth
+with `persistPendingState` covering durability, the explicit
+per-write `await`s can collapse back to a single batched flush.
+Until then, leave both writes awaited.
+
 ### `lxmfDelivery` — broadcast-echo-only self-echo gate
 
 **Site:** `Sources/LXMFSwift/Router/LXMRouter.swift` — `lxmfDelivery(_:method:)`,

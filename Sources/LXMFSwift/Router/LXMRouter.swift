@@ -707,11 +707,39 @@ public actor LXMRouter {
                         // would reload `deliveryAttempts = 0` from the
                         // DB and effectively grant unlimited retries,
                         // bypassing `MAX_DELIVERY_ATTEMPTS`.
+                        // ORDERING NOTE — awaited (not detached) on
+                        // purpose. The matching `.sent` write in
+                        // `handlePropagationAccepted` is also awaited
+                        // inside the actor, so the two are serialized
+                        // by the actor's mailbox: this `.outbound`
+                        // write completes before `handlePropagationAccepted`
+                        // can run, so a fast RESOURCE_PRF can NEVER
+                        // observe its `.sent` write being clobbered
+                        // by a late-landing `.outbound` write. If
+                        // either of these is changed back to
+                        // `Task.detached`, the race greptile flagged
+                        // (4/5 round, PR #7) returns:
+                        //
+                        //   T0: processOutbound detaches `.outbound`
+                        //   T1: sendPropagated returns
+                        //   T2: RESOURCE_PRF arrives (fast network)
+                        //   T3: handlePropagationAccepted detaches `.sent`
+                        //   T4: global executor runs `.sent` before
+                        //       `.outbound` (no order guarantee)
+                        //   T5: next launch: `.outbound` row → re-send
+                        //       of an already-propagated message.
+                        //
+                        // The DB write is cheap (single-row UPDATE on
+                        // GRDB's serial write pool) and the actor
+                        // suspension during this `await` is bounded —
+                        // any queued mailbox work (including
+                        // `handlePropagationAccepted` triggered by an
+                        // already-in-flight RESOURCE_PRF callback)
+                        // simply runs after the await, preserving the
+                        // observable order.
                         var snapshot = pendingOutbound[i]
                         snapshot.state = .outbound
-                        Task.detached { [database] in
-                            try? await database.saveMessage(snapshot)
-                        }
+                        try? await database.saveMessage(snapshot)
                     } else {
                         requestPath(nodeHash)
                         pendingOutbound[i].nextDeliveryAttempt = Date().addingTimeInterval(Self.PATH_REQUEST_WAIT)
@@ -844,7 +872,7 @@ public actor LXMRouter {
     /// checkmark" on the iOS UI 2026-05-10.
     ///
     /// - Parameter resourceHash: The 32-byte resource hash
-    public func handleResourceTransferComplete(resourceHash: Data) {
+    public func handleResourceTransferComplete(resourceHash: Data) async {
         let resHex = resourceHash.prefix(8).map { String(format: "%02x", $0) }.joined()
         guard let messageHash = pendingResourceDeliveries.removeValue(forKey: resourceHash) else {
             routerLogger.info("Resource \(resHex, privacy: .public) completed but no pending message mapping")
@@ -855,7 +883,7 @@ public actor LXMRouter {
         if pendingPropagationResources.remove(resourceHash) != nil {
             // PROPAGATED resource transfer — python `__mark_propagated`.
             routerLogger.info("Resource \(resHex, privacy: .public) → message \(msgHex, privacy: .public), marking sent (propagation node ack)")
-            handlePropagationAccepted(messageHash: messageHash)
+            await handlePropagationAccepted(messageHash: messageHash)
         } else {
             // DIRECT resource transfer — python `__mark_delivered`.
             routerLogger.info("Resource \(resHex, privacy: .public) → message \(msgHex, privacy: .public), marking delivered (recipient ack)")
@@ -1060,15 +1088,23 @@ public actor LXMRouter {
     /// DELIVERED state distinction is what consumers (UI, etc.) read.
     ///
     /// - Parameter messageHash: The LXMF message hash (32 bytes)
-    public func handlePropagationAccepted(messageHash: Data) {
+    public func handlePropagationAccepted(messageHash: Data) async {
         let hashHex = messageHash.prefix(8).map { String(format: "%02x", $0) }.joined()
         routerLogger.info("Propagation upload accepted for message \(hashHex, privacy: .public)")
 
         // Update database state to sent (NOT delivered — see comment on
         // handleResourceTransferComplete + python LXMessage.py:568-578).
-        Task.detached { [database] in
-            try? await database.updateMessageState(id: messageHash, state: .sent)
-        }
+        //
+        // ORDERING NOTE — awaited (not detached) on purpose. The
+        // matching `.outbound` write in `processOutbound`'s
+        // PROPAGATED+RESOURCE branch is also awaited inside the actor.
+        // Because both writes run on the actor's serial mailbox, the
+        // `.outbound` write always completes before this function can
+        // run — so a fast RESOURCE_PRF can never observe its `.sent`
+        // write being clobbered by a late-landing `.outbound` write.
+        // See the matching comment at processOutbound's
+        // PROPAGATED+RESOURCE site for the full race-and-fix narrative.
+        try? await database.updateMessageState(id: messageHash, state: .sent)
 
         // Notify delegate. We reuse `didConfirmDelivery` for the UI
         // refresh signal — the delegate's job is "this message's state
