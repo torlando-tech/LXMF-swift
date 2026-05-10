@@ -133,6 +133,38 @@ CANCELLED. When that lands, both the `indicesToRemove` machinery and
 the `handleOutboundResourceFailed` re-enqueue can be deleted; the
 state-driven loop will handle resource-failure retries naturally.
 
+**Sub-deviation (PROPAGATED resource path DB write, PR #7 round 2):**
+The in-flight DB write for a PROPAGATED+RESOURCE message (immediately
+after `sendPropagated` returns with `message.state == .sending`)
+persists `state = .outbound` (not the in-memory `.sending`) and writes
+the FULL message record via `saveMessage`, not the state column alone
+via `updateMessageState`.
+
+  - `.outbound` over `.sending` — `loadPendingOutbound()`
+    (`LXMFDatabase.swift:459-468`) filters strictly on
+    `state == .outbound`. Persisting `.sending` would make a
+    crash-during-in-flight message invisible to the restart queue.
+    `.outbound` is the safe fallback: on restart the message is
+    re-enqueued and re-attempted; in steady state the resource
+    callbacks (`handlePropagationAccepted` → `.sent`,
+    `handleOutboundResourceFailed` → `.outbound`/`.rejected`/`.cancelled`)
+    overwrite this with the real terminal state.
+  - `saveMessage` over `updateMessageState` — the optimistic removal
+    from `pendingOutbound` happens BEFORE `persistPendingState`'s
+    full-record save, so without a full-record write here the DB
+    misses the just-incremented `deliveryAttempts`. The resource-
+    failure re-enqueue (`handleOutboundResourceFailed` reloads
+    via `database.getMessage`) would otherwise see stale
+    `deliveryAttempts = 0` and grant unlimited retries, defeating
+    `MAX_DELIVERY_ATTEMPTS`.
+
+Python has no analog because python doesn't persist `pending_outbound`
+to disk at all. This sub-deviation is purely the swift port's
+crash-recovery semantics. The re-sync note above still applies — once
+the long-term refactor lands, this entire DB-write block goes away
+(the message stays in `pendingOutbound`, `persistPendingState` covers
+durability, and the callbacks just mutate in-memory state).
+
 ### `lxmfDelivery` — broadcast-echo-only self-echo gate
 
 **Site:** `Sources/LXMFSwift/Router/LXMRouter.swift` — `lxmfDelivery(_:method:)`,

@@ -664,14 +664,16 @@ public actor LXMRouter {
                         // Mirror python LXMRouter.py:2675-2728 +
                         // LXMessage.send() (LXMessage.py:498-512):
                         // PROPAGATED+RESOURCE leaves message.state =
-                        // .sending until the resource-completion
-                        // callback (handlePropagationAccepted) fires
-                        // when RESOURCE_PRF arrives. Persisting `.sent`
-                        // unconditionally here would lie to consumers
-                        // (background fetch, app re-launch) about a
-                        // message whose upload may still fail — they
-                        // would skip the retry and the message would
-                        // be silently stuck.
+                        // .sending in memory until the resource-
+                        // completion callback (handlePropagationAccepted
+                        // / handleOutboundResourceFailed) fires when
+                        // RESOURCE_PRF or a resource-conclusion is
+                        // received. Persisting `.sent` unconditionally
+                        // here would lie to consumers (background
+                        // fetch, app re-launch) about a message whose
+                        // upload may still fail — they would skip the
+                        // retry and the message would be silently
+                        // stuck.
                         //
                         // The small-packet branch of sendPropagated
                         // (LXMRouter+Propagation.swift:202-207) DOES
@@ -679,10 +681,36 @@ public actor LXMRouter {
                         // sets message.state = .sent there, so only
                         // for the resource path is the in-memory
                         // state still .sending at this point.
-                        let sentMsg = pendingOutbound[i]
-                        let actualState = sentMsg.state
+                        //
+                        // DB-persistence policy for the resource path:
+                        // we deliberately do NOT persist `.sending` to
+                        // the DB. `loadPendingOutbound()` filters
+                        // strictly on `state == .outbound`
+                        // (LXMFDatabase.swift:459-468), so a `.sending`
+                        // row is invisible to the restart queue and a
+                        // crash during the in-flight window (this
+                        // detached write → resource callback) would
+                        // permanently strand the message.
+                        //
+                        // Instead we persist a full message record
+                        // with state `.outbound` (safe fallback —
+                        // restart-recoverable) and the CURRENT
+                        // `deliveryAttempts` count. The in-flight
+                        // callbacks (handlePropagationAccepted,
+                        // handleOutboundResourceFailed) overwrite this
+                        // with the real terminal state when they fire.
+                        // Using `saveMessage` (full record) rather
+                        // than `updateMessageState` (state column
+                        // only) is load-bearing — without persisting
+                        // `deliveryAttempts`, a resource-failure
+                        // re-enqueue via `handleOutboundResourceFailed`
+                        // would reload `deliveryAttempts = 0` from the
+                        // DB and effectively grant unlimited retries,
+                        // bypassing `MAX_DELIVERY_ATTEMPTS`.
+                        var snapshot = pendingOutbound[i]
+                        snapshot.state = .outbound
                         Task.detached { [database] in
-                            try? await database.updateMessageState(id: sentMsg.hash, state: actualState)
+                            try? await database.saveMessage(snapshot)
                         }
                     } else {
                         requestPath(nodeHash)
@@ -977,10 +1005,32 @@ public actor LXMRouter {
             // here too would double-count and hit MAX_DELIVERY_ATTEMPTS
             // (=8) in half the expected cycles.
             //
+            // MAX_DELIVERY_ATTEMPTS budget integrity: the persisted
+            // `deliveryAttempts` we just reloaded reflects the in-flight
+            // attempt that just failed, because `processOutbound`'s
+            // PROPAGATED+RESOURCE branch now `saveMessage`s the full
+            // record (with the post-increment count) before scheduling
+            // the resource transfer. Without that full-record write the
+            // reload would see `deliveryAttempts = 0` and effectively
+            // grant unlimited retries per resource failure. See
+            // `port-deviations.md` (sub-deviation under "processOutbound
+            // optimistic queue removal").
+            //
             // Backoff via `nextDeliveryAttempt` ensures the re-enqueued
-            // message doesn't immediately retry. processOutbound's
-            // existing exponential-ish backoff (line ~699) will widen
-            // this on each subsequent failure.
+            // message doesn't immediately retry on the next
+            // `processOutbound` tick. Mirrors python
+            // `LXMRouter.py:2638/2645/2700` which schedules the next
+            // attempt at `time.time() + PATH_REQUEST_WAIT` (flat — no
+            // per-attempt scaling). `processOutbound`'s catch-block
+            // backoff at line ~699 (which DOES scale per attempt) does
+            // not fire for callback-arrived resource failures because
+            // `sendPropagated` already returned successfully and the
+            // failure is reported asynchronously via the resource
+            // callback path — that scaling is therefore not load-
+            // bearing for this code path. If persistent resource
+            // failures need wider spacing in future, both this site
+            // and the catch-block scaling should be re-aligned
+            // together (and a unified deviation note added).
             msg.state = .outbound
             msg.nextDeliveryAttempt = Date().addingTimeInterval(Self.PATH_REQUEST_WAIT)
             pendingOutbound.append(msg)
