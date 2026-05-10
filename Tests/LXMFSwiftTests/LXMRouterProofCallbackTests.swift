@@ -787,6 +787,95 @@ final class LXMRouterProofCallbackTests: XCTestCase {
         }
     }
 
+    // MARK: - send* happy-path coverage (with real Transport)
+    //
+    // The deep bodies of sendOpportunistic / sendDirect / sendPropagated
+    // were originally only covered end-to-end via the cross-repo iOS
+    // smoke suite. These tests stand up a real ReticulumTransport +
+    // PathTable + MockInterface so the same code paths get unit-level
+    // coverage rolled up to Codecov.
+    //
+    // Common setup pattern:
+    //   1. Build router + transport + mock interface + wire them
+    //   2. Generate a recipient Identity, compute its lxmf.delivery hash
+    //   3. Seed PathTable with a PathEntry for that hash so the send's
+    //      path-lookup succeeds
+    //   4. Pack an LXMessage addressed to the recipient
+    //   5. Invoke the send function
+    //   6. Verify bytes landed on the mock interface
+
+    /// Helper: build the lxmf.delivery destination hash for an Identity,
+    /// matching what the receiver's LXMRouter would compute.
+    private func lxmfDeliveryHash(for identity: Identity) -> Data {
+        Destination.hash(identity: identity, appName: "lxmf", aspects: ["delivery"])
+    }
+
+    /// Helper: record a path entry in the transport's path table so
+    /// `lookup(destinationHash:)` returns a valid entry for our recipient.
+    private func seedPathEntry(
+        transport: ReticulumTransport, destinationHash: Data, identity: Identity,
+        hopCount: UInt8 = 1, interfaceId: String, nextHop: Data? = nil
+    ) async {
+        let pathTable = await transport.getPathTable()
+        let entry = PathEntry(
+            destinationHash: destinationHash,
+            publicKeys: identity.publicKeys,
+            interfaceId: interfaceId,
+            hopCount: hopCount,
+            expiration: 86400,
+            randomBlob: Data((0..<10).map { _ in UInt8.random(in: 0...255) }),
+            nextHop: nextHop
+        )
+        _ = await pathTable.record(entry: entry)
+    }
+
+    /// sendOpportunistic happy path: packs a single encrypted packet and
+    /// sends through transport. Covers the identity-resolution + encrypt +
+    /// packet-build + transport.send path. Roughly 30-40 lines of
+    /// LXMRouter+Delivery.swift's `sendOpportunistic` body.
+    func testSendOpportunisticHappyPathEmitsBytesOnInterface() async throws {
+        let router = try await makeRouter()
+        let transport = ReticulumTransport()
+        let iface = CapturingInterface(id: "opp-happy-iface")
+        try await transport.addInterface(iface)
+        await router.setTransport(transport)
+
+        let recipient = Identity()
+        let destHash = lxmfDeliveryHash(for: recipient)
+        await seedPathEntry(
+            transport: transport, destinationHash: destHash, identity: recipient,
+            interfaceId: iface.id
+        )
+
+        var msg = LXMessage(
+            destinationHash: destHash,
+            sourceIdentity: Identity(),
+            content: Data("opp-happy".utf8),
+            title: Data(), fields: nil, desiredMethod: .opportunistic
+        )
+        _ = try msg.pack()
+
+        try await router.sendOpportunistic(&msg)
+
+        let sent = await iface.drain()
+        XCTAssertGreaterThanOrEqual(sent.count, 1,
+            "sendOpportunistic happy path must emit at least one packet on " +
+            "the mock interface; got \(sent.count). Either path lookup " +
+            "failed (PathEntry seeded?) or transport routing skipped this " +
+            "interface.")
+    }
+
+    // sendDirect / sendPropagated happy-path tests would require an
+    // already-active Link to the recipient (DIRECT) or to the
+    // propagation node (PROPAGATED). `Link._setStateForTesting`
+    // (reticulum-swift) is internal to its own test target — there's
+    // no public swift-API to force a link into `.active` state from
+    // outside reticulum-swift's tests, and the real link-establish
+    // handshake needs a counterparty. Coverage for those code paths
+    // continues to live in the cross-repo iOS smoke suite
+    // (`direct_echo` / `propagated_echo` in Columba's phone harness)
+    // until reticulum-swift exposes a public test-state hook.
+
     func testHandleResourceTransferCompleteNoOpOnUnknownHash() async throws {
         // Defensive: if RESOURCE_PRF fires twice (re-delivery) or for a
         // hash that's already been cleared, the early-return must not
@@ -843,6 +932,7 @@ extension LXMRouter {
     fileprivate func testGetMessage(id: Data) async throws -> LXMessage? {
         try await database.getMessage(id: id)
     }
+
 }
 
 // MARK: - Mock interfaces
