@@ -40,17 +40,31 @@ final class LXMFOutboundResourceHandler: ResourceCallbacks, @unchecked Sendable 
 
     func resourceConcluded(_ resource: Resource) async {
         let state = await resource.state
-        guard state == .complete else {
-            routerLogger.warning("Outbound resource concluded in state \(String(describing: state)), not complete")
-            return
-        }
         guard let resourceHash = await resource.hash else {
-            routerLogger.warning("Outbound resource concluded but no hash")
+            // No hash means we have no way to map back to the message.
+            // Without a hash there's also nothing in the maps to leak.
+            routerLogger.warning("Outbound resource concluded but no hash; map cleanup skipped (nothing to clean)")
             return
         }
         let resHex = resourceHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-        routerLogger.info("Outbound resource \(resHex) transfer confirmed by receiver")
-        await router.handleResourceTransferComplete(resourceHash: resourceHash)
+
+        if state == .complete {
+            routerLogger.info("Outbound resource \(resHex) transfer confirmed by receiver")
+            await router.handleResourceTransferComplete(resourceHash: resourceHash)
+        } else {
+            // Non-complete terminal state (.failed, .rejected, .cancelled,
+            // etc). Mirror python `LXMessage.__resource_concluded` /
+            // `__propagation_resource_concluded` (LXMF/LXMessage.py:592-609):
+            // unconditional dispatch on terminal state, branch by per-method
+            // semantics inside `handleOutboundResourceFailed`. Critically,
+            // the cleanup ALSO reclaims the swift-port-side map state
+            // (pendingResourceDeliveries + pendingPropagationResources)
+            // that the early-return predecessor leaked.
+            routerLogger.warning("Outbound resource \(resHex) concluded in non-complete state \(String(describing: state)); marking message for retry / failure per python parity")
+            await router.handleOutboundResourceFailed(
+                resourceHash: resourceHash, resourceState: state
+            )
+        }
     }
 }
 

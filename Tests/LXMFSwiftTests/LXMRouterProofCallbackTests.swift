@@ -189,6 +189,154 @@ final class LXMRouterProofCallbackTests: XCTestCase {
             // in, which is reticulum-swift's concern.
         }
     }
+
+    // MARK: - handleOutboundResourceFailed — map cleanup on failure
+
+    /// Greptile review on PR #7 (issue 1): when an outbound resource
+    /// transfer concluded in a non-`.complete` state, the prior
+    /// `LXMFOutboundResourceHandler.resourceConcluded` early-returned
+    /// without removing the resource hash from
+    /// `pendingResourceDeliveries` and (for prop sends)
+    /// `pendingPropagationResources`. Across the router's lifetime
+    /// those maps grew without bound on every link drop / PN timeout
+    /// / cancellation, AND if the same resource hash ever did
+    /// re-complete the wrong per-method state handler could fire.
+    ///
+    /// The fix routes non-complete resource conclusions through
+    /// `LXMRouter.handleOutboundResourceFailed`, which always reclaims
+    /// both map entries and writes a python-faithful state transition
+    /// (LXMF/LXMessage.py:592-609). These tests pin the map-cleanup
+    /// guarantee — the part most prone to regressing because the
+    /// failure path is rarely hit in development.
+
+    func testOutboundResourceFailedReclaimsMapsForDirectPath() async throws {
+        let router = try await makeRouter()
+        let resourceHash = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
+        let messageHash = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
+
+        // Seed only `pendingResourceDeliveries` (DIRECT path —
+        // sendDirect's resource branch does NOT insert into
+        // `pendingPropagationResources`).
+        await router.setPendingResourceDelivery(resourceHash: resourceHash, messageHash: messageHash)
+
+        let beforeDeliveries = await router.pendingResourceDeliveries.count
+        let beforeProp = await router.pendingPropagationResources.count
+        XCTAssertEqual(beforeDeliveries, 1, "Setup: pendingResourceDeliveries must contain 1 entry pre-fail")
+        XCTAssertEqual(beforeProp, 0, "Setup: pendingPropagationResources must be empty for DIRECT path")
+
+        await router.handleOutboundResourceFailed(
+            resourceHash: resourceHash, resourceState: .failed
+        )
+
+        let afterDeliveries = await router.pendingResourceDeliveries.count
+        let afterProp = await router.pendingPropagationResources.count
+        XCTAssertEqual(afterDeliveries, 0,
+            "DIRECT resource failure must clear pendingResourceDeliveries — " +
+            "leaving entries here was the bug greptile flagged on PR #7. " +
+            "Got \(afterDeliveries) entries.")
+        XCTAssertEqual(afterProp, 0,
+            "pendingPropagationResources must remain empty for DIRECT failure; got \(afterProp).")
+    }
+
+    func testOutboundResourceFailedReclaimsMapsForPropagationPath() async throws {
+        let router = try await makeRouter()
+        let resourceHash = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
+        let messageHash = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
+
+        // Seed BOTH maps — PROPAGATED resource path inserts into
+        // `pendingPropagationResources` AND `pendingResourceDeliveries`
+        // (LXMRouter+Propagation.swift:241-249).
+        await router.setPendingResourceDelivery(resourceHash: resourceHash, messageHash: messageHash)
+        await router.markPendingPropagationResource(resourceHash: resourceHash)
+
+        let beforeDeliveries = await router.pendingResourceDeliveries.count
+        let beforeProp = await router.pendingPropagationResources.count
+        XCTAssertEqual(beforeDeliveries, 1, "Setup: pendingResourceDeliveries seeded")
+        XCTAssertEqual(beforeProp, 1, "Setup: pendingPropagationResources seeded")
+
+        await router.handleOutboundResourceFailed(
+            resourceHash: resourceHash, resourceState: .failed
+        )
+
+        let afterDeliveries = await router.pendingResourceDeliveries.count
+        let afterProp = await router.pendingPropagationResources.count
+        XCTAssertEqual(afterDeliveries, 0,
+            "PROPAGATED resource failure must clear pendingResourceDeliveries; got \(afterDeliveries).")
+        XCTAssertEqual(afterProp, 0,
+            "PROPAGATED resource failure must clear pendingPropagationResources — " +
+            "this is the half greptile specifically called out as leaking. " +
+            "Got \(afterProp) entries.")
+    }
+
+    func testOutboundResourceFailedReclaimsMapsForRejectedState() async throws {
+        // Mirrors `LXMessage.__resource_concluded` (LXMF/LXMessage.py
+        // :596-601): on `RNS.Resource.REJECTED` python sets
+        // `state = REJECTED` rather than retrying. The map cleanup
+        // must still happen — this test pins that we don't regress
+        // by special-casing `.rejected` and accidentally skipping the
+        // reclaim.
+        let router = try await makeRouter()
+        let resourceHash = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
+        let messageHash = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
+
+        await router.setPendingResourceDelivery(resourceHash: resourceHash, messageHash: messageHash)
+        await router.markPendingPropagationResource(resourceHash: resourceHash)
+
+        await router.handleOutboundResourceFailed(
+            resourceHash: resourceHash, resourceState: .rejected
+        )
+
+        let afterDeliveries = await router.pendingResourceDeliveries.count
+        let afterProp = await router.pendingPropagationResources.count
+        XCTAssertEqual(afterDeliveries, 0,
+            ".rejected must still reclaim pendingResourceDeliveries; got \(afterDeliveries).")
+        XCTAssertEqual(afterProp, 0,
+            ".rejected must still reclaim pendingPropagationResources; got \(afterProp).")
+    }
+
+    func testOutboundResourceFailedNoOpOnUnknownResourceHash() async throws {
+        // Defensive: if `resourceConcluded` fires with a hash we
+        // don't have in either map (could happen on a doubly-fired
+        // callback or a hash collision with a legitimately-cancelled
+        // outbound), the failure path must not crash and must not
+        // mutate any other entries.
+        let router = try await makeRouter()
+        let stableHash = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
+        let stableMsgHash = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
+
+        // Seed an unrelated entry that must survive.
+        await router.setPendingResourceDelivery(resourceHash: stableHash, messageHash: stableMsgHash)
+
+        let unknownHash = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
+        await router.handleOutboundResourceFailed(
+            resourceHash: unknownHash, resourceState: .failed
+        )
+
+        let stillThere = await router.pendingResourceDeliveries[stableHash]
+        XCTAssertEqual(stillThere, stableMsgHash,
+            "Unknown-hash failure must not touch unrelated map entries; " +
+            "the unrelated stableHash entry was clobbered.")
+    }
+}
+
+// MARK: - Test-only LXMRouter helpers
+//
+// `pendingResourceDeliveries` / `pendingPropagationResources` are
+// `public var` fields on the LXMRouter actor, but actor-isolated state
+// can't be mutated directly from outside the actor — every write needs
+// to be funneled through an actor-isolated function. These helpers are
+// the minimal surface required to seed the maps for the failure-path
+// tests above; they're test-only so I'm not exposing
+// general-purpose mutators on the production API.
+
+extension LXMRouter {
+    fileprivate func setPendingResourceDelivery(resourceHash: Data, messageHash: Data) {
+        pendingResourceDeliveries[resourceHash] = messageHash
+    }
+
+    fileprivate func markPendingPropagationResource(resourceHash: Data) {
+        pendingPropagationResources.insert(resourceHash)
+    }
 }
 
 // MARK: - Mock interfaces

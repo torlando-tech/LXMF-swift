@@ -661,9 +661,28 @@ public actor LXMRouter {
                         pendingOutbound[i] = msg
                         indicesToRemove.insert(i)
 
+                        // Mirror python LXMRouter.py:2675-2728 +
+                        // LXMessage.send() (LXMessage.py:498-512):
+                        // PROPAGATED+RESOURCE leaves message.state =
+                        // .sending until the resource-completion
+                        // callback (handlePropagationAccepted) fires
+                        // when RESOURCE_PRF arrives. Persisting `.sent`
+                        // unconditionally here would lie to consumers
+                        // (background fetch, app re-launch) about a
+                        // message whose upload may still fail — they
+                        // would skip the retry and the message would
+                        // be silently stuck.
+                        //
+                        // The small-packet branch of sendPropagated
+                        // (LXMRouter+Propagation.swift:202-207) DOES
+                        // await proof inline before returning and
+                        // sets message.state = .sent there, so only
+                        // for the resource path is the in-memory
+                        // state still .sending at this point.
                         let sentMsg = pendingOutbound[i]
+                        let actualState = sentMsg.state
                         Task.detached { [database] in
-                            try? await database.updateMessageState(id: sentMsg.hash, state: .sent)
+                            try? await database.updateMessageState(id: sentMsg.hash, state: actualState)
                         }
                     } else {
                         requestPath(nodeHash)
@@ -813,6 +832,79 @@ public actor LXMRouter {
             // DIRECT resource transfer — python `__mark_delivered`.
             routerLogger.info("Resource \(resHex, privacy: .public) → message \(msgHex, privacy: .public), marking delivered (recipient ack)")
             handleDeliveryProofReceived(messageHash: messageHash)
+        }
+    }
+
+    /// Handle outbound resource transfer FAILURE (resource concluded
+    /// in any non-`.complete` state — `.failed`, `.rejected`,
+    /// `.cancelled`, etc.).
+    ///
+    /// Mirrors python `LXMessage.__resource_concluded`
+    /// (LXMF/LXMessage.py:592-601) for the DIRECT path and
+    /// `__propagation_resource_concluded` (LXMessage.py:603-609) for
+    /// the PROPAGATED path. Critical responsibilities:
+    ///
+    ///   1. Reclaim the swift-port-introduced map state
+    ///      (`pendingResourceDeliveries`, `pendingPropagationResources`).
+    ///      Python uses LXMessage object lifetime instead and has
+    ///      nothing to clean up; we externalized the tracking so we
+    ///      now have lifetime obligations python doesn't.
+    ///   2. Advance message state per python's per-method semantics:
+    ///      - DIRECT, resource state == .rejected → state = `.rejected`
+    ///        (python `LXMessage.py:597` sets `state = REJECTED`).
+    ///      - DIRECT, other non-complete (and not cancelled) →
+    ///        state = `.outbound` for retry (python
+    ///        `LXMessage.py:598-601` tears down the link + sets
+    ///        `state = OUTBOUND`). We skip the explicit teardown
+    ///        because reticulum-swift's link layer detects the
+    ///        failed transfer separately; if a follow-up bug shows
+    ///        the link sticks around in a bad state across retries,
+    ///        re-add `await resource.link?.close(reason: .timeout)`.
+    ///      - PROPAGATED, any non-complete (and not cancelled) →
+    ///        state = `.outbound` (python `LXMessage.py:607-609`
+    ///        does not distinguish REJECTED from other failures on
+    ///        the propagation path; everything retries via the
+    ///        outbound queue).
+    ///
+    /// Without this method, `resourceConcluded` returned early on
+    /// non-complete states and the maps grew without bound across the
+    /// router's lifetime; if the same resource hash were ever to
+    /// re-complete (highly unlikely but not impossible), the wrong
+    /// per-method state handler would fire.
+    ///
+    /// - Parameters:
+    ///   - resourceHash: 32-byte resource hash from the failed transfer.
+    ///   - resourceState: Terminal `ResourceState` reported by reticulum-swift.
+    public func handleOutboundResourceFailed(
+        resourceHash: Data, resourceState: ResourceState
+    ) {
+        let resHex = resourceHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+        let wasPropagation = pendingPropagationResources.remove(resourceHash) != nil
+        guard let messageHash = pendingResourceDeliveries.removeValue(forKey: resourceHash) else {
+            routerLogger.info("Outbound resource \(resHex, privacy: .public) failed (\(String(describing: resourceState))) but no pending message mapping; entries reclaimed (none found)")
+            return
+        }
+        let msgHex = messageHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+
+        let newState: LXMessageState
+        if wasPropagation {
+            // Python LXMessage.py:607-609: any non-complete →
+            // state=OUTBOUND for retry (no separate REJECTED branch).
+            newState = .outbound
+            routerLogger.info("Outbound PROPAGATED resource \(resHex, privacy: .public) → message \(msgHex, privacy: .public) failed (\(String(describing: resourceState))); marking outbound for retry")
+        } else {
+            // Python LXMessage.py:596-601: REJECTED is its own terminal
+            // state; everything else gets OUTBOUND for retry.
+            if resourceState == .rejected {
+                newState = .rejected
+            } else {
+                newState = .outbound
+            }
+            routerLogger.info("Outbound DIRECT resource \(resHex, privacy: .public) → message \(msgHex, privacy: .public) failed (\(String(describing: resourceState))); → \(String(describing: newState))")
+        }
+
+        Task.detached { [database] in
+            try? await database.updateMessageState(id: messageHash, state: newState)
         }
     }
 
