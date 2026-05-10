@@ -21,12 +21,12 @@ let package = Package(
         )
     ],
     dependencies: [
-        // Temporarily pinned to fix/link-data-no-header2-conversion while
-        // the upstream HEADER_2-conversion fix for link DATA packets is
-        // unreleased. Revert to `from: "0.2.x"` once a release tag exists.
-        // Tracking a branch makes resolution non-reproducible across
-        // checkouts; this pin must come off before merging back to main.
-        .package(url: "https://github.com/torlando-tech/reticulum-swift.git", branch: "fix/link-data-no-header2-conversion"),
+        // Pinned to reticulum-swift 0.3.0 — the release that drops
+        // `destinationHash` from `sendLinkData` (breaking) and aligns
+        // link DATA send with python parity. Floor must be ≥ 0.3.0
+        // because LXMF-swift now uses the new `sendLinkData(packet:)`
+        // signature; an older reticulum-swift would not compile.
+        .package(url: "https://github.com/torlando-tech/reticulum-swift.git", from: "0.3.0"),
         .package(url: "https://github.com/groue/GRDB.swift.git", from: "6.0.0"),
         .package(url: "https://github.com/tsolomko/SWCompression.git", from: "4.8.0"),
     ],
