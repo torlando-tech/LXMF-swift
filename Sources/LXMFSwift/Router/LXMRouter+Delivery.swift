@@ -264,13 +264,29 @@ extension LXMRouter {
             throw error
         }
 
-        // Identify ourselves to the remote peer so they can respond
-        do {
-            try await link.identify(identity: identity)
-            directSendLogger.info("identified to remote peer")
-        } catch {
-            directSendLogger.warning("identify failed (non-fatal): \(error)")
-        }
+        // DO NOT proactively identify on the DIRECT link.
+        //
+        // Python's LXMRouter does NOT identify-as-router on the
+        // outbound delivery link. The python identify call lives in
+        // `LXMRouter.py:2530-2540` ("backchannel identification") and
+        // happens *after* a message is delivered, using the SOURCE
+        // delivery destination's identity (not the router identity).
+        // The purpose: tell the recipient "you can reply to my
+        // delivery destination over this same link." Swift's
+        // `link.identify(identity: routerIdentity)` was identifying
+        // with the wrong identity AND at the wrong moment, which
+        // confused some receivers (echo bot in particular: smoke
+        // direct_echo failed with state=SENT but no echo back —
+        // tearing the link / mismatched identity context made the
+        // bot's `on_delivery` handler not fire).
+        //
+        // The PROPAGATED path made the same fix earlier (LXMRouter
+        // +Propagation.swift) referencing python LXMRouter.py:2682-2720.
+        //
+        // If a backchannel-identify becomes necessary for two-way
+        // direct chat (which the echo bot exercises), it should be
+        // a separate post-send step using the source delivery
+        // identity, mirroring python LXMRouter.py:2530-2540.
 
         // Update message state
         message.state = .sending
