@@ -369,10 +369,33 @@ public actor LXMRouter {
             let sourceHash = data.subdata(in: 16..<32)
             let srcHex = sourceHash.prefix(4).map { String(format: "%02x", $0) }.joined()
 
-            // Self-echo detection: relay broadcasts our own outbound messages back to us.
+            // Self-echo detection: a TCP relay broadcasts every packet
+            // to all connected clients including the original sender,
+            // so our own outbound LXMF messages echo back as inbound.
+            // The original fix (LXMF-swift commit 9992795 "fix(lxmf):
+            // prevent relay self-echo from overwriting outbound
+            // messages", 2026-02-05) silenced these to keep the DB
+            // record's `incoming` flag from being overwritten.
+            //
+            // BUT — that's only the right call for broadcast paths
+            // (.direct / .opportunistic). When the same message comes
+            // back via PROPAGATION sync (`method == .propagated`), it's
+            // because we explicitly retrieved it from the propagation
+            // node — a legitimate self-loop scenario for
+            // single-device round-trip testing AND for "send to
+            // myself" UX flows where a user wants their messages on
+            // multiple devices via the same identity. Mirrors the
+            // kotlin port (LXMF-kt LXMRouter.kt) which never installed
+            // a self-echo gate at all and routes both paths through
+            // the dedup-on-hash check below.
+            //
+            // python ref: LXMF/LXMRouter.py has no self-echo gate;
+            // duplicate-hash detection is the only mechanism. The
+            // swift gate was a port-time defensive add for the
+            // broadcast case only.
             let localDeliveryHash = Destination.hash(identity: identity, appName: "lxmf", aspects: ["delivery"])
-            if sourceHash == localDeliveryHash {
-                routerLogger.info("REJECTED: self-echo from \(srcHex)")
+            if sourceHash == localDeliveryHash && method != .propagated {
+                routerLogger.info("REJECTED: self-echo from \(srcHex) via \(String(describing: method))")
                 return false
             }
 

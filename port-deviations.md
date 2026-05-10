@@ -79,6 +79,49 @@ unchanged for callers that prefer single-threaded determinism (tests,
 bridges) — also mirrors python's fall-back behavior on platforms
 without multiprocessing.
 
+### `lxmfDelivery` — broadcast-only self-echo gate
+
+**Site:** `Sources/LXMFSwift/Router/LXMRouter.swift` — `lxmfDelivery(_:method:)`,
+the `if sourceHash == localDeliveryHash && method != .propagated` block.
+
+**Python reference:** `LXMF/LXMF/LXMRouter.py` — there is **no** equivalent
+self-echo gate anywhere in `lxmf_delivery`/`handle_outbound_completed`.
+Python relies on the duplicate-hash check (`message.hash` lookup against
+the local delivery store) to drop messages it has already seen, including
+self-echoed ones.
+
+**Swift change:** the swift port silently drops inbound messages whose
+`sourceHash` equals the local LXMF delivery hash *unless* they came in
+via `method == .propagated`. This is a narrowed form of the original
+2026-02-05 fix (commit `9992795` "fix(lxmf): prevent relay self-echo
+from overwriting outbound messages"). The original gate dropped self-
+echoes unconditionally; the narrowing was added 2026-05-10 once the iOS
+smoke pipeline started exercising the legitimate self-loop case
+(propagated_bidirectional sends from the device to itself, and the
+phone retrieves that same message back via sync).
+
+**Reason:** Category (a) — language/runtime accommodation. Specifically:
+swift's `Database` layer (`LXMFDatabase` SQLite store) treats hash as a
+PRIMARY KEY; an inbound write of an already-stored outbound message
+flips the row's `incoming` flag and overwrites `conversation_hash`,
+which python's database (filesystem-of-pickles in
+`storage_path/messagestore`) does not do because it doesn't have a
+"row" with mutable state — each message is its own file.
+
+The TCP-relay broadcast path (which pumps every outbound packet back
+to the sender on the same TCPInterface — see `RNS.TCPInterface`) is
+the failure mode that triggered the original gate. That path uses
+`.direct`/`.opportunistic`, never `.propagated` (propagation goes via
+the propagation-node link, not the broadcast bus). Excluding
+`.propagated` from the gate restores the python behavior for the
+sync-pull path while preserving the swift-DB-specific safety on the
+broadcast path.
+
+**Re-sync note:** if upstream python LXMF gains its own equivalent
+gate (or if swift's `LXMFDatabase` is reworked so that a duplicate
+hash insert is a true noop / error rather than an overwrite), this
+deviation should be revisited and possibly removed.
+
 ## Resolved deviations
 
 (none yet — this file was created during the iOS smoke-pipeline
