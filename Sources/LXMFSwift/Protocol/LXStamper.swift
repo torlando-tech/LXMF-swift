@@ -156,11 +156,13 @@ public enum LXStamper {
     ///   - expandRounds: Number of HKDF expansion rounds (default: 3000, PN: 1000)
     /// - Returns: Tuple of (stamp, rounds) where rounds is number of attempts
     public static func generateStamp(messageID: Data, cost: Int = DEFAULT_COST, expandRounds: Int = EXPAND_ROUNDS) async -> (stamp: Data, rounds: Int) {
-        // Use Task.detached to run on background thread and avoid blocking
-        return await Task.detached(priority: .userInitiated) {
-            let workblock = stampWorkblock(material: messageID, expandRounds: expandRounds)
-            return generateStampSync(workblock: workblock, cost: cost)
-        }.value
+        // Mirror python `job_linux`'s parallel design — race N workers,
+        // first to find a valid stamp wins. See port-deviations.md for the
+        // full justification + python ref site. Existing single-threaded
+        // callers (tests, conformance bridge) can still call
+        // `generateStampSync` directly for deterministic single-CPU runs.
+        let workblock = stampWorkblock(material: messageID, expandRounds: expandRounds)
+        return await generateStampParallel(workblock: workblock, cost: cost)
     }
 
     /// Synchronous stamp generation (for internal use and testing).
@@ -171,21 +173,86 @@ public enum LXStamper {
     ///     pstamp = os.urandom(256//8); rounds += 1
     /// ```
     ///
+    /// Performance: pre-feeds the (large) workblock into a SHA256 context
+    /// once, then per attempt only digests the 32-byte stamp on a copy.
+    /// Avoids the per-attempt 256KB allocation + redundant SHA over the
+    /// workblock that a naive `SHA256.hash(workblock + stamp)` loop does.
+    /// Mirrors the kotlin port's reticulum-kt#66 fix (which dropped cost=16
+    /// stamp gen from ~21s to ~400ms on phones); identical hash output.
+    ///
     /// - Parameters:
     ///   - workblock: Pre-computed workblock
     ///   - cost: Required number of leading zero bits
     /// - Returns: Tuple of (stamp, rounds)
     public static func generateStampSync(workblock: Data, cost: Int) -> (stamp: Data, rounds: Int) {
         var rounds = 0
-        var stamp: Data
+        var stamp = Data(count: STAMP_SIZE)
+
+        // Pre-fed digest: workblock is hashed exactly once. Each attempt
+        // copies the in-progress digest state, finalises with the stamp,
+        // and reads the 32-byte hash. This is byte-for-byte identical to
+        // SHA256.hash(workblock + stamp) but ~Nx faster (N = workblock
+        // size in bytes / stamp size, ~8000x at cost=16 PN workblock).
+        let primed = SHA256_PrimedDigest(prefix: workblock)
 
         repeat {
             // Generate random 32-byte stamp candidate
-            stamp = Data((0..<STAMP_SIZE).map { _ in UInt8.random(in: 0...255) })
+            stamp.withUnsafeMutableBytes { buf in
+                _ = SecRandomCopyBytes(kSecRandomDefault, STAMP_SIZE, buf.baseAddress!)
+            }
             rounds += 1
-        } while !stampValid(stamp: stamp, cost: cost, workblock: workblock)
 
-        return (stamp, rounds)
+            // Finalize a copy of the primed digest with the stamp suffix.
+            let hash = primed.finalize(suffix: stamp)
+            if countLeadingZeroBits(hash) >= cost {
+                return (stamp, rounds)
+            }
+        } while true
+    }
+
+    /// Concurrent stamp generation: spawns N CPU workers that each run the
+    /// inner loop on its own SecureRandom + primed digest, racing to find
+    /// a valid stamp. First worker to find one wins; others see the result
+    /// pointer flip and exit. Mirrors the kotlin port's parallel job design.
+    ///
+    /// Use this from `generateStamp(messageID:cost:expandRounds:)` instead
+    /// of the single-threaded `generateStampSync`. Provided as a separate
+    /// helper so existing callers (tests + bridges) that prefer the
+    /// deterministic single-threaded path keep working.
+    public static func generateStampParallel(workblock: Data, cost: Int) async -> (stamp: Data, rounds: Int) {
+        let workerCount = max(1, min(8, ProcessInfo.processInfo.activeProcessorCount))
+        // Shared "found" container — first worker to win sets it.
+        let found = StampResultBox()
+
+        return await withTaskGroup(of: Int.self) { group in
+            for _ in 0..<workerCount {
+                group.addTask(priority: .userInitiated) {
+                    var localRounds = 0
+                    var stamp = Data(count: STAMP_SIZE)
+                    let primed = SHA256_PrimedDigest(prefix: workblock)
+
+                    while !found.isSet() {
+                        stamp.withUnsafeMutableBytes { buf in
+                            _ = SecRandomCopyBytes(kSecRandomDefault, STAMP_SIZE, buf.baseAddress!)
+                        }
+                        localRounds += 1
+                        let hash = primed.finalize(suffix: stamp)
+                        if countLeadingZeroBits(hash) >= cost {
+                            found.set(stamp: stamp)
+                            return localRounds
+                        }
+                    }
+                    return localRounds
+                }
+            }
+            var totalRounds = 0
+            for await r in group { totalRounds += r }
+            // `found` is guaranteed non-nil here: the first winner triggers
+            // every other worker's `found.isSet()` check and they exit, but
+            // none of them complete before the group has at least one
+            // value. If this ever returns nil, that's a logic bug.
+            return (found.stamp ?? Data(count: STAMP_SIZE), totalRounds)
+        }
     }
 
     // MARK: - Stamp Value
@@ -245,6 +312,55 @@ public enum LXStamper {
         }
 
         return count
+    }
+
+    /// Pre-fed SHA256 digest helper. Wraps CryptoKit's `SHA256` so the
+    /// inner stamp loop can hash `workblock + stamp` without re-allocating
+    /// the (large) workblock prefix on every attempt. See
+    /// `port-deviations.md` for the python-ref justification.
+    ///
+    /// CryptoKit's `Hasher` value type COWs internally on `update()`; we
+    /// rely on that — `finalize(suffix:)` makes a fresh local copy of the
+    /// primed hasher, calls `update()` with the 32-byte stamp, finalizes,
+    /// and returns the digest. The original `primed` is unchanged so the
+    /// next call starts from the same workblock-prefilled state.
+    private struct SHA256_PrimedDigest {
+        private let primed: SHA256
+
+        init(prefix: Data) {
+            var h = SHA256()
+            h.update(data: prefix)
+            self.primed = h
+        }
+
+        func finalize(suffix: Data) -> Data {
+            var h = primed
+            h.update(data: suffix)
+            return Data(h.finalize())
+        }
+    }
+
+    /// Worker-shared "first valid stamp wins" container for
+    /// `generateStampParallel`. Mirrors python `job_linux`'s
+    /// `stop_event + result_queue` pair. See `port-deviations.md`.
+    private final class StampResultBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _stamp: Data?
+
+        var stamp: Data? {
+            lock.lock(); defer { lock.unlock() }
+            return _stamp
+        }
+
+        func isSet() -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            return _stamp != nil
+        }
+
+        func set(stamp: Data) {
+            lock.lock(); defer { lock.unlock() }
+            if _stamp == nil { _stamp = stamp }
+        }
     }
 
     /// Pack integer as MessagePack format.
