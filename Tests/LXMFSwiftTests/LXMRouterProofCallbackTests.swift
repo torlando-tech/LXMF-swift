@@ -655,6 +655,138 @@ final class LXMRouterProofCallbackTests: XCTestCase {
             "Got \(String(describing: finalState)).")
     }
 
+    // MARK: - send* guard-clause coverage
+    //
+    // The send paths (sendPropagated / sendDirect / sendOpportunistic)
+    // each have a stack of early-return guard clauses before any real
+    // network work begins. These are trivial to test (no transport
+    // setup needed) and they cover the bulk of the "first few lines"
+    // of each function — which means a non-trivial chunk of coverage
+    // for very little test surface.
+
+    func testSendPropagatedThrowsWhenPropagationNodeNotSet() async throws {
+        let router = try await makeRouter()
+        // Deliberately don't call setOutboundPropagationNode — that's
+        // the guard under test.
+        var msg = LXMessage(
+            destinationHash: Data((0..<16).map { _ in 0xAB }),
+            sourceIdentity: Identity(),
+            content: Data("test".utf8),
+            title: Data(), fields: nil, desiredMethod: .propagated
+        )
+        _ = try msg.pack()
+
+        do {
+            try await router.sendPropagated(&msg)
+            XCTFail("sendPropagated must throw when outboundPropagationNode is nil")
+        } catch LXMFError.propagationNodeNotSet {
+            // expected
+        } catch {
+            XCTFail("expected propagationNodeNotSet, got \(error)")
+        }
+    }
+
+    func testSendPropagatedThrowsWhenMessageNotPacked() async throws {
+        let router = try await makeRouter()
+        // Set a prop node so we get past the first guard.
+        await router.setOutboundPropagationNode(Data((0..<16).map { _ in 0xCD }))
+        // setTransport - but transport not strictly needed since
+        // we'll fail on the .notPacked guard first. Actually the
+        // guard order is: propNode → transport → packed. Without
+        // a transport, we hit transportNotAvailable instead. To
+        // isolate the .notPacked guard we need a transport stub.
+        let transport = ReticulumTransport()
+        await router.setTransport(transport)
+
+        var msg = LXMessage(
+            destinationHash: Data((0..<16).map { _ in 0xAB }),
+            sourceIdentity: Identity(),
+            content: Data("test".utf8),
+            title: Data(), fields: nil, desiredMethod: .propagated
+        )
+        // Skip the .pack() call — that's the bug under test (caller
+        // forgot to pack before sending).
+
+        do {
+            try await router.sendPropagated(&msg)
+            XCTFail("sendPropagated must throw when message is not packed")
+        } catch LXMFError.notPacked {
+            // expected
+        } catch {
+            XCTFail("expected notPacked, got \(error)")
+        }
+    }
+
+    func testSendDirectThrowsWhenTransportNotAvailable() async throws {
+        let router = try await makeRouter()
+        // Don't setTransport — that's the guard under test.
+
+        var msg = LXMessage(
+            destinationHash: Data((0..<16).map { _ in 0xAB }),
+            sourceIdentity: Identity(),
+            content: Data("test".utf8),
+            title: Data(), fields: nil, desiredMethod: .direct
+        )
+        _ = try msg.pack()
+
+        do {
+            try await router.sendDirect(&msg)
+            XCTFail("sendDirect must throw when transport not set")
+        } catch LXMFError.linkFailed {
+            // expected — sendDirect wraps `transportNotAvailable` via
+            // the static `LXMFError.transportNotAvailable` which is
+            // itself a `.linkFailed("Transport not available")`.
+        } catch {
+            XCTFail("expected linkFailed/transportNotAvailable, got \(error)")
+        }
+    }
+
+    func testSendDirectThrowsWhenMessageNotPacked() async throws {
+        let router = try await makeRouter()
+        let transport = ReticulumTransport()
+        await router.setTransport(transport)
+
+        var msg = LXMessage(
+            destinationHash: Data((0..<16).map { _ in 0xAB }),
+            sourceIdentity: Identity(),
+            content: Data("test".utf8),
+            title: Data(), fields: nil, desiredMethod: .direct
+        )
+        // Don't pack.
+
+        do {
+            try await router.sendDirect(&msg)
+            XCTFail("sendDirect must throw when message not packed")
+        } catch LXMFError.notPacked {
+            // expected
+        } catch {
+            XCTFail("expected notPacked, got \(error)")
+        }
+    }
+
+    func testSendOpportunisticThrowsWhenTransportNotAvailable() async throws {
+        let router = try await makeRouter()
+
+        var msg = LXMessage(
+            destinationHash: Data((0..<16).map { _ in 0xAB }),
+            sourceIdentity: Identity(),
+            content: Data("test".utf8),
+            title: Data(), fields: nil, desiredMethod: .opportunistic
+        )
+        _ = try msg.pack()
+
+        do {
+            try await router.sendOpportunistic(&msg)
+            XCTFail("sendOpportunistic must throw when transport not set")
+        } catch LXMFError.linkFailed {
+            // expected. `LXMFError.transportNotAvailable` is a static
+            // let aliasing `.linkFailed("Transport not available")`,
+            // so the runtime case is `.linkFailed`.
+        } catch {
+            XCTFail("expected linkFailed/transportNotAvailable, got \(error)")
+        }
+    }
+
     func testHandleResourceTransferCompleteNoOpOnUnknownHash() async throws {
         // Defensive: if RESOURCE_PRF fires twice (re-delivery) or for a
         // hash that's already been cleared, the early-return must not
