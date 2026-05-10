@@ -196,8 +196,7 @@ extension LXMRouter {
             // Compute packet hash BEFORE sending (for proof matching)
             let packetHash = packet.getFullHash()
 
-            let propDestHash = await link.destinationHash
-            try await transport.sendLinkData(packet: packet, destinationHash: propDestHash)
+            try await transport.sendLinkData(packet: packet)
 
             // Wait for proof from propagation node (confirms message accepted)
             let proved = await transport.waitForPacketProof(packetHash: packetHash, timeout: 15)

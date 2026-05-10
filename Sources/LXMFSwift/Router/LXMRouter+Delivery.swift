@@ -338,7 +338,6 @@ extension LXMRouter {
 
             try await sendLinkDataWithProofCallback(
                 packet: packet,
-                destinationHash: destHash,
                 messageHash: message.hash,
                 transport: transport
             )
@@ -580,10 +579,10 @@ extension LXMRouter {
     /// this block, but the logic itself is independent of link state.
     ///
     /// - Parameters:
-    ///   - packet: encrypted link DATA packet to send.
-    ///   - destinationHash: the recipient's destination hash (used by
-    ///     `transport.sendLinkData` for path-table HEADER_2 routing
-    ///     decisions; the packet itself is addressed to the linkId).
+    ///   - packet: encrypted link DATA packet to send. The packet is
+    ///     addressed to the linkId; `transport.sendLinkData` routes
+    ///     it to the link's pinned `attached_interface` per python
+    ///     `Transport.outbound` (RNS/Transport.py:1122-1130).
     ///   - messageHash: hash of the LXMessage; the proof callback
     ///     calls `handleDeliveryProofReceived(messageHash:)` with
     ///     this so the right outbound message advances to `.delivered`.
@@ -591,7 +590,6 @@ extension LXMRouter {
     ///     and send through.
     internal func sendLinkDataWithProofCallback(
         packet: Packet,
-        destinationHash: Data,
         messageHash: Data,
         transport: ReticulumTransport
     ) async throws {
@@ -600,7 +598,7 @@ extension LXMRouter {
             await self?.handleDeliveryProofReceived(messageHash: messageHash)
         }
         do {
-            try await transport.sendLinkData(packet: packet, destinationHash: destinationHash)
+            try await transport.sendLinkData(packet: packet)
         } catch {
             await transport.removeProofCallback(truncatedHash: packetTruncatedHash)
             throw error

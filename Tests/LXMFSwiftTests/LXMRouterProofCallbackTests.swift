@@ -74,7 +74,6 @@ final class LXMRouterProofCallbackTests: XCTestCase {
 
         try await router.sendLinkDataWithProofCallback(
             packet: packet,
-            destinationHash: packet.destination,
             messageHash: messageHash,
             transport: transport
         )
@@ -109,7 +108,6 @@ final class LXMRouterProofCallbackTests: XCTestCase {
         do {
             try await router.sendLinkDataWithProofCallback(
                 packet: packet,
-                destinationHash: packet.destination,
                 messageHash: messageHash,
                 transport: transport
             )
