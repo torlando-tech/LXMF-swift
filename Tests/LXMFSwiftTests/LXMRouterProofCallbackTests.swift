@@ -317,6 +317,127 @@ final class LXMRouterProofCallbackTests: XCTestCase {
             "Unknown-hash failure must not touch unrelated map entries; " +
             "the unrelated stableHash entry was clobbered.")
     }
+
+    // MARK: - handleOutboundResourceFailed — re-enqueue into pendingOutbound
+
+    /// Greptile review (3/5 confidence) on PR #7: when a resource
+    /// transfer fails mid-session, `processOutbound` has already
+    /// removed the message from `pendingOutbound` (via
+    /// `indicesToRemove` immediately after `sendPropagated` /
+    /// `sendDirect` returns). Without a periodic DB → queue reload,
+    /// the failed message disappears from in-memory retry until app
+    /// restart.
+    ///
+    /// `handleOutboundResourceFailed` now re-loads the LXMessage
+    /// from the DB after writing state=.outbound, then appends to
+    /// `pendingOutbound` so the next `processOutbound` tick picks it
+    /// up. Documented in port-deviations.md as a swift-port band-aid
+    /// for the broader optimistic-remove divergence from python.
+
+    func testOutboundResourceFailedReenqueuesMessageForRetryablePropagationFailure() async throws {
+        let router = try await makeRouter()
+
+        // Seed a real LXMessage in the DB so the re-enqueue path can
+        // load it back. The minimal valid shape is a packed
+        // PROPAGATED message — sourceIdentity / destinationHash /
+        // content are enough; the message just needs to round-trip
+        // through `database.saveMessage` and back via `getMessage`.
+        let srcIdentity = Identity()
+        let destHash = Data((0..<16).map { _ in UInt8.random(in: 0...255) })
+        var msg = LXMessage(
+            destinationHash: destHash,
+            sourceIdentity: srcIdentity,
+            content: Data("retry-me".utf8),
+            title: Data(),
+            fields: nil,
+            desiredMethod: .propagated
+        )
+        _ = try msg.pack()  // populates msg.hash + msg.packed
+        try await router.testSaveMessage(msg)
+
+        // Simulate the state at the moment a resource failure fires:
+        // processOutbound has already inserted into the maps + removed
+        // from pendingOutbound. We seed the maps directly.
+        let resourceHash = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
+        await router.setPendingResourceDelivery(resourceHash: resourceHash, messageHash: msg.hash)
+        await router.markPendingPropagationResource(resourceHash: resourceHash)
+        let setupPending = await router.pendingOutbound.count
+        XCTAssertEqual(setupPending, 0,
+            "Setup: pendingOutbound should be empty (mirrors post-`indicesToRemove` state).")
+
+        // Trigger the failure path.
+        await router.handleOutboundResourceFailed(
+            resourceHash: resourceHash, resourceState: .failed
+        )
+
+        // The maps must be cleared (existing invariant) AND the
+        // message must be back in pendingOutbound — this is the
+        // greptile-3/5 bug fix.
+        let afterProp = await router.pendingPropagationResources.count
+        let afterDeliveries = await router.pendingResourceDeliveries.count
+        XCTAssertEqual(afterProp, 0, "pendingPropagationResources should be reclaimed.")
+        XCTAssertEqual(afterDeliveries, 0, "pendingResourceDeliveries should be reclaimed.")
+
+        let pendingHashes = await router.pendingOutbound.map { $0.hash }
+        XCTAssertTrue(pendingHashes.contains(msg.hash),
+            "Failed PROPAGATED resource transfer MUST be re-enqueued for " +
+            "retry on the next processOutbound tick. Without this, the " +
+            "message disappears from in-memory state and is only retried " +
+            "on app re-launch (greptile PR #7, 3/5 confidence). " +
+            "pendingOutbound count=\(pendingHashes.count)")
+
+        // The re-enqueued message must reflect the failure semantics:
+        // state=.outbound (retryable), nextDeliveryAttempt set in the
+        // future so processOutbound doesn't immediately re-fire.
+        let reenqueued = await router.pendingOutbound.first { $0.hash == msg.hash }!
+        XCTAssertEqual(reenqueued.state, .outbound,
+            "Re-enqueued message must have state=.outbound for retry " +
+            "(python LXMessage.py:608). Got \(reenqueued.state).")
+        if let nextAttempt = reenqueued.nextDeliveryAttempt {
+            XCTAssertGreaterThan(nextAttempt, Date(),
+                "Re-enqueued message must have a future nextDeliveryAttempt " +
+                "so processOutbound's next tick doesn't immediately re-fire " +
+                "without backoff. Got \(nextAttempt).")
+        } else {
+            XCTFail("Re-enqueued message must have nextDeliveryAttempt set " +
+                    "to enforce backoff; was nil.")
+        }
+    }
+
+    func testOutboundResourceFailedSkipsReenqueueForTerminalRejectedDirect() async throws {
+        // DIRECT path with resourceState=.rejected → state=.rejected
+        // (python LXMessage.py:597). Rejected is terminal; the message
+        // is NOT re-enqueued for retry. The DB row stays with the
+        // rejected state for the UI to render.
+        let router = try await makeRouter()
+
+        let srcIdentity = Identity()
+        let destHash = Data((0..<16).map { _ in UInt8.random(in: 0...255) })
+        var msg = LXMessage(
+            destinationHash: destHash,
+            sourceIdentity: srcIdentity,
+            content: Data("rejected-msg".utf8),
+            title: Data(),
+            fields: nil,
+            desiredMethod: .direct
+        )
+        _ = try msg.pack()
+        try await router.testSaveMessage(msg)
+
+        let resourceHash = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
+        await router.setPendingResourceDelivery(resourceHash: resourceHash, messageHash: msg.hash)
+        // No markPendingPropagationResource — this is the DIRECT path.
+
+        await router.handleOutboundResourceFailed(
+            resourceHash: resourceHash, resourceState: .rejected
+        )
+
+        let pendingHashes = await router.pendingOutbound.map { $0.hash }
+        XCTAssertFalse(pendingHashes.contains(msg.hash),
+            "Rejected DIRECT resource MUST NOT be re-enqueued — python " +
+            "LXMessage.py:597 treats REJECTED as terminal. " +
+            "pendingOutbound count=\(pendingHashes.count)")
+    }
 }
 
 // MARK: - Test-only LXMRouter helpers
@@ -336,6 +457,17 @@ extension LXMRouter {
 
     fileprivate func markPendingPropagationResource(resourceHash: Data) {
         pendingPropagationResources.insert(resourceHash)
+    }
+
+    /// Persist a packed LXMessage via the router's internal `database`
+    /// so subsequent `handleOutboundResourceFailed` can load it back
+    /// during re-enqueue. `database` was bumped from `private` to
+    /// `internal` (LXMRouter.swift:67) specifically to enable
+    /// `@testable`-scoped access here — production callers continue
+    /// to go through the public `handleOutbound` / `lxmfDelivery`
+    /// surface that already routes saves through `database` itself.
+    fileprivate func testSaveMessage(_ message: LXMessage) async throws {
+        try await database.saveMessage(message)
     }
 }
 

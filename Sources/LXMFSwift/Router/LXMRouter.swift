@@ -64,7 +64,7 @@ public actor LXMRouter {
     public let identity: Identity
 
     /// Database for message persistence
-    private let database: LXMFDatabase
+    internal let database: LXMFDatabase
 
     /// In-memory pending outbound queue (PRIMARY).
     /// `internal` (not `private`) so cross-file extensions in this module
@@ -877,7 +877,7 @@ public actor LXMRouter {
     ///   - resourceState: Terminal `ResourceState` reported by reticulum-swift.
     public func handleOutboundResourceFailed(
         resourceHash: Data, resourceState: ResourceState
-    ) {
+    ) async {
         let resHex = resourceHash.prefix(8).map { String(format: "%02x", $0) }.joined()
         let wasPropagation = pendingPropagationResources.remove(resourceHash) != nil
         guard let messageHash = pendingResourceDeliveries.removeValue(forKey: resourceHash) else {
@@ -903,8 +903,72 @@ public actor LXMRouter {
             routerLogger.info("Outbound DIRECT resource \(resHex, privacy: .public) → message \(msgHex, privacy: .public) failed (\(String(describing: resourceState))); → \(String(describing: newState))")
         }
 
-        Task.detached { [database] in
-            try? await database.updateMessageState(id: messageHash, state: newState)
+        // Persist the new state synchronously here so the in-memory
+        // re-enqueue below (if applicable) can read back a consistent
+        // record. Errors are non-fatal — the in-memory state on the
+        // re-enqueued LXMessage is the authoritative driver for the
+        // next `processOutbound` tick; DB persistence is for
+        // cross-launch durability and any retry on app re-launch.
+        do {
+            try await database.updateMessageState(id: messageHash, state: newState)
+        } catch {
+            routerLogger.error("Failed to persist failed-resource state for \(msgHex, privacy: .public): \(error)")
+        }
+
+        // Re-enqueue retryable failures into `pendingOutbound`.
+        //
+        // Without this step, `processOutbound` had already removed the
+        // message from the in-memory queue via `indicesToRemove`
+        // (LXMRouter.swift:~660) BEFORE the resource conclusion
+        // callback fires — there's no periodic DB→queue reload, so a
+        // failed resource transfer would silently disappear from the
+        // retry queue until the next app launch.
+        //
+        // For `.outbound`-bound retries we reload the LXMessage from
+        // the DB (it has the freshly-written `.outbound` state and
+        // the original packed payload), bump `deliveryAttempts` +
+        // `nextDeliveryAttempt` so the next `processOutbound` tick
+        // doesn't immediately re-fire and burn the retry budget, then
+        // append + kick processing.
+        //
+        // For `.rejected` (DIRECT terminal), we skip the re-enqueue —
+        // python's REJECTED state is terminal. The DB row stays with
+        // state=.rejected for the UI to render.
+        guard newState == .outbound else {
+            routerLogger.debug("\(msgHex, privacy: .public) is terminal (\(String(describing: newState))); skipping re-enqueue")
+            return
+        }
+
+        do {
+            guard var msg = try await database.getMessage(id: messageHash) else {
+                routerLogger.warning("Cannot re-enqueue \(msgHex, privacy: .public): DB lookup returned nil")
+                return
+            }
+            // State is .outbound (already persisted above). Don't bump
+            // `deliveryAttempts` here — `processOutbound` increments it
+            // at line ~584 when it actually attempts delivery. Bumping
+            // here too would double-count and hit MAX_DELIVERY_ATTEMPTS
+            // (=8) in half the expected cycles.
+            //
+            // Backoff via `nextDeliveryAttempt` ensures the re-enqueued
+            // message doesn't immediately retry. processOutbound's
+            // existing exponential-ish backoff (line ~699) will widen
+            // this on each subsequent failure.
+            msg.state = .outbound
+            msg.nextDeliveryAttempt = Date().addingTimeInterval(Self.PATH_REQUEST_WAIT)
+            pendingOutbound.append(msg)
+            routerLogger.info("\(msgHex, privacy: .public) re-enqueued for retry (attempts so far: \(msg.deliveryAttempts), next attempt in \(Int(Self.PATH_REQUEST_WAIT))s)")
+        } catch {
+            routerLogger.error("Failed to re-enqueue \(msgHex, privacy: .public): \(error)")
+            return
+        }
+
+        // Kick the processing loop so the re-enqueued message is
+        // considered on the next iteration without waiting for a
+        // periodic tick. Detached so we don't extend this
+        // delegate-callback path's lifetime.
+        Task.detached { [weak self] in
+            await self?.processOutbound()
         }
     }
 

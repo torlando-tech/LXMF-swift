@@ -79,6 +79,60 @@ unchanged for callers that prefer single-threaded determinism (tests,
 bridges) — also mirrors python's fall-back behavior on platforms
 without multiprocessing.
 
+### `processOutbound` optimistic queue removal + `handleOutboundResourceFailed` re-enqueue
+
+**Site:** `Sources/LXMFSwift/Router/LXMRouter.swift` — `processOutbound`
+(the `indicesToRemove.insert(i)` immediately after `sendOpportunistic`
+/ `sendDirect` / `sendPropagated` returns) and
+`handleOutboundResourceFailed` (the `pendingOutbound.append(msg)`
+re-enqueue at the bottom).
+
+**Python reference:** `LXMF/LXMF/LXMRouter.py:2513-2562` —
+`process_outbound` is a STATE-DRIVEN loop. It iterates
+`self.pending_outbound` on every tick and only `pending_outbound.remove(...)`s
+when `lxmessage.state` is truly terminal: `DELIVERED` (line 2519),
+`SENT` for PROPAGATED (line 2544), `CANCELLED` (line 2548), or
+`REJECTED` (line 2554). For any other state — including the
+intermediate `OUTBOUND` that `__resource_concluded` sets after a
+failed resource transfer (LXMessage.py:600) — the message stays in
+`pending_outbound` and the next `process_outbound` tick re-attempts.
+The retry path naturally re-uses the same LXMessage object.
+
+**Swift change:** the swift port removes from `pendingOutbound` via
+`indicesToRemove` immediately after the per-method send function
+returns successfully, regardless of whether the resulting state is
+truly terminal or merely in-flight (e.g. `.sending` for a
+resource-path PROPAGATED whose RESOURCE_PRF hasn't arrived). For
+async failures discovered after this optimistic removal — most
+prominently a resource transfer concluding in a non-`.complete`
+state — `handleOutboundResourceFailed` now re-appends the message
+to `pendingOutbound` and kicks `processOutbound` so the retry path
+fires. The DB row's state is updated first so the re-loaded
+LXMessage reflects `.outbound` (mirroring python's in-place state
+transition on a still-queued message).
+
+**Reason:** Category (a) — the broader optimistic-remove design
+predates this PR (`indicesToRemove` is used to batch removals at the
+end of each `processOutbound` iteration so we don't mutate the array
+while iterating, which is harder in swift than python). Aligning
+fully with python's state-driven keep-in-queue model would require
+restructuring `processOutbound` to never call `indicesToRemove.insert`
+unless the message hit a terminal state. That's a bigger refactor.
+The `handleOutboundResourceFailed` re-enqueue is the targeted patch
+that restores python's observable retry behavior for failed resource
+transfers — the specific case greptile review flagged as silently
+dropping messages on PR #7. Other in-flight async failures (link
+timeout before any callback fires, send throws inside the per-method
+function) are already handled by the existing throw/catch path in
+`processOutbound` that schedules a `nextDeliveryAttempt` retry.
+
+**Re-sync note:** the right long-term fix is restructuring
+`processOutbound` to mirror python's lifecycle — only remove from
+`pendingOutbound` on DELIVERED / SENT(PROPAGATED) / REJECTED /
+CANCELLED. When that lands, both the `indicesToRemove` machinery and
+the `handleOutboundResourceFailed` re-enqueue can be deleted; the
+state-driven loop will handle resource-failure retries naturally.
+
 ### `lxmfDelivery` — broadcast-echo-only self-echo gate
 
 **Site:** `Sources/LXMFSwift/Router/LXMRouter.swift` — `lxmfDelivery(_:method:)`,
