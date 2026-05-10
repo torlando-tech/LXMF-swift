@@ -134,9 +134,11 @@ extension LXMRouter {
                 expandRounds: LXStamper.EXPAND_ROUNDS_PN
             )
             stampBytes = stamp
+            propLogger.info("[PROP_SEND_STAMP] cost=\(stampCost) rounds=\(rounds) lxmData_len=\(lxmData.count) tid=\(transientId.prefix(8).map { String(format: "%02x", $0) }.joined()) stamp=\(stampBytes.prefix(8).map { String(format: "%02x", $0) }.joined())")
         } else {
             // Cost 0: any stamp passes, but still needs proper format (32 bytes)
             stampBytes = Data((0..<LXStamper.STAMP_SIZE).map { _ in UInt8.random(in: 0...255) })
+            propLogger.warning("[PROP_SEND_STAMP] cost=0 — sending RANDOM stamp; lxmd will likely reject if it requires non-zero cost")
         }
 
         var lxmfData = lxmData
