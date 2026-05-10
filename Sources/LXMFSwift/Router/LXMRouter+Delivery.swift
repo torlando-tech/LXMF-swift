@@ -97,17 +97,42 @@ extension LXMRouter {
             throw LXMFError.notPacked
         }
 
-        // Look up path entry for destination to get their public key
+        // Resolve recipient encryption material. For self-send (own
+        // delivery destinations), the path table has no entry — announces
+        // leave the device, they don't loop back into the local table —
+        // so we must check `deliveryDestinations` first. Mirrors python
+        // `RNS.Identity.recall(hash)`'s "is this hash local?" branch.
+        // Same pattern as `sendPropagated` — see LXMRouter+Propagation
+        // for the full python ref discussion.
         let destHex = message.destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-        guard let pathEntry = await pathTable.lookup(destinationHash: message.destinationHash) else {
-            throw LXMFError.destinationNotFound
+        let effectiveKey: Data
+        let pathRatchet: Data?
+        let publicKeysForHash: Data
+        if let localDest = deliveryDestinations[message.destinationHash]?.0,
+           let localIdentity = localDest.identity {
+            // Local destination: use its base key (no ratchet — that's
+            // a per-recipient announce concept and we are the recipient).
+            // `encryptionPublicKey` is a Curve25519 PublicKey type;
+            // `publicKeys` is the wire-format Data (concat of enc + sign
+            // public keys). For the HKDF salt and the SINGLE-destination
+            // encrypt below, we want the raw Data form.
+            effectiveKey = localIdentity.encryptionPublicKey.rawRepresentation
+            pathRatchet = nil
+            publicKeysForHash = localIdentity.publicKeys
+            routerLogger.debug("OPP self-send: resolving \(destHex) via local delivery destination")
+        } else {
+            guard let pathEntry = await pathTable.lookup(destinationHash: message.destinationHash) else {
+                throw LXMFError.destinationNotFound
+            }
+            // Get recipient's encryption public key (use ratchet if
+            // available, otherwise base key). When a destination announces
+            // with a ratchet, we MUST use the ratchet key for forward
+            // secrecy.
+            effectiveKey = pathEntry.effectiveEncryptionKey
+            pathRatchet = pathEntry.ratchet
+            publicKeysForHash = pathEntry.publicKeys
         }
-
-        // Get recipient's encryption public key (use ratchet if available, otherwise base key)
-        // When a destination announces with a ratchet, we MUST use the ratchet key for
-        // forward secrecy - the recipient will decrypt using their current ratchet private key.
-        let effectiveKey = pathEntry.effectiveEncryptionKey
-        let hasRatchet = pathEntry.ratchet != nil && pathEntry.ratchet!.count == 32
+        let hasRatchet = pathRatchet != nil && pathRatchet!.count == 32
         let keyHex = effectiveKey.prefix(8).map { String(format: "%02x", $0) }.joined()
         routerLogger.debug("Using encryption key[0:8]=\(keyHex), hasRatchet=\(hasRatchet)")
 
@@ -123,7 +148,7 @@ extension LXMRouter {
         // CRITICAL: Python RNS uses identity hash as HKDF salt, NOT destination hash!
         // Identity hash = SHA256(publicKeys)[:16]
         // This must match Python RNS Identity.get_salt() which returns self.hash
-        let identityHash = Hashing.truncatedHash(pathEntry.publicKeys)
+        let identityHash = Hashing.truncatedHash(publicKeysForHash)
         let identityHashHex = identityHash.prefix(8).map { String(format: "%02x", $0) }.joined()
         routerLogger.debug("Using identityHash[0:8]=\(identityHashHex) as HKDF salt")
 
@@ -367,21 +392,29 @@ extension LXMRouter {
             deliveryLinks.removeValue(forKey: destinationHash)
         }
 
-        // Look up path entry to get recipient's public keys
-        guard let pathTable = self.pathTable else {
-            throw LXMFError.transportNotAvailable
-        }
-
-        guard let pathEntry = await pathTable.lookup(destinationHash: destinationHash) else {
-            throw LXMFError.destinationNotFound
-        }
-
-        // Create public-key-only Identity from path entry's public keys
+        // Resolve recipient identity. For self-send (own delivery
+        // destinations), the path table has no entry — announces leave
+        // the device, they don't loop back into the local table — so
+        // check `deliveryDestinations` first. Mirrors python
+        // `RNS.Identity.recall(hash)`. Same pattern as `sendPropagated`
+        // and `sendOpportunistic`.
         let recipientIdentity: Identity
-        do {
-            recipientIdentity = try Identity(publicKeyBytes: pathEntry.publicKeys)
-        } catch {
-            throw LXMFError.invalidMessageFormat("Invalid recipient public keys: \(error.localizedDescription)")
+        if let localDest = deliveryDestinations[destinationHash]?.0,
+           let localIdentity = localDest.identity {
+            recipientIdentity = localIdentity
+            routerLogger.debug("DIRECT self-link: resolving \(destHex) via local delivery destination")
+        } else {
+            guard let pathTable = self.pathTable else {
+                throw LXMFError.transportNotAvailable
+            }
+            guard let pathEntry = await pathTable.lookup(destinationHash: destinationHash) else {
+                throw LXMFError.destinationNotFound
+            }
+            do {
+                recipientIdentity = try Identity(publicKeyBytes: pathEntry.publicKeys)
+            } catch {
+                throw LXMFError.invalidMessageFormat("Invalid recipient public keys: \(error.localizedDescription)")
+            }
         }
 
         // Debug: print identity hash
