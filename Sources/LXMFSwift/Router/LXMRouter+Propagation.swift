@@ -123,15 +123,20 @@ extension LXMRouter {
         // Get or establish link to propagation node
         let link = try await getOrEstablishPropagationLink(to: propagationNode, transport: transport)
 
-        // Identify ourselves to the propagation node
-        do {
-            try await link.identify(identity: identity)
-        } catch {
-            // Non-fatal - some nodes may not require identification
-        }
-
-        // Update message state
+        // Do NOT identify on the delivery link.
+        //
+        // Python `LXMRouter.process_outbound` PROPAGATED branch (LXMRouter.py
+        // 2682-2720) deliberately omits `link.identify()`. Only the sync /
+        // retrieval path (LXMRouter.py:494) identifies. Identifying on the
+        // delivery link forces lxmd's `propagation_resource_concluded`
+        // (LXMRouter.py:2191) into the peer-discovery branch — calling
+        // `recall_app_data(remote_hash)` while the resource is concluding —
+        // which probes global state during the proof emission path and
+        // stalls the proof. The kotlin port hit and documented the same
+        // trap (LXMF-kt LXMRouter.kt:2181-2206). Symptom: state stuck at
+        // .sending, no proof callback, no delegate notify.
         message.state = .sending
+        notifyUpdate(message)
 
         // Send based on size (Python: LINK_PACKET_MAX_CONTENT = RNS.Link.MDU = 431)
         if propagationPayload.count <= LXMFConstants.LINK_PACKET_MDU {
@@ -166,18 +171,62 @@ extension LXMRouter {
             // Wait for proof from propagation node (confirms message accepted)
             let proved = await transport.waitForPacketProof(packetHash: packetHash, timeout: 15)
             if proved {
+                // Python `__mark_propagated` flips state to SENT (LXMessage.py:570).
                 message.state = .sent
+                notifyUpdate(message)
             } else {
-                message.state = .sent  // Still mark sent - we can't be certain it failed
+                // Python `__link_packet_timed_out` (LXMessage.py:611-616)
+                // flips state back to OUTBOUND so processOutbound can retry.
+                // Previously the swift port marked .sent unconditionally,
+                // which was a silent ack of failure.
+                message.state = .outbound
+                notifyUpdate(message)
+                throw LXMFError.propagationFailed("propagation link-packet proof timeout")
             }
         } else {
-            // Large message: use Resource transfer
-            try await link.sendResource(data: propagationPayload, requestId: nil, isResponse: false)
-            message.state = .sent
-        }
+            // Large message: use Resource transfer.
+            //
+            // Mirrors the sendDirect resource path (LXMRouter+Delivery.swift:
+            // 304-326). The completion callback is what flips state to .sent
+            // and notifies the delegate — emitting it inline immediately
+            // after `sendResource` returns is wrong because that's just the
+            // advertisement, not lxmd's ack. Without the callback wiring,
+            // outbound PROPAGATED state would never advance for any message
+            // that needs Resource (most messages, given LXMF_OVERHEAD pushes
+            // size over 431 bytes).
+            //
+            // Python ref: LXMessage.py:649-651 wires
+            //   RNS.Resource(propagation_packed, link,
+            //                callback=__propagation_resource_concluded,
+            //                progress_callback=__update_transfer_progress)
+            // and __propagation_resource_concluded → __mark_propagated → SENT.
+            let outboundHandler = LXMFOutboundResourceHandler(router: self)
+            await link.setResourceCallbacks(outboundHandler)
 
-        // Notify state update
-        notifyUpdate(message)
+            let resource = try await link.sendResource(
+                data: propagationPayload, requestId: nil, isResponse: false
+            )
+
+            if let resHash = await resource.hash {
+                pendingResourceDeliveries[resHash] = message.hash
+                let resHashHex = resHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+                let msgHashHex = message.hash.prefix(8).map { String(format: "%02x", $0) }.joined()
+                propLogger.info(
+                    "PROPAGATED resource registered \(resHashHex) → message \(msgHashHex); awaiting RESOURCE_PRF"
+                )
+            } else {
+                // Couldn't register for proof tracking — without the resHash
+                // we can't map RESOURCE_PRF back to this message. Throw so
+                // processOutbound's retry path runs rather than leaving the
+                // message in .sending forever.
+                message.state = .outbound
+                notifyUpdate(message)
+                throw LXMFError.propagationFailed("propagation resource has no hash; cannot wire proof callback")
+            }
+            // NOTE: state stays .sending here. handleResourceTransferComplete
+            // (LXMRouter.swift:719) flips it to .sent + notifyUpdates when
+            // RESOURCE_PRF arrives.
+        }
     }
 
     // MARK: - Propagation Link Management
