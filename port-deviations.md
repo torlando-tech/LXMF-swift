@@ -79,10 +79,10 @@ unchanged for callers that prefer single-threaded determinism (tests,
 bridges) — also mirrors python's fall-back behavior on platforms
 without multiprocessing.
 
-### `lxmfDelivery` — broadcast-only self-echo gate
+### `lxmfDelivery` — broadcast-echo-only self-echo gate
 
 **Site:** `Sources/LXMFSwift/Router/LXMRouter.swift` — `lxmfDelivery(_:method:)`,
-the `if sourceHash == localDeliveryHash && method != .propagated` block.
+the `if sourceHash == localDeliveryHash && destinationHash != localDeliveryHash && method != .propagated` block.
 
 **Python reference:** `LXMF/LXMF/LXMRouter.py` — there is **no** equivalent
 self-echo gate anywhere in `lxmf_delivery`/`handle_outbound_completed`.
@@ -91,14 +91,30 @@ the local delivery store) to drop messages it has already seen, including
 self-echoed ones.
 
 **Swift change:** the swift port silently drops inbound messages whose
-`sourceHash` equals the local LXMF delivery hash *unless* they came in
-via `method == .propagated`. This is a narrowed form of the original
-2026-02-05 fix (commit `9992795` "fix(lxmf): prevent relay self-echo
-from overwriting outbound messages"). The original gate dropped self-
-echoes unconditionally; the narrowing was added 2026-05-10 once the iOS
-smoke pipeline started exercising the legitimate self-loop case
-(propagated_bidirectional sends from the device to itself, and the
-phone retrieves that same message back via sync).
+`sourceHash` equals the local LXMF delivery hash AND whose `destinationHash`
+is NOT the local delivery hash AND whose method is not `.propagated`.
+This is a doubly-narrowed form of the original 2026-02-05 fix
+(commit `9992795` "fix(lxmf): prevent relay self-echo from overwriting
+outbound messages").
+
+The narrowing was applied iteratively as the iOS smoke pipeline
+started exercising legitimate self-loop cases:
+
+  1. **Original (2026-02-05)** — `sourceHash == localDeliveryHash`
+     unconditionally rejected. Broke `propagated_bidirectional` smoke
+     scenario (phone uploads to PN, syncs it back, gate rejected the
+     sync delivery as self-echo).
+  2. **First narrowing (2026-05-10 morning)** — added `&& method != .propagated`.
+     Fixed propagated; still broke `direct_bidirectional` and
+     `opp_bidirectional` (phone sends to its own destination over a
+     link or single packet — TCP relay echoes the packet back, and
+     the gate rejected it as self-echo even though the message was
+     legitimately addressed to us).
+  3. **Second narrowing (2026-05-10 afternoon)** — added
+     `&& destinationHash != localDeliveryHash`. Now the gate only
+     fires when the source is us AND the destination is someone
+     else AND the method is non-propagated, which is exactly the
+     TCP-relay-broadcast-of-our-outbound case.
 
 **Reason:** Category (a) — language/runtime accommodation. Specifically:
 swift's `Database` layer (`LXMFDatabase` SQLite store) treats hash as a
