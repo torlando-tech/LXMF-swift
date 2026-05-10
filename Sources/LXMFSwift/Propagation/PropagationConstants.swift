@@ -47,4 +47,18 @@ public enum PropagationConstants {
 
     /// Default maximum messages per sync request if not announced.
     public static let DEFAULT_PER_SYNC_LIMIT = 20
+
+    // MARK: - LXMPeer signaling constants
+    //
+    // Mirrors python `LXMPeer` (LXMF/LXMPeer.py:13-29). Sent by the
+    // propagation node as a single-element msgpack array `[code]` over
+    // the propagation link's packet-callback channel. The iOS port
+    // installs that callback in `LXMRouter+Propagation.swift`'s
+    // `getOrEstablishPropagationLink` and routes msgpack-decoded
+    // codes through `handlePropagationSignalingPacket` there.
+
+    /// Propagation node rejected the message because the propagation
+    /// stamp didn't meet the node's required cost.
+    /// Python ref: `LXMPeer.ERROR_INVALID_STAMP = 0xf5`
+    public static let ERROR_INVALID_STAMP: UInt8 = 0xf5
 }

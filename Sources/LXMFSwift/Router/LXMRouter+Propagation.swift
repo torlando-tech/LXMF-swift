@@ -314,12 +314,99 @@ extension LXMRouter {
         // Initiate link
         let link = try await transport.initiateLink(to: destination, identity: identity)
         propagationLinks[nodeHash] = link
+
+        // Register a packet callback for propagation-link signaling.
+        //
+        // Mirrors python `LXMRouter.process_outbound` PROPAGATED branch:
+        //   self.outbound_propagation_link.set_packet_callback(
+        //       self.propagation_transfer_signalling_packet)
+        // (LXMRouter.py:2719). The handler at LXMRouter.py:2498 unpacks
+        // msgpack data and reacts to LXMPeer.ERROR_INVALID_STAMP (0xf5).
+        //
+        // WITHOUT this callback, lxmd's signaling packets get routed
+        // through Transport's default link-data path (ReticulumTransport
+        // .swift:2167) which checks `plaintext.count >= 16` for an LXMF
+        // dest hash — signaling msgpack arrays are typically a few bytes,
+        // so they fail the check, fall through, and Transport logs
+        // "Link data too short for LXMF" and DROPS them. lxmd sees no
+        // response, gives up, closes the link with `closed by remote
+        // peer (verified)`. Net effect: every PROPAGATED send hangs
+        // through the full LINK_TIMEOUT (30s) and retries indefinitely.
+        //
+        // This was the proximate cause of iOS issue #67.
+        await link.setPacketCallback { [weak self] data, _ in
+            guard let self = self else { return }
+            await self.handlePropagationSignalingPacket(data, link: link)
+        }
+
         propLogger.error("[PROP_LINK] Link initiated, waiting for active state...")
 
         // Wait for link to become active
         try await waitForPropagationLinkActive(link, timeout: PropagationConstants.LINK_TIMEOUT)
 
         return link
+    }
+
+    /// Handle a signaling packet received over the propagation link's
+    /// packet-callback channel. Mirrors python
+    /// `LXMRouter.propagation_transfer_signalling_packet`
+    /// (LXMRouter.py:2498-2511).
+    ///
+    /// Format: msgpack-encoded `[code, ...]` where `code` is one of
+    /// `PropagationConstants.ERROR_INVALID_STAMP` (currently the only
+    /// signal python sends; future-proofed by leaving the array open).
+    ///
+    /// On `ERROR_INVALID_STAMP` the python reference cancels the
+    /// outbound message via `cancel_outbound(message_id, REJECTED)`.
+    /// LXMF-swift exposes the equivalent transition by setting the
+    /// pending outbound message's state to `.rejected` and removing it
+    /// from `pendingOutbound`. The `for_lxmessage` association python
+    /// uses (LXMRouter.py:2505-2506) maps to the (link → message)
+    /// pairing established at send time; with the current LXMF-swift
+    /// design the single most-recent `pendingOutbound` entry routed
+    /// through this propagation node is the most likely target. We
+    /// scan `pendingOutbound` for the topmost message that's
+    /// `.propagated` AND `.sending` and reject that one.
+    func handlePropagationSignalingPacket(_ data: Data, link: Link) async {
+        do {
+            let unpacked = try unpackLXMF(data)
+            guard case .array(let elements) = unpacked,
+                  let first = elements.first else {
+                propLogger.warning("[PROP_SIGNAL] payload not a non-empty array — ignoring")
+                return
+            }
+            // Codes are sent as msgpack uint by python.
+            let code: UInt8
+            switch first {
+            case .uint(let u): code = UInt8(truncatingIfNeeded: u)
+            case .int(let i):  code = UInt8(truncatingIfNeeded: i)
+            default:
+                propLogger.warning("[PROP_SIGNAL] first element not a numeric code — ignoring")
+                return
+            }
+            switch code {
+            case PropagationConstants.ERROR_INVALID_STAMP:
+                propLogger.error("[PROP_SIGNAL] ERROR_INVALID_STAMP — propagation node rejected outbound stamp")
+                // Best-effort match-and-reject of the most recently-sent
+                // PROPAGATED message that's still in flight.
+                for i in pendingOutbound.indices.reversed() {
+                    var msg = pendingOutbound[i]
+                    if msg.method == .propagated && msg.state == .sending {
+                        msg.state = .rejected
+                        pendingOutbound[i] = msg
+                        notifyFailure(msg, reason: .stampValidationFailed)
+                        let hashHex = msg.hash.prefix(8).map { String(format: "%02x", $0) }.joined()
+                        propLogger.error("[PROP_SIGNAL] cancelled outbound \(hashHex) as REJECTED")
+                        return
+                    }
+                }
+                propLogger.warning("[PROP_SIGNAL] ERROR_INVALID_STAMP received but no pending propagated message in .sending found")
+            default:
+                propLogger.warning("[PROP_SIGNAL] unknown signal code 0x\(String(format: "%02x", code))")
+            }
+        } catch {
+            propLogger.error("[PROP_SIGNAL] msgpack decode failed: \(error.localizedDescription)")
+        }
     }
 
     /// Wait for propagation link to become active with timeout.

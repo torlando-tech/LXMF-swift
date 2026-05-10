@@ -66,8 +66,14 @@ public actor LXMRouter {
     /// Database for message persistence
     private let database: LXMFDatabase
 
-    /// In-memory pending outbound queue (PRIMARY)
-    private var pendingOutbound: [LXMessage] = []
+    /// In-memory pending outbound queue (PRIMARY).
+    /// `internal` (not `private`) so cross-file extensions in this module
+    /// can read/mutate it — specifically `LXMRouter+Propagation.swift`'s
+    /// `handlePropagationSignalingPacket` needs to flip the most recent
+    /// in-flight propagated message to `.rejected` when the propagation
+    /// node sends `LXMPeer.ERROR_INVALID_STAMP` over the link's packet
+    /// callback.
+    internal var pendingOutbound: [LXMessage] = []
 
     /// In-memory failed outbound queue
     private var failedOutbound: [LXMessage] = []
@@ -665,7 +671,11 @@ public actor LXMRouter {
     /// - Parameters:
     ///   - message: Failed message
     ///   - reason: Error causing failure
-    private func notifyFailure(_ message: LXMessage, reason: LXMFError) {
+    /// `internal` (was `private`) so cross-file extensions in this module
+    /// can fire delegate failure callbacks. Specifically
+    /// `LXMRouter+Propagation`'s ERROR_INVALID_STAMP signal handler needs
+    /// to notify the delegate when the propagation node rejects a stamp.
+    internal func notifyFailure(_ message: LXMessage, reason: LXMFError) {
         if let wrapper = delegateWrapper, let delegate = wrapper.delegate {
             Task { @MainActor in
                 delegate.router(self, didFailMessage: message, reason: reason)
