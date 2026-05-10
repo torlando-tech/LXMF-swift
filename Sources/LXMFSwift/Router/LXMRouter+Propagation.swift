@@ -69,18 +69,47 @@ extension LXMRouter {
         let messageBody = packed.dropFirst(16)  // source_hash + signature + payload
         let destHashHex = destHash.map { String(format: "%02x", $0) }.joined()
 
-        // Look up recipient's public keys from path table
-        guard let pathTable = self.pathTable else {
-            throw LXMFError.transportNotAvailable
+        // Resolve recipient identity. Order matters:
+        //
+        //  1. If the destination matches one of OUR registered local
+        //     LXMF delivery destinations, use that destination's identity
+        //     directly. This mirrors python `RNS.Identity.recall(hash)`,
+        //     which returns the local identity for own destinations
+        //     without consulting Transport's path table. Concretely: a
+        //     phone sending to one of its own LXMF destinations (the
+        //     test-harness self-loop pattern, also legitimate scenarios
+        //     like sending to a secondary identity) wouldn't have a
+        //     PathTable entry for itself — announces leave the device,
+        //     they don't loop back into the local table — so the
+        //     pathTable.lookup below would fail with .noPath even though
+        //     we obviously DO know our own keys.
+        //
+        //  2. Otherwise look up the path table for received-announce
+        //     entries. This is the normal cross-device case.
+        //
+        // The kotlin port (LXMF-kt LXMRouter.kt:1181-1183) avoids this
+        // problem by passing the recipient `Destination` object directly
+        // on the LXMessage at creation, with keys already attached.
+        // LXMF-swift's API takes a bare destinationHash, so the lookup
+        // happens here — and needs both branches.
+        let destIdentity: Identity
+        let destIdentityHash: Data
+        if let localDest = deliveryDestinations[Data(destHash)]?.0,
+           let localIdentity = localDest.identity {
+            destIdentity = localIdentity
+            destIdentityHash = localIdentity.hash
+            propLogger.info("[PROP_SEND] Resolving \(destHashHex) via local delivery destination")
+        } else {
+            guard let pathTable = self.pathTable else {
+                throw LXMFError.transportNotAvailable
+            }
+            guard let destPathEntry = await pathTable.lookup(destinationHash: Data(destHash)) else {
+                propLogger.error("[PROP_SEND] No path entry for recipient \(destHashHex); LXMessage cannot be encrypted to recipient")
+                throw LXMFError.noPath
+            }
+            destIdentity = try Identity(publicKeyBytes: destPathEntry.publicKeys)
+            destIdentityHash = destIdentity.hash
         }
-
-        guard let destPathEntry = await pathTable.lookup(destinationHash: Data(destHash)) else {
-            throw LXMFError.noPath
-        }
-
-        // Create recipient Identity for encryption
-        let destIdentity = try Identity(publicKeyBytes: destPathEntry.publicKeys)
-        let destIdentityHash = destIdentity.hash
 
         // Encrypt message body to RECIPIENT identity (NOT the propagation node)
         // This allows only the recipient to decrypt, while the propagation node stores opaquely
