@@ -517,6 +517,161 @@ final class LXMRouterProofCallbackTests: XCTestCase {
             "LXMessage.py:597 treats REJECTED as terminal. " +
             "pendingOutbound count=\(pendingHashes.count)")
     }
+
+    // MARK: - handlePropagationAccepted + handleResourceTransferComplete dispatch
+
+    /// Helper: poll the DB until the message's state matches `expected`
+    /// (or fail after `timeout`). Both `handlePropagationAccepted` and
+    /// `handleDeliveryProofReceived` use `Task.detached` to write the
+    /// DB asynchronously — we have to wait briefly. ms-scale is fine
+    /// for an in-process SQLite.
+    private func waitForMessageState(
+        _ router: LXMRouter, messageHash: Data, expected: LXMessageState,
+        timeout: TimeInterval = 2.0
+    ) async throws -> LXMessageState? {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            let msg = try await router.testGetMessage(id: messageHash)
+            if let s = msg?.state, s == expected {
+                return s
+            }
+            try await Task.sleep(nanoseconds: 50_000_000)  // 50ms
+        }
+        return try await router.testGetMessage(id: messageHash)?.state
+    }
+
+    /// `handlePropagationAccepted` is the new (PR #7) terminal-state
+    /// handler for PROPAGATED resource transfers — invoked when
+    /// RESOURCE_PRF arrives from the propagation node. Per python
+    /// `LXMessage.__mark_propagated` (LXMessage.py:568-578) it must
+    /// transition the message to state=`.sent` (NOT `.delivered`).
+    /// Pinning this is critical: regressing to `.delivered` would
+    /// reintroduce the double-checkmark lie that triggered the whole
+    /// state-split rework in `b2e14cd`.
+    func testHandlePropagationAcceptedTransitionsToSent() async throws {
+        let router = try await makeRouter()
+
+        let srcIdentity = Identity()
+        let destHash = Data((0..<16).map { _ in UInt8.random(in: 0...255) })
+        var msg = LXMessage(
+            destinationHash: destHash,
+            sourceIdentity: srcIdentity,
+            content: Data("prop-accepted".utf8),
+            title: Data(),
+            fields: nil,
+            desiredMethod: .propagated
+        )
+        _ = try msg.pack()
+        try await router.testSaveMessage(msg)
+
+        await router.handlePropagationAccepted(messageHash: msg.hash)
+
+        let finalState = try await waitForMessageState(
+            router, messageHash: msg.hash, expected: .sent
+        )
+        XCTAssertEqual(finalState, .sent,
+            "handlePropagationAccepted must transition DB state to " +
+            ".sent per python LXMessage.py:568-578 — anything else " +
+            "(especially .delivered) reintroduces the false-positive " +
+            "delivery confirmation. Got \(String(describing: finalState)).")
+    }
+
+    /// `handleResourceTransferComplete` dispatches by membership in
+    /// `pendingPropagationResources`: when present, route to
+    /// `handlePropagationAccepted` (PROPAGATED → state=.sent); when
+    /// absent, route to `handleDeliveryProofReceived` (DIRECT →
+    /// state=.delivered). This test pins the PROPAGATED branch.
+    func testHandleResourceTransferCompleteForPropagationRoutesToSent() async throws {
+        let router = try await makeRouter()
+
+        let srcIdentity = Identity()
+        let destHash = Data((0..<16).map { _ in UInt8.random(in: 0...255) })
+        var msg = LXMessage(
+            destinationHash: destHash,
+            sourceIdentity: srcIdentity,
+            content: Data("prop-resource-complete".utf8),
+            title: Data(),
+            fields: nil,
+            desiredMethod: .propagated
+        )
+        _ = try msg.pack()
+        try await router.testSaveMessage(msg)
+
+        let resourceHash = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
+        await router.setPendingResourceDelivery(resourceHash: resourceHash, messageHash: msg.hash)
+        await router.markPendingPropagationResource(resourceHash: resourceHash)
+
+        await router.handleResourceTransferComplete(resourceHash: resourceHash)
+
+        let finalState = try await waitForMessageState(
+            router, messageHash: msg.hash, expected: .sent
+        )
+        XCTAssertEqual(finalState, .sent,
+            "handleResourceTransferComplete must dispatch PROPAGATED " +
+            "resources to handlePropagationAccepted (state=.sent). " +
+            "Got \(String(describing: finalState)). A .delivered here " +
+            "means the dispatch lookup in pendingPropagationResources " +
+            "missed and the DIRECT branch fired wrongly.")
+
+        // Both maps should be cleaned post-dispatch (the
+        // handleResourceTransferComplete `.removeValue` + `.remove`
+        // calls).
+        let afterDeliveries = await router.pendingResourceDeliveries.count
+        let afterProp = await router.pendingPropagationResources.count
+        XCTAssertEqual(afterDeliveries, 0, "Maps must be cleaned post-dispatch.")
+        XCTAssertEqual(afterProp, 0, "Maps must be cleaned post-dispatch.")
+    }
+
+    /// DIRECT path through the same dispatcher → state=.delivered.
+    func testHandleResourceTransferCompleteForDirectRoutesToDelivered() async throws {
+        let router = try await makeRouter()
+
+        let srcIdentity = Identity()
+        let destHash = Data((0..<16).map { _ in UInt8.random(in: 0...255) })
+        var msg = LXMessage(
+            destinationHash: destHash,
+            sourceIdentity: srcIdentity,
+            content: Data("direct-resource-complete".utf8),
+            title: Data(),
+            fields: nil,
+            desiredMethod: .direct
+        )
+        _ = try msg.pack()
+        try await router.testSaveMessage(msg)
+
+        let resourceHash = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
+        await router.setPendingResourceDelivery(resourceHash: resourceHash, messageHash: msg.hash)
+        // Deliberately NOT in pendingPropagationResources — this is
+        // the DIRECT path.
+
+        await router.handleResourceTransferComplete(resourceHash: resourceHash)
+
+        let finalState = try await waitForMessageState(
+            router, messageHash: msg.hash, expected: .delivered
+        )
+        XCTAssertEqual(finalState, .delivered,
+            "DIRECT resource transfer completion must dispatch to " +
+            "handleDeliveryProofReceived → state=.delivered. " +
+            "Got \(String(describing: finalState)).")
+    }
+
+    func testHandleResourceTransferCompleteNoOpOnUnknownHash() async throws {
+        // Defensive: if RESOURCE_PRF fires twice (re-delivery) or for a
+        // hash that's already been cleared, the early-return must not
+        // crash and must not mutate unrelated map entries.
+        let router = try await makeRouter()
+
+        let stableHash = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
+        let stableMsgHash = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
+        await router.setPendingResourceDelivery(resourceHash: stableHash, messageHash: stableMsgHash)
+
+        let unknownHash = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
+        await router.handleResourceTransferComplete(resourceHash: unknownHash)
+
+        let stillThere = await router.pendingResourceDeliveries[stableHash]
+        XCTAssertEqual(stillThere, stableMsgHash,
+            "Unknown-hash complete must not touch unrelated map entries.")
+    }
 }
 
 // MARK: - Test-only LXMRouter helpers
@@ -547,6 +702,14 @@ extension LXMRouter {
     /// surface that already routes saves through `database` itself.
     fileprivate func testSaveMessage(_ message: LXMessage) async throws {
         try await database.saveMessage(message)
+    }
+
+    /// Read a message from the router's database by hash. Used by
+    /// state-transition tests to verify async DB writes from
+    /// `handlePropagationAccepted` / `handleResourceTransferComplete`
+    /// took effect.
+    fileprivate func testGetMessage(id: Data) async throws -> LXMessage? {
+        try await database.getMessage(id: id)
     }
 }
 
