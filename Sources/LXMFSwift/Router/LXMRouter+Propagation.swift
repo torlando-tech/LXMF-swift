@@ -240,6 +240,15 @@ extension LXMRouter {
 
             if let resHash = await resource.hash {
                 pendingResourceDeliveries[resHash] = message.hash
+                // Tag this resource as a PROPAGATED upload. When RESOURCE_PRF
+                // arrives, `handleResourceTransferComplete` consults this set
+                // and routes to `handlePropagationAccepted` (state → .sent)
+                // rather than `handleDeliveryProofReceived` (state →
+                // .delivered). Python ref: `LXMessage.__as_resource`
+                // (LXMF/LXMessage.py:649-651) wires
+                // `__propagation_resource_concluded` for the prop path,
+                // distinct from `__resource_concluded` for direct.
+                pendingPropagationResources.insert(resHash)
                 let resHashHex = resHash.prefix(8).map { String(format: "%02x", $0) }.joined()
                 let msgHashHex = message.hash.prefix(8).map { String(format: "%02x", $0) }.joined()
                 propLogger.info(
@@ -255,8 +264,8 @@ extension LXMRouter {
                 throw LXMFError.propagationFailed("propagation resource has no hash; cannot wire proof callback")
             }
             // NOTE: state stays .sending here. handleResourceTransferComplete
-            // (LXMRouter.swift:719) flips it to .sent + notifyUpdates when
-            // RESOURCE_PRF arrives.
+            // routes via handlePropagationAccepted to flip state → .sent
+            // when RESOURCE_PRF arrives (python ref: __mark_propagated).
         }
     }
 

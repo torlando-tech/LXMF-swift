@@ -108,6 +108,22 @@ public actor LXMRouter {
     /// When RESOURCE_PRF is received, we look up the message hash here to mark it delivered.
     public var pendingResourceDeliveries: [Data: Data] = [:]
 
+    /// Outbound resource hashes that correspond to PROPAGATED messages.
+    ///
+    /// Membership in this set causes `handleResourceTransferComplete` to
+    /// treat RESOURCE_PRF as "propagation node accepted the upload" rather
+    /// than "recipient acked delivery". The end-state distinction matches
+    /// python `LXMessage.__mark_propagated` (LXMF/LXMessage.py:568-578)
+    /// which caps PROPAGATED at `state = SENT`, vs `__mark_delivered`
+    /// (LXMessage.py:556-566) which advances OPP/DIRECT to DELIVERED.
+    /// Without this set, large PROPAGATED messages (which use Resource
+    /// transfer rather than the small-packet path at
+    /// LXMRouter+Propagation.swift:173-216) incorrectly advance to
+    /// DELIVERED in the iOS UI — the sender NEVER learns when the
+    /// recipient syncs the message down from the propagation node, so
+    /// claiming "delivered" is a false positive.
+    public var pendingPropagationResources: Set<Data> = []
+
     /// Active propagation links (separate cache from delivery links)
     public var propagationLinks: [Data: Link] = [:]
 
@@ -755,8 +771,30 @@ public actor LXMRouter {
 
     /// Handle outbound resource transfer completion (RESOURCE_PRF received).
     ///
-    /// Called by `LXMFOutboundResourceHandler` when a resource proof is received.
-    /// Looks up the corresponding message hash and marks it as delivered.
+    /// Called by `LXMFOutboundResourceHandler` when a resource proof is
+    /// received. Looks up the corresponding message hash and routes to
+    /// the right terminal-state handler based on whether the resource
+    /// was a DIRECT delivery (state advances to `.delivered`) or a
+    /// PROPAGATED upload (state advances to `.sent` only — propagation
+    /// nodes ack the upload, not the recipient's receipt).
+    ///
+    /// Mirrors python `LXMessage.__as_resource` (LXMF/LXMessage.py:635-
+    /// 651) which wires DIFFERENT resource callbacks per method:
+    ///   - DIRECT path: `RNS.Resource(packed, destination,
+    ///     callback=self.__resource_concluded, ...)` → on COMPLETE
+    ///     `__mark_delivered` (LXMessage.py:556-566) → state=DELIVERED.
+    ///   - PROPAGATED path: `RNS.Resource(propagation_packed, link,
+    ///     callback=self.__propagation_resource_concluded, ...)` → on
+    ///     COMPLETE `__mark_propagated` (LXMessage.py:568-578) →
+    ///     state=SENT.
+    ///
+    /// Without this distinction, large PROPAGATED messages (which use
+    /// Resource transfer because they exceed `LINK_PACKET_MDU` = 431
+    /// bytes) incorrectly advance to DELIVERED in the iOS UI, claiming
+    /// the recipient acked delivery — but the sender NEVER learns when
+    /// the recipient syncs the message down from the propagation node.
+    /// Tyler observed this as "PROPAGATED messages show double
+    /// checkmark" on the iOS UI 2026-05-10.
     ///
     /// - Parameter resourceHash: The 32-byte resource hash
     public func handleResourceTransferComplete(resourceHash: Data) {
@@ -766,8 +804,52 @@ public actor LXMRouter {
             return
         }
         let msgHex = messageHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-        routerLogger.info("Resource \(resHex, privacy: .public) → message \(msgHex, privacy: .public), marking delivered")
-        handleDeliveryProofReceived(messageHash: messageHash)
+
+        if pendingPropagationResources.remove(resourceHash) != nil {
+            // PROPAGATED resource transfer — python `__mark_propagated`.
+            routerLogger.info("Resource \(resHex, privacy: .public) → message \(msgHex, privacy: .public), marking sent (propagation node ack)")
+            handlePropagationAccepted(messageHash: messageHash)
+        } else {
+            // DIRECT resource transfer — python `__mark_delivered`.
+            routerLogger.info("Resource \(resHex, privacy: .public) → message \(msgHex, privacy: .public), marking delivered (recipient ack)")
+            handleDeliveryProofReceived(messageHash: messageHash)
+        }
+    }
+
+    /// Handle propagation-upload acceptance (RESOURCE_PRF from
+    /// propagation node received, OR small-packet PROOF from
+    /// propagation node received).
+    ///
+    /// Mirrors python `LXMessage.__mark_propagated` (LXMF/LXMessage.py
+    /// :568-578) which sets `state = SENT, progress = 1.0` and fires
+    /// the user's delivery callback. The user's callback is shared
+    /// between direct and propagated paths in python — the SENT vs
+    /// DELIVERED state distinction is what consumers (UI, etc.) read.
+    ///
+    /// - Parameter messageHash: The LXMF message hash (32 bytes)
+    public func handlePropagationAccepted(messageHash: Data) {
+        let hashHex = messageHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+        routerLogger.info("Propagation upload accepted for message \(hashHex, privacy: .public)")
+
+        // Update database state to sent (NOT delivered — see comment on
+        // handleResourceTransferComplete + python LXMessage.py:568-578).
+        Task.detached { [database] in
+            try? await database.updateMessageState(id: messageHash, state: .sent)
+        }
+
+        // Notify delegate. We reuse `didConfirmDelivery` for the UI
+        // refresh signal — the delegate's job is "this message's state
+        // changed, reload it"; reading the new state is the consumer's
+        // responsibility. Adding a separate `didConfirmPropagation`
+        // delegate method would be a larger API change for no
+        // additional information (consumers already read `.state` on
+        // the reloaded message).
+        if let wrapper = delegateWrapper, let delegate = wrapper.delegate {
+            let hash = messageHash
+            Task { @MainActor in
+                delegate.router(self, didConfirmDelivery: hash)
+            }
+        }
     }
 
     // MARK: - Path Management
