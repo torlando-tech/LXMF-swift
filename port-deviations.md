@@ -339,6 +339,57 @@ to a python-style state-driven keep-in-queue model (see the
 above) lands, the swift-specific re-enqueue path goes away and
 this sub-deviation can be deleted along with it.
 
+**Sub-deviation (DIRECT resource path DB write + ordering parity,
+PR #7 round 6):** Greptile (4/5 confidence) flagged that the
+DIRECT branch in `processOutbound` was writing `.sent` via
+`Task.detached` immediately after `sendDirect` returned, without
+the guarded `saveMessage(.outbound)` pattern the PROPAGATED
+branch gained earlier in this PR. The same crash-recovery gap
+greptile previously identified for PROPAGATED applied verbatim:
+a large DIRECT resource transfer that crashes between
+`sendDirect` returning and the resource conclusion firing left
+the DB at `.sent` with no re-enqueue path on restart.
+
+Fix applies the same three changes to the DIRECT path:
+
+  1. `sendDirect` (`LXMRouter+Delivery.swift`) leaves
+     `message.state = .sending` for the resource path (small-
+     packet still sets `.sent` because the packet has already
+     been transmitted). This matches python `LXMessage.send`
+     (LXMessage.py:498-512) — `__as_packet().send()` is followed
+     by `state = SENT` immediately; `__as_resource().advertise()`
+     leaves state alone for the resource callback to update.
+  2. `processOutbound` DIRECT case (`LXMRouter.swift`)
+     branches on `snapshot.state == .sending`:
+     resource → `saveMessage(.outbound)` (full record, carries
+     `deliveryAttempts`); small-packet → `updateMessageState(.sent)`
+     (state column only). Both awaited inside the actor.
+  3. `handleDeliveryProofReceived` (`LXMRouter.swift`) is now
+     `async` and `await`s its DB write of `.delivered`, so the
+     actor mailbox serializes the `.outbound`→`.delivered`
+     transition. Without this, a fast RESOURCE_PRF could land
+     `.delivered` via `Task.detached` before `processOutbound`'s
+     `.outbound` write, leaving the message marked `.outbound`
+     for a duplicate re-send.
+
+**Python reference:** `LXMessage.py:498-512` (`send`), :556-566
+(`__mark_delivered`), :592-601 (`__resource_concluded`). Python's
+DIRECT resource conclusion writes `state = DELIVERED` on COMPLETE
+and `state = REJECTED`/`OUTBOUND` on failure; swift now mirrors
+the COMPLETE branch with an awaited DB write and the failure
+branches via `handleOutboundResourceFailed` (already wired).
+
+**Reason:** Category (a) — same actor-isolation + DB-persistence
+accommodation the PROPAGATED branch needed (since python doesn't
+persist `pending_outbound` at all, the DB row is purely a
+swift-port concern). The fix brings DIRECT into parity with the
+PROPAGATED treatment that landed earlier in this PR.
+
+**Re-sync note:** absorbed by the same long-term refactor — when
+`processOutbound` moves to a python-style state-driven loop, the
+in-flight `.outbound` DB write goes away and the resource
+callbacks just mutate in-memory state.
+
 ### `lxmfDelivery` — broadcast-echo-only self-echo gate
 
 **Site:** `Sources/LXMFSwift/Router/LXMRouter.swift` — `lxmfDelivery(_:method:)`,

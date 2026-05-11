@@ -632,6 +632,91 @@ final class LXMRouterProofCallbackTests: XCTestCase {
         return try await router.testGetMessage(id: messageHash)?.state
     }
 
+    /// `handleDeliveryProofReceived` is the DIRECT-path terminal
+    /// handler — invoked when a delivery proof arrives (either as a
+    /// PROOF packet for the small-packet path or as RESOURCE_PRF
+    /// routed via `handleResourceTransferComplete` for the resource
+    /// path). Per python `LXMessage.__mark_delivered`
+    /// (LXMessage.py:556-566) it must transition the message to
+    /// `.delivered`. Pin the async + awaited-DB-write behavior so the
+    /// ordering guarantee against `processOutbound`'s in-flight
+    /// `.outbound` write (DIRECT resource branch) is preserved.
+    /// PR #7 round 6 — greptile 4/5 follow-up.
+    func testHandleDeliveryProofReceivedTransitionsToDelivered() async throws {
+        let router = try await makeRouter()
+
+        let srcIdentity = Identity()
+        let destHash = Data((0..<16).map { _ in UInt8.random(in: 0...255) })
+        var msg = LXMessage(
+            destinationHash: destHash,
+            sourceIdentity: srcIdentity,
+            content: Data("direct-delivered".utf8),
+            title: Data(),
+            fields: nil,
+            desiredMethod: .direct
+        )
+        _ = try msg.pack()
+        try await router.testSaveMessage(msg)
+
+        await router.handleDeliveryProofReceived(messageHash: msg.hash)
+
+        let finalState = try await waitForMessageState(
+            router, messageHash: msg.hash, expected: .delivered
+        )
+        XCTAssertEqual(finalState, .delivered,
+            "handleDeliveryProofReceived must transition DB state to " +
+            ".delivered per python LXMessage.py:556-566. Got " +
+            "\(String(describing: finalState)).")
+    }
+
+    /// Ordering parity: when `processOutbound`'s DIRECT resource
+    /// branch writes `.outbound` to the DB (the in-flight crash-
+    /// recovery row), and then `handleDeliveryProofReceived` writes
+    /// `.delivered` after the resource conclusion fires, the final
+    /// DB row must be `.delivered` — NOT clobbered back to `.outbound`
+    /// by a late-landing write. Without the actor-mailbox
+    /// serialization (both writes `await`-ed inside the actor), a
+    /// `Task.detached` from the conclusion callback could land on the
+    /// global executor before the `processOutbound` write completed.
+    /// This test sequences the two writes in the exact actor order
+    /// they would fire and verifies the DB ends at `.delivered`.
+    func testDirectResourcePathDBWriteOrdering() async throws {
+        let router = try await makeRouter()
+
+        let srcIdentity = Identity()
+        let destHash = Data((0..<16).map { _ in UInt8.random(in: 0...255) })
+        var msg = LXMessage(
+            destinationHash: destHash,
+            sourceIdentity: srcIdentity,
+            content: Data("direct-resource-ordering".utf8),
+            title: Data(),
+            fields: nil,
+            desiredMethod: .direct
+        )
+        _ = try msg.pack()
+        // Simulate processOutbound's in-flight `.outbound` write
+        // (full record via `saveMessage`, carrying deliveryAttempts).
+        var outboundSnapshot = msg
+        outboundSnapshot.state = .outbound
+        try await router.testSaveMessage(outboundSnapshot)
+
+        // Then the resource conclusion fires → DIRECT path →
+        // handleDeliveryProofReceived writes `.delivered`. Both are
+        // on the actor's serial mailbox, so this strict ordering
+        // matches what real production code observes.
+        await router.handleDeliveryProofReceived(messageHash: msg.hash)
+
+        let finalState = try await waitForMessageState(
+            router, messageHash: msg.hash, expected: .delivered
+        )
+        XCTAssertEqual(finalState, .delivered,
+            "DIRECT resource ordering parity: after `.outbound` " +
+            "in-flight write + `.delivered` conclusion write run in " +
+            "actor order, the DB must reflect `.delivered`. " +
+            "Got \(String(describing: finalState)). Regression here " +
+            "means a `Task.detached` slipped back in somewhere.")
+    }
+
     /// `handlePropagationAccepted` is the new (PR #7) terminal-state
     /// handler for PROPAGATED resource transfers — invoked when
     /// RESOURCE_PRF arrives from the propagation node. Per python

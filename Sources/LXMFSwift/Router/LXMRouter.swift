@@ -695,10 +695,45 @@ public actor LXMRouter {
                         routerLogger.info("sendDirect completed to \(destHashHex)")
                         indicesToRemove.insert(i)
 
-                        // Update database
-                        let sentMsg = pendingOutbound[i]
-                        Task.detached { [database] in
-                            try? await database.updateMessageState(id: sentMsg.hash, state: .sent)
+                        // DB persistence policy mirrors the PROPAGATED
+                        // branch's two-path treatment. Greptile flagged
+                        // (PR #7 round 5) that the previous unconditional
+                        // `Task.detached { .sent }` here left a large
+                        // DIRECT resource transfer with the DB at `.sent`
+                        // immediately after `sendDirect` returned — even
+                        // though the resource was still in flight. A
+                        // crash before RESOURCE_PRF arrived would leave
+                        // the message "sent" on disk with no
+                        // re-enqueue, and the recipient would never get
+                        // it.
+                        //
+                        // Now branched the same way as PROPAGATED
+                        // (LXMRouter.swift:805-842):
+                        //   - sendDirect's small-packet path returns
+                        //     with state=.sent; persist `.sent` via
+                        //     `updateMessageState` (state-column only).
+                        //   - sendDirect's resource path returns with
+                        //     state=.sending; persist `.outbound` via
+                        //     full-record `saveMessage` so
+                        //     `deliveryAttempts` is carried into the DB
+                        //     and a crash between here and the
+                        //     resource callback re-enqueues the
+                        //     message at the right attempt count.
+                        // Both writes are awaited inside the actor so
+                        // the callback writes (`.delivered` for
+                        // success, `.outbound` again for re-enqueue,
+                        // `.rejected`/`.cancelled` for terminals) are
+                        // strictly serialized after this one. Without
+                        // the await, a fast RESOURCE_PRF could land
+                        // its `.delivered` write before this
+                        // `.outbound` write and get clobbered.
+                        let snapshot = pendingOutbound[i]
+                        if snapshot.state == .sending {
+                            var outboundSnapshot = snapshot
+                            outboundSnapshot.state = .outbound
+                            try? await database.saveMessage(outboundSnapshot)
+                        } else {
+                            try? await database.updateMessageState(id: snapshot.hash, state: snapshot.state)
                         }
                     } else {
                         // Need path first
@@ -926,14 +961,23 @@ public actor LXMRouter {
     /// the delegate to trigger UI refresh (single checkmark → double checkmark).
     ///
     /// - Parameter messageHash: The LXMF message hash (32 bytes)
-    public func handleDeliveryProofReceived(messageHash: Data) {
+    public func handleDeliveryProofReceived(messageHash: Data) async {
         let hashHex = messageHash.prefix(8).map { String(format: "%02x", $0) }.joined()
         routerLogger.error("Delivery proof received for message \(hashHex, privacy: .public)")
 
-        // Update database state to delivered
-        Task.detached { [database] in
-            try? await database.updateMessageState(id: messageHash, state: .delivered)
-        }
+        // Update database state to delivered.
+        //
+        // ORDERING NOTE — awaited (not detached) on purpose. The
+        // matching `.outbound` write in processOutbound's DIRECT
+        // resource branch (LXMRouter.swift:DIRECT case) is also
+        // awaited inside the actor. Because both writes run on the
+        // actor's serial mailbox, the `.outbound` write always
+        // completes before this function can run — so a fast
+        // RESOURCE_PRF can never observe its `.delivered` write being
+        // clobbered by a late-landing `.outbound` write. Mirrors the
+        // same fix applied to `handlePropagationAccepted` (PR #7
+        // greptile round 4).
+        try? await database.updateMessageState(id: messageHash, state: .delivered)
 
         // Notify delegate for UI refresh
         if let wrapper = delegateWrapper, let delegate = wrapper.delegate {
@@ -987,7 +1031,7 @@ public actor LXMRouter {
         } else {
             // DIRECT resource transfer — python `__mark_delivered`.
             routerLogger.info("Resource \(resHex, privacy: .public) → message \(msgHex, privacy: .public), marking delivered (recipient ack)")
-            handleDeliveryProofReceived(messageHash: messageHash)
+            await handleDeliveryProofReceived(messageHash: messageHash)
         }
     }
 

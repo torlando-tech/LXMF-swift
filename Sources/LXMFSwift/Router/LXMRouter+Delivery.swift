@@ -307,6 +307,15 @@ extension LXMRouter {
 
         directSendLogger.info("packed size=\(packed.count), LINK_PACKET_MAX=\(LXMFConstants.LINK_PACKET_MAX_CONTENT)")
 
+        // Branch tracks which path we took so the post-send state
+        // transition can honor python's per-method semantics
+        // (LXMessage.py:498-512): small-packet sets state=SENT
+        // immediately because the packet has been transmitted (the
+        // delivery proof later advances to DELIVERED); resource path
+        // leaves state at SENDING because the resource is still being
+        // transferred and `__mark_delivered` (LXMessage.py:556-566)
+        // fires on `__resource_concluded` COMPLETE.
+        let usedResourcePath: Bool
         // Send based on message size
         if packed.count <= LXMFConstants.LINK_PACKET_MAX_CONTENT {
             // Small enough for link DATA packet
@@ -355,6 +364,7 @@ extension LXMRouter {
                 messageHash: message.hash,
                 transport: transport
             )
+            usedResourcePath = false
         } else {
             // Need Resource for large message
             directSendLogger.info("Message too large for link packet (\(packed.count) > \(LXMFConstants.LINK_PACKET_MAX_CONTENT)), using Resource transfer")
@@ -378,11 +388,32 @@ extension LXMRouter {
                 directSendLogger.info("Registered resource \(resHashHex) → message \(msgHashHex) for delivery confirmation")
                 pendingResourceDeliveries[resHash] = msgHash
             }
+            usedResourcePath = true
         }
 
-        // Mark as sent
-        message.state = .sent
-        directSendLogger.info("Message marked sent for dest=\(destHashHex)")
+        // Post-send state transition (python LXMessage.py:498-512).
+        //
+        // Small-packet path: the packet has been transmitted; state=
+        // SENT now and `handleDeliveryProofReceived` advances to
+        // DELIVERED when proof arrives. Same as PROPAGATED small-packet
+        // (LXMRouter+Propagation.swift's `sendPropagated` post-
+        // waitForPacketProof state flip).
+        //
+        // Resource path: state stays at .sending — the resource is
+        // still being transferred. `handleResourceTransferComplete` →
+        // `handleDeliveryProofReceived` advances to .delivered on
+        // RESOURCE_PRF; `handleOutboundResourceFailed` re-enqueues
+        // with state=.outbound on resource conclusion failure. The
+        // matching DB persistence policy in `processOutbound`'s
+        // DIRECT branch writes `.outbound` (NOT `.sending`) for the
+        // resource-path case so a crash between this return and the
+        // resource conclusion re-enqueues the message on next launch.
+        if !usedResourcePath {
+            message.state = .sent
+            directSendLogger.info("Message marked sent for dest=\(destHashHex) (small-packet path)")
+        } else {
+            directSendLogger.info("Message left at .sending for dest=\(destHashHex) (resource path; awaiting RESOURCE_PRF)")
+        }
 
         // Notify delegate
         notifyUpdate(message)
