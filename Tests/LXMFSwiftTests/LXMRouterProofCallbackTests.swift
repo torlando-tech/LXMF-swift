@@ -1199,6 +1199,87 @@ final class LXMRouterProofCallbackTests: XCTestCase {
         XCTAssertEqual(recorded.first?.hash, msg.hash)
     }
 
+    /// FIFO ordering: when two propagated sends are concurrently
+    /// in-flight (FIFO=[A, B] in submission order), the first arriving
+    /// `ERROR_INVALID_STAMP` signal must attribute to A (the oldest)
+    /// because the propagation node evaluates uploaded messages'
+    /// stamps in arrival order. A LIFO pop (`popLast`) would
+    /// mis-attribute to B, causing the wrong message to be marked
+    /// `.rejected` while A continues retrying.
+    /// PR #7 round 6 — greptile flagged the original LIFO `popLast`.
+    func testHandlePropagationSignalingPacketAttributesFIFO() async throws {
+        let router = try await makeRouter()
+
+        let srcIdentity = Identity()
+        let destA = Data((0..<16).map { _ in UInt8.random(in: 0...255) })
+        var msgA = LXMessage(
+            destinationHash: destA,
+            sourceIdentity: srcIdentity,
+            content: Data("first-in-flight".utf8),
+            title: Data(),
+            fields: nil,
+            desiredMethod: .propagated
+        )
+        _ = try msgA.pack()
+        try await router.testSaveMessage(msgA)
+
+        let destB = Data((0..<16).map { _ in UInt8.random(in: 0...255) })
+        var msgB = LXMessage(
+            destinationHash: destB,
+            sourceIdentity: srcIdentity,
+            content: Data("second-in-flight".utf8),
+            title: Data(),
+            fields: nil,
+            desiredMethod: .propagated
+        )
+        _ = try msgB.pack()
+        try await router.testSaveMessage(msgB)
+
+        await router.testAppendPendingPropagationSends(msgA.hash)
+        await router.testAppendPendingPropagationSends(msgB.hash)
+        await router.testAppendPendingOutbound(msgA)
+        await router.testAppendPendingOutbound(msgB)
+
+        let recorder = await MainActor.run { FailureRecorder() }
+        await router.setDelegate(recorder)
+
+        let signal = packLXMF(.array([.uint(UInt64(PropagationConstants.ERROR_INVALID_STAMP))]))
+        await router.handlePropagationSignalingPacket(signal)
+
+        // FIFO: oldest (A) is consumed; B remains in-flight.
+        let queueLen = await router.testPendingPropagationSendsCount
+        XCTAssertEqual(queueLen, 1,
+            "FIFO pop must drain only the oldest hash; B should still be in-flight.")
+
+        let aInRejections = await router.testPendingPropagationRejectionsContains(msgA.hash)
+        let bInRejections = await router.testPendingPropagationRejectionsContains(msgB.hash)
+        XCTAssertTrue(aInRejections,
+            "First arriving ERROR_INVALID_STAMP must attribute to the FIRST (oldest) " +
+            "in-flight send (A), not the most-recent. LIFO popLast would put B here, " +
+            "which is the bug greptile flagged.")
+        XCTAssertFalse(bInRejections,
+            "B must NOT be in the rejections set — A was the first in-flight.")
+
+        let stateA = await router.testPendingOutboundState(forHash: msgA.hash)
+        let stateB = await router.testPendingOutboundState(forHash: msgB.hash)
+        XCTAssertEqual(stateA, .rejected,
+            "A's pendingOutbound slot must be flipped to `.rejected`.")
+        XCTAssertNotEqual(stateB, .rejected,
+            "B's slot must remain unchanged — only A's stamp was rejected.")
+
+        let finalAState = try await waitForMessageState(
+            router, messageHash: msgA.hash, expected: .rejected
+        )
+        XCTAssertEqual(finalAState, .rejected, "A's DB row must be `.rejected`.")
+
+        try await Task.sleep(nanoseconds: 100_000_000)
+        let recorded = await MainActor.run { recorder.failures }
+        XCTAssertEqual(recorded.count, 1,
+            "Delegate must receive exactly one didFailMessage callback (for A).")
+        XCTAssertEqual(recorded.first?.hash, msgA.hash,
+            "didFailMessage must fire with A's hash, not B's.")
+    }
+
     /// Defensive: signal arrives with no in-flight send. Must no-op
     /// (no DB mutation, no delegate call, no crash). Mirrors python's
     /// behavior when `packet.link.for_lxmessage` isn't set — the

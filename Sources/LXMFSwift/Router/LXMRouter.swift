@@ -149,8 +149,12 @@ public actor LXMRouter {
     ///
     /// FIFO of message hashes survives both async windows because it's
     /// actor-isolated state mutated outside the per-send `var msg`
-    /// copy lifecycle. The handler pops the most-recent hash, looks it
-    /// up by HASH (stable across async boundaries) in `pendingOutbound`
+    /// copy lifecycle. The handler pops the OLDEST hash (FIFO
+    /// `removeFirst`, not LIFO `popLast`) because the propagation
+    /// node evaluates uploaded messages' stamps in arrival order —
+    /// so the first ERROR_INVALID_STAMP signal corresponds to the
+    /// first (oldest) in-flight send. Looks the popped hash up by
+    /// HASH (stable across async boundaries) in `pendingOutbound`
     /// AND falls through to a DB-only update when the message has
     /// already been removed (resource path), so neither path silently
     /// drops the rejection.

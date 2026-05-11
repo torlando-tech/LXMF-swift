@@ -240,6 +240,21 @@ extension LXMRouter {
                 // flips state back to OUTBOUND so processOutbound can retry.
                 // Previously the swift port marked .sent unconditionally,
                 // which was a silent ack of failure.
+                //
+                // Defensive: drain any rejections entry for this hash
+                // before the retry path fires. If a stamp-rejection
+                // signal landed during the proof wait, the rejection
+                // check above (line ~226) would have consumed the
+                // entry and thrown `.rejected` — so reaching this
+                // branch implies rejections doesn't have us. But if
+                // the code is ever restructured (e.g. proof wait
+                // moves into a throwing-style API), a stale entry
+                // could survive past this point and falsely reject
+                // the next retry that re-pushes the same hash.
+                // Greptile (PR #7 round 6) called out this defense-
+                // in-depth gap; cheap to close and prevents
+                // future regressions.
+                pendingPropagationRejections.remove(inFlightHash)
                 message.state = .outbound
                 notifyUpdate(message)
                 throw LXMFError.propagationFailed("propagation link-packet proof timeout")
@@ -474,13 +489,19 @@ extension LXMRouter {
                 // because reticulum-swift's Link doesn't expose a
                 // mutable per-link user-data slot we can attach an
                 // LXMessage ref to. We approximate with a FIFO keyed on
-                // message hash; FIFO + actor isolation gives us LIFO
-                // matching that's "the most-recently-started send" —
-                // the same semantics python achieves via the back-pointer.
-                guard let inFlightHash = pendingPropagationSends.popLast() else {
+                // message hash, popped FIFO (oldest first) to match the
+                // propagation node's stamp-evaluation order: the PN
+                // evaluates uploads in arrival order, so the first
+                // rejection signal corresponds to the first (oldest)
+                // in-flight send. Greptile (PR #7 round 6) caught an
+                // earlier `popLast()` here — LIFO semantics that would
+                // mis-attribute the rejection to the most-recent send
+                // when two propagated messages are concurrently in-flight.
+                guard !pendingPropagationSends.isEmpty else {
                     propLogger.warning("[PROP_SIGNAL] ERROR_INVALID_STAMP received but pendingPropagationSends is empty")
                     return
                 }
+                let inFlightHash = pendingPropagationSends.removeFirst()
                 // Mark in the rejections set so the small-packet branch
                 // of `sendPropagated`, when it resumes from
                 // `waitForPacketProof`, observes the rejection and
