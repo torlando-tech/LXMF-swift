@@ -269,6 +269,76 @@ an in-process link→message map), both fields can collapse into
 a single direct lookup, mirroring python more faithfully. Until
 then the FIFO + rejections set is the path-of-least-divergence.
 
+**Sub-deviation (`pendingPropagationRejections` short-circuit in
+`handleOutboundResourceFailed`, PR #7 round 5):** when the
+propagation node sends `ERROR_INVALID_STAMP` mid-resource-upload,
+the signal handler sets `.rejected` synchronously, then the
+resource transfer concludes with `.failed` (the PN tore down the
+link). `handleOutboundResourceFailed`'s default propagation
+branch would overwrite the DB row with `.outbound` and re-enqueue
+the message for retry — which is wrong, because the stamp config
+is config-driven and the same rejection will repeat for every
+retry until `MAX_DELIVERY_ATTEMPTS`, each time firing
+`didFailMessage` and spamming any UI listener.
+
+The new short-circuit (`Sources/LXMFSwift/Router/LXMRouter.swift`,
+inside `handleOutboundResourceFailed` at the
+`else if wasPropagation && pendingPropagationRejections.contains(messageHash)`
+branch) routes the conclusion through the terminal path with
+`newState = .rejected` (preserving the signal handler's DB write)
+AND suppresses the duplicate delegate notify in the terminal
+block (the signal handler already fired
+`didFailMessage(.stampValidationFailed)`, which is more accurate
+than the resource-failure path's
+`"resource transfer rejected by peer"` reason).
+
+**Python reference:** `LXMF/LXMessage.py:603-609` —
+```
+def __propagation_resource_concluded(self, resource):
+    if resource.status == RNS.Resource.COMPLETE:
+        self.__mark_propagated()
+    else:
+        if self.state != LXMessage.CANCELLED:
+            resource.link.teardown()
+            self.state = LXMessage.OUTBOUND
+```
+
+Python's guard checks `state != CANCELLED`, not `!= REJECTED` —
+which means python's resource conclusion DOES overwrite REJECTED
+with OUTBOUND when called after `cancel_outbound(REJECTED)`. The
+reason python doesn't observe a retry-spam bug from this is
+that python's `pending_outbound` removal happens through a
+different mechanism: when the next `process_outbound` tick sees
+`state == REJECTED` (LXMRouter.py:2552-2556) it removes the
+LXMessage from the queue and fires the failed callback. By the
+time the resource callback fires (post-teardown, async), the
+LXMessage is no longer in `pending_outbound`; the late
+`state = OUTBOUND` assignment lands on a dangling object
+reference and is a no-op.
+
+**Swift port has no such detachment.**
+`handleOutboundResourceFailed` is the swift accommodation that
+**reloads the message from the DB and re-appends to
+`pendingOutbound`** (documented under "processOutbound
+optimistic queue removal + handleOutboundResourceFailed
+re-enqueue" earlier in this file). That swift-specific reload
+turns python's harmless late assignment into an actively
+harmful retry loop, which this sub-deviation prevents.
+
+**Reason:** Category (a) — language/runtime accommodation
+required because swift's DB-driven re-enqueue mechanism makes
+visible what python's reference-detachment hides. The
+`pendingPropagationRejections` check restores observable
+end-of-line semantics for stamp-rejected propagated resources,
+matching what python's user-visible behavior is (one failure
+notification, no retry spam).
+
+**Re-sync note:** if the long-term refactor of `processOutbound`
+to a python-style state-driven keep-in-queue model (see the
+"Re-sync note" under "processOutbound optimistic queue removal"
+above) lands, the swift-specific re-enqueue path goes away and
+this sub-deviation can be deleted along with it.
+
 ### `lxmfDelivery` — broadcast-echo-only self-echo gate
 
 **Site:** `Sources/LXMFSwift/Router/LXMRouter.swift` — `lxmfDelivery(_:method:)`,

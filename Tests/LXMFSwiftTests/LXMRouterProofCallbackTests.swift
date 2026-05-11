@@ -404,6 +404,98 @@ final class LXMRouterProofCallbackTests: XCTestCase {
         }
     }
 
+    /// Stamp-rejection short-circuit: when the propagation node sent
+    /// `ERROR_INVALID_STAMP` mid-resource-upload, the signal handler
+    /// has already set `.rejected` in the DB and added the hash to
+    /// `pendingPropagationRejections`. The subsequent resource
+    /// conclusion (typically `.failed` from the link teardown) must
+    /// route through the terminal path with `.rejected` preserved —
+    /// NOT re-enqueue the message for retry, since the stamp config
+    /// won't change and every retry would re-trigger the same
+    /// rejection, spamming the delegate. And the duplicate
+    /// `didFailMessage` must be suppressed (the signal handler
+    /// already fired it with `.stampValidationFailed`).
+    /// Python ref: `LXMessage.py:603-609` only guards against
+    /// `state != CANCELLED`; swift needs this stronger guard because
+    /// `handleOutboundResourceFailed` reloads from the DB and
+    /// re-appends to `pendingOutbound` (a swift-specific
+    /// accommodation already documented in port-deviations.md).
+    func testOutboundResourceFailedShortCircuitsAfterStampRejection() async throws {
+        let router = try await makeRouter()
+
+        let srcIdentity = Identity()
+        let destHash = Data((0..<16).map { _ in UInt8.random(in: 0...255) })
+        var msg = LXMessage(
+            destinationHash: destHash,
+            sourceIdentity: srcIdentity,
+            content: Data("stamp-rejected-then-resource-fails".utf8),
+            title: Data(),
+            fields: nil,
+            desiredMethod: .propagated
+        )
+        _ = try msg.pack()
+        try await router.testSaveMessage(msg)
+
+        // Simulate post-signal state: DB already at .rejected (signal
+        // handler wrote it), hash in pendingPropagationRejections,
+        // resource maps still seeded (the resource was in-flight when
+        // the signal arrived; conclusion fires after teardown).
+        try await router.testUpdateMessageState(id: msg.hash, state: .rejected)
+        await router.testInsertPendingPropagationRejection(msg.hash)
+        let resourceHash = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
+        await router.setPendingResourceDelivery(resourceHash: resourceHash, messageHash: msg.hash)
+        await router.markPendingPropagationResource(resourceHash: resourceHash)
+
+        let recorder = await MainActor.run { FailureRecorder() }
+        await router.setDelegate(recorder)
+
+        // Resource conclusion fires with .failed (typical post-stamp-
+        // rejection outcome — PN tore down the link).
+        await router.handleOutboundResourceFailed(
+            resourceHash: resourceHash, resourceState: .failed
+        )
+
+        // DB state must remain `.rejected` — the default propagation
+        // branch would have overwritten with `.outbound`.
+        let finalState = try await waitForMessageState(
+            router, messageHash: msg.hash, expected: .rejected
+        )
+        XCTAssertEqual(finalState, .rejected,
+            "Stamp-rejected message must retain `.rejected` in the DB. " +
+            "Got \(String(describing: finalState)).")
+
+        // Must NOT have been re-enqueued.
+        let pendingHashes = await router.pendingOutbound.map { $0.hash }
+        XCTAssertFalse(pendingHashes.contains(msg.hash),
+            "Stamp-rejected message must NOT be re-enqueued for retry " +
+            "(would cause infinite stamp-rejection loop until " +
+            "MAX_DELIVERY_ATTEMPTS).")
+
+        // Rejection-set entry must be drained.
+        let stillInRejections = await router.testPendingPropagationRejectionsContains(msg.hash)
+        XCTAssertFalse(stillInRejections,
+            "Rejection-set entry must be drained after the resource " +
+            "conclusion consumed it; otherwise the set leaks across " +
+            "send attempts.")
+
+        // Resource maps must be cleared (existing invariant).
+        let afterProp = await router.pendingPropagationResources.count
+        let afterDeliveries = await router.pendingResourceDeliveries.count
+        XCTAssertEqual(afterProp, 0, "pendingPropagationResources must be reclaimed.")
+        XCTAssertEqual(afterDeliveries, 0, "pendingResourceDeliveries must be reclaimed.")
+
+        // Delegate must NOT receive a second notify — the signal
+        // handler is responsible for the user-visible notification
+        // with the accurate `.stampValidationFailed` reason. The
+        // resource conclusion is a follow-on internal event.
+        try await Task.sleep(nanoseconds: 100_000_000)
+        let recorded = await MainActor.run { recorder.failures }
+        XCTAssertEqual(recorded.count, 0,
+            "Resource conclusion after stamp rejection must NOT fire " +
+            "a duplicate didFailMessage — the signal handler already " +
+            "notified the delegate with .stampValidationFailed.")
+    }
+
     func testOutboundResourceFailedSkipsReenqueueForCancelledPropagation() async throws {
         // PROPAGATED path with resourceState=.cancelled → terminal,
         // NOT retried. Python `__propagation_resource_concluded`
@@ -1128,6 +1220,23 @@ extension LXMRouter {
 
     fileprivate func testPendingOutboundState(forHash hash: Data) -> LXMessageState? {
         pendingOutbound.first(where: { $0.hash == hash })?.state
+    }
+
+    /// Seed a hash into `pendingPropagationRejections` — models the
+    /// post-signal-handler state where the signal landed but the
+    /// resource conclusion hasn't fired yet. Used by tests that
+    /// exercise the stamp-rejection short-circuit in
+    /// `handleOutboundResourceFailed`.
+    fileprivate func testInsertPendingPropagationRejection(_ hash: Data) {
+        pendingPropagationRejections.insert(hash)
+    }
+
+    /// Test-only DB state writer — mirrors what the signal handler
+    /// does when it persists `.rejected`. Lets the resource-failure
+    /// short-circuit test start from a realistic post-signal DB state
+    /// without spinning up the real signal-handler path.
+    fileprivate func testUpdateMessageState(id: Data, state: LXMessageState) async throws {
+        try await database.updateMessageState(id: id, state: state)
     }
 }
 

@@ -1070,6 +1070,11 @@ public actor LXMRouter {
         // peer-cancelled transfer.
         let newState: LXMessageState
         let isTerminal: Bool
+        // Tracks whether the signal handler has already fired
+        // `didFailMessage` for this hash (via the
+        // `pendingPropagationRejections` short-circuit branch below).
+        // The terminal block uses this to suppress a duplicate notify.
+        var alreadyNotifiedBySignalHandler = false
         if resourceState == .cancelled {
             // Python: state stays whatever the sender already set it
             // to (typically CANCELLED if the sender cancelled, or some
@@ -1078,6 +1083,49 @@ public actor LXMRouter {
             newState = .cancelled
             isTerminal = true
             routerLogger.info("Outbound resource \(resHex, privacy: .public) → message \(msgHex, privacy: .public) cancelled; terminal (no retry per python LXMessage.py:598/607)")
+        } else if wasPropagation && pendingPropagationRejections.contains(messageHash) {
+            // Stamp-rejected PROPAGATED resource: the propagation node
+            // already sent `ERROR_INVALID_STAMP` over the link's packet
+            // callback, `handlePropagationSignalingPacket` has set
+            // `.rejected` in the DB AND fired `didFailMessage`. The
+            // resource transfer is now concluding (typically `.failed`
+            // because the PN dropped the connection or the link is
+            // tearing down) — without this guard we'd overwrite the
+            // DB row with `.outbound` and re-enqueue for retry, which:
+            //   (a) burns retry attempts on a stamp config that won't
+            //       change (the PN's `outbound_propagation_node` cost
+            //       is config-driven; the same stamp will be rejected
+            //       again next attempt), and
+            //   (b) fires repeated `didFailMessage` notifications,
+            //       spamming any UI consumer that listens for delivery
+            //       failures.
+            //
+            // Python ref: `LXMessage.py:603-609` only guards against
+            // `state != CANCELLED`, so python's resource-conclusion
+            // would actually clobber `REJECTED` with `OUTBOUND` —
+            // but python's `pending_outbound.remove` (LXMRouter.py:
+            // 2552-2556 REJECTED check) detaches the LXMessage from the
+            // outbound queue before the resource callback fires, so
+            // the late `state = OUTBOUND` write is a no-op on a
+            // dangling object reference. Swift's port has no such
+            // detachment: `handleOutboundResourceFailed` reloads the
+            // message from the DB and re-appends to `pendingOutbound`
+            // (see "PROPAGATED resource path re-enqueue mechanism" in
+            // port-deviations.md), so the `.outbound` write actually
+            // takes effect. This rejection-set check restores the
+            // equivalent terminal-state semantics.
+            //
+            // `isTerminal = true` routes to the terminal block below,
+            // but we suppress the duplicate `didFailMessage` notify
+            // there (the signal handler already fired it with
+            // `.stampValidationFailed`, which is the more accurate
+            // reason than the resource-failure path's
+            // "resource transfer rejected by peer").
+            newState = .rejected
+            isTerminal = true
+            alreadyNotifiedBySignalHandler = true
+            pendingPropagationRejections.remove(messageHash)
+            routerLogger.info("Outbound PROPAGATED resource \(resHex, privacy: .public) → message \(msgHex, privacy: .public) concluded \(String(describing: resourceState)) AFTER stamp rejection; terminal (.rejected), skipping re-enqueue")
         } else if wasPropagation {
             // Python LXMessage.py:607-609: any non-complete (and not
             // cancelled, handled above) → state=OUTBOUND for retry.
@@ -1163,7 +1211,20 @@ public actor LXMRouter {
                 // isTerminal=true above.
                 reason = .invalidStateTransition(from: .sending, to: newState)
             }
-            if let terminalMsg = try? await database.getMessage(id: messageHash) {
+            if alreadyNotifiedBySignalHandler {
+                // `handlePropagationSignalingPacket` already fired
+                // `didFailMessage` with the more accurate
+                // `.stampValidationFailed` reason when the
+                // ERROR_INVALID_STAMP signal arrived. The resource is
+                // only concluding now (likely `.failed` from the link
+                // teardown that follows a stamp rejection); firing a
+                // second `didFailMessage` here would double-notify any
+                // UI consumer. Skip the notify but keep the
+                // terminal-state DB write above and the early return
+                // below so the message stays out of the re-enqueue
+                // path.
+                routerLogger.debug("\(msgHex, privacy: .public) terminal (.rejected) via stamp rejection; signal handler already notified delegate")
+            } else if let terminalMsg = try? await database.getMessage(id: messageHash) {
                 notifyFailure(terminalMsg, reason: reason)
             } else {
                 routerLogger.warning("\(msgHex, privacy: .public) terminal (\(String(describing: newState))) but DB lookup failed; delegate notify skipped")
