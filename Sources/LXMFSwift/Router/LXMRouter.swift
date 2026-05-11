@@ -540,6 +540,28 @@ public actor LXMRouter {
                 continue
             }
 
+            // Check if message rejected (terminal — mirrors python
+            // LXMRouter.py:2552-2556: `state == REJECTED` removes
+            // from `pending_outbound` and fires the failed callback).
+            // The most common source is
+            // `handlePropagationSignalingPacket` setting `.rejected`
+            // on an ERROR_INVALID_STAMP from the propagation node;
+            // `handleOutboundResourceFailed` also sets `.rejected`
+            // on a DIRECT-path resource REJECTED conclusion
+            // (LXMessage.py:597). Without this guard the rejected
+            // message would fall into the per-method `switch` below
+            // and burn the retry budget on a known-terminal message.
+            //
+            // notifyFailure is intentionally NOT called here: the
+            // signal handler / resource handler that set `.rejected`
+            // is responsible for delegate notification (it has the
+            // failure reason context — stampValidationFailed vs
+            // resource REJECTED — that `processOutbound` does not).
+            if pendingOutbound[i].state == .rejected {
+                indicesToRemove.insert(i)
+                continue
+            }
+
             // Check if message has been pending too long (prevents crash loops from stuck messages)
             let messageAge = Date().timeIntervalSince1970 - pendingOutbound[i].timestamp
             if messageAge > Self.MAX_OUTBOUND_AGE {
