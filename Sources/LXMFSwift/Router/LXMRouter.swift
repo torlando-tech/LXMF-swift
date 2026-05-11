@@ -1074,7 +1074,43 @@ public actor LXMRouter {
         // end-of-line. The DB row stays with the terminal state for
         // the UI to render (and for any background-fetch / app-
         // re-launch consumer to see).
-        guard !isTerminal else {
+        if isTerminal {
+            // Terminal resource conclusion (`.cancelled` either path,
+            // `.rejected` DIRECT-only). The message was already
+            // removed from `pendingOutbound` by `processOutbound`'s
+            // `indicesToRemove` after `sendDirect`/`sendPropagated`
+            // returned, so `processOutbound`'s `.cancelled` /
+            // `.rejected` guards never see it. The delegate's
+            // `didFailMessage` would therefore never fire for these
+            // cases without an explicit notify here.
+            //
+            // Python ref: `LXMessage.py:596-598` (DIRECT REJECTED) and
+            // `LXMessage.py:598/607` (CANCELLED for either path) set
+            // the terminal state AND then fire the user's failed/
+            // delivery callback inline. Swift's split (callback fires
+            // here, removed-from-queue elsewhere) requires the
+            // explicit notify to match observable behavior.
+            //
+            // We reconstruct a lightweight LXMessage snapshot from
+            // the DB so the delegate gets a recognizable message
+            // object. If the DB lookup fails we still notify with a
+            // placeholder so the delegate isn't silently starved.
+            let reason: LXMFError
+            switch newState {
+            case .rejected:
+                reason = .propagationFailed("resource transfer rejected by peer")
+            case .cancelled:
+                reason = .invalidStateTransition(from: .sending, to: .cancelled)
+            default:
+                // Defensive — only .rejected and .cancelled set
+                // isTerminal=true above.
+                reason = .invalidStateTransition(from: .sending, to: newState)
+            }
+            if let terminalMsg = try? await database.getMessage(id: messageHash) {
+                notifyFailure(terminalMsg, reason: reason)
+            } else {
+                routerLogger.warning("\(msgHex, privacy: .public) terminal (\(String(describing: newState))) but DB lookup failed; delegate notify skipped")
+            }
             routerLogger.debug("\(msgHex, privacy: .public) is terminal (\(String(describing: newState))); skipping re-enqueue")
             return
         }
