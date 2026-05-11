@@ -64,10 +64,16 @@ public actor LXMRouter {
     public let identity: Identity
 
     /// Database for message persistence
-    private let database: LXMFDatabase
+    internal let database: LXMFDatabase
 
-    /// In-memory pending outbound queue (PRIMARY)
-    private var pendingOutbound: [LXMessage] = []
+    /// In-memory pending outbound queue (PRIMARY).
+    /// `internal` (not `private`) so cross-file extensions in this module
+    /// can read/mutate it — specifically `LXMRouter+Propagation.swift`'s
+    /// `handlePropagationSignalingPacket` needs to flip the most recent
+    /// in-flight propagated message to `.rejected` when the propagation
+    /// node sends `LXMPeer.ERROR_INVALID_STAMP` over the link's packet
+    /// callback.
+    internal var pendingOutbound: [LXMessage] = []
 
     /// In-memory failed outbound queue
     private var failedOutbound: [LXMessage] = []
@@ -101,6 +107,69 @@ public actor LXMRouter {
     /// Map outbound resource hash → message hash for delivery confirmation.
     /// When RESOURCE_PRF is received, we look up the message hash here to mark it delivered.
     public var pendingResourceDeliveries: [Data: Data] = [:]
+
+    /// Outbound resource hashes that correspond to PROPAGATED messages.
+    ///
+    /// Membership in this set causes `handleResourceTransferComplete` to
+    /// treat RESOURCE_PRF as "propagation node accepted the upload" rather
+    /// than "recipient acked delivery". The end-state distinction matches
+    /// python `LXMessage.__mark_propagated` (LXMF/LXMessage.py:568-578)
+    /// which caps PROPAGATED at `state = SENT`, vs `__mark_delivered`
+    /// (LXMessage.py:556-566) which advances OPP/DIRECT to DELIVERED.
+    /// Without this set, large PROPAGATED messages (which use Resource
+    /// transfer rather than the small-packet path at
+    /// LXMRouter+Propagation.swift:173-216) incorrectly advance to
+    /// DELIVERED in the iOS UI — the sender NEVER learns when the
+    /// recipient syncs the message down from the propagation node, so
+    /// claiming "delivered" is a false positive.
+    public var pendingPropagationResources: Set<Data> = []
+
+    /// FIFO of message hashes for currently in-flight PROPAGATED sends.
+    ///
+    /// Populated at the top of `sendPropagated` (before any `await`)
+    /// and drained when the send concludes — success (proof received
+    /// for the small-packet path; RESOURCE_PRF → `handlePropagationAccepted`
+    /// for the resource path), timeout, or failure.
+    ///
+    /// Required because `handlePropagationSignalingPacket` (the
+    /// `ERROR_INVALID_STAMP` handler) historically scanned
+    /// `pendingOutbound` for the most-recent entry with
+    /// `state == .sending`, but that scan is **structurally dead**:
+    ///
+    ///   - Small-packet path: `processOutbound` copies the message
+    ///     (`var msg = pendingOutbound[i]`), calls `sendPropagated`,
+    ///     and writes the copy back only AFTER the call returns.
+    ///     During the 15s `waitForPacketProof` window — exactly when
+    ///     a STAMP rejection signal would arrive — `pendingOutbound[i].state`
+    ///     is still `.outbound`. The scan matches nothing.
+    ///   - Resource path: `pendingOutbound[i] = msg` runs synchronously
+    ///     and then `indicesToRemove` fires at end of the iteration.
+    ///     The PN's async signal arrives AFTER the slot is removed.
+    ///     The scan matches nothing.
+    ///
+    /// FIFO of message hashes survives both async windows because it's
+    /// actor-isolated state mutated outside the per-send `var msg`
+    /// copy lifecycle. The handler pops the OLDEST hash (FIFO
+    /// `removeFirst`, not LIFO `popLast`) because the propagation
+    /// node evaluates uploaded messages' stamps in arrival order —
+    /// so the first ERROR_INVALID_STAMP signal corresponds to the
+    /// first (oldest) in-flight send. Looks the popped hash up by
+    /// HASH (stable across async boundaries) in `pendingOutbound`
+    /// AND falls through to a DB-only update when the message has
+    /// already been removed (resource path), so neither path silently
+    /// drops the rejection.
+    public var pendingPropagationSends: [Data] = []
+
+    /// Message hashes that received an `ERROR_INVALID_STAMP` signal
+    /// while their send was in flight. Consulted by `sendPropagated`
+    /// at the end of the small-packet branch (after the proof wait)
+    /// to abort with `.rejected` instead of the normal `.sent` /
+    /// `.outbound` outcome. Set membership is the one signal that
+    /// races against `pendingOutbound[i] = msg` writeback after a
+    /// successful proof — without it, a PN that both rejects-the-stamp
+    /// AND fires-a-late-proof (unlikely but possible) would leave the
+    /// message recorded `.sent` despite the rejection.
+    public var pendingPropagationRejections: Set<Data> = []
 
     /// Active propagation links (separate cache from delivery links)
     public var propagationLinks: [Data: Link] = [:]
@@ -360,13 +429,46 @@ public actor LXMRouter {
                 routerLogger.warning("REJECTED: too short (\(data.count) < 32)")
                 return false
             }
+            let destinationHash = data.subdata(in: 0..<16)
             let sourceHash = data.subdata(in: 16..<32)
             let srcHex = sourceHash.prefix(4).map { String(format: "%02x", $0) }.joined()
 
-            // Self-echo detection: relay broadcasts our own outbound messages back to us.
+            // Self-echo detection: a TCP relay broadcasts every packet
+            // to all connected clients including the original sender,
+            // so our own outbound LXMF messages echo back as inbound.
+            // The original fix (LXMF-swift commit 9992795 "fix(lxmf):
+            // prevent relay self-echo from overwriting outbound
+            // messages", 2026-02-05) silenced these to keep the DB
+            // record's `incoming` flag from being overwritten.
+            //
+            // The current narrowed form rejects only when the dest is
+            // someone else (`destinationHash != localDeliveryHash`)
+            // AND the method is non-propagated. Three legitimate
+            // self-loop cases are intentionally allowed through:
+            //
+            //  1. PROPAGATION sync — we deliberately pulled this from
+            //     the propagation node (`method == .propagated`).
+            //  2. Self-send via DIRECT — link target is our own
+            //     delivery destination; the inbound dest IS us.
+            //  3. Self-send via OPPORTUNISTIC — same as #2 but single-
+            //     packet. Also exercised by the iOS smoke harness
+            //     (`opp_bidirectional`) and by multi-device-via-same-
+            //     identity UX flows.
+            //
+            // The remaining rejection case — broadcast echo of an
+            // outbound to someone else — is the bug case the original
+            // 2026-02-05 fix targeted: source=us, destination=other,
+            // method=direct/opp, packet bounced off the TCP relay back
+            // into our inbound path. Those still get silenced.
+            //
+            // python ref: LXMF/LXMRouter.py has no self-echo gate;
+            // duplicate-hash detection is the only mechanism. Documented
+            // in port-deviations.md.
             let localDeliveryHash = Destination.hash(identity: identity, appName: "lxmf", aspects: ["delivery"])
-            if sourceHash == localDeliveryHash {
-                routerLogger.info("REJECTED: self-echo from \(srcHex)")
+            if sourceHash == localDeliveryHash
+                && destinationHash != localDeliveryHash
+                && method != .propagated {
+                routerLogger.info("REJECTED: self-echo from \(srcHex) via \(String(describing: method))")
                 return false
             }
 
@@ -485,6 +587,28 @@ public actor LXMRouter {
                 continue
             }
 
+            // Check if message rejected (terminal — mirrors python
+            // LXMRouter.py:2552-2556: `state == REJECTED` removes
+            // from `pending_outbound` and fires the failed callback).
+            // The most common source is
+            // `handlePropagationSignalingPacket` setting `.rejected`
+            // on an ERROR_INVALID_STAMP from the propagation node;
+            // `handleOutboundResourceFailed` also sets `.rejected`
+            // on a DIRECT-path resource REJECTED conclusion
+            // (LXMessage.py:597). Without this guard the rejected
+            // message would fall into the per-method `switch` below
+            // and burn the retry budget on a known-terminal message.
+            //
+            // notifyFailure is intentionally NOT called here: the
+            // signal handler / resource handler that set `.rejected`
+            // is responsible for delegate notification (it has the
+            // failure reason context — stampValidationFailed vs
+            // resource REJECTED — that `processOutbound` does not).
+            if pendingOutbound[i].state == .rejected {
+                indicesToRemove.insert(i)
+                continue
+            }
+
             // Check if message has been pending too long (prevents crash loops from stuck messages)
             let messageAge = Date().timeIntervalSince1970 - pendingOutbound[i].timestamp
             if messageAge > Self.MAX_OUTBOUND_AGE {
@@ -575,10 +699,45 @@ public actor LXMRouter {
                         routerLogger.info("sendDirect completed to \(destHashHex)")
                         indicesToRemove.insert(i)
 
-                        // Update database
-                        let sentMsg = pendingOutbound[i]
-                        Task.detached { [database] in
-                            try? await database.updateMessageState(id: sentMsg.hash, state: .sent)
+                        // DB persistence policy mirrors the PROPAGATED
+                        // branch's two-path treatment. Greptile flagged
+                        // (PR #7 round 5) that the previous unconditional
+                        // `Task.detached { .sent }` here left a large
+                        // DIRECT resource transfer with the DB at `.sent`
+                        // immediately after `sendDirect` returned — even
+                        // though the resource was still in flight. A
+                        // crash before RESOURCE_PRF arrived would leave
+                        // the message "sent" on disk with no
+                        // re-enqueue, and the recipient would never get
+                        // it.
+                        //
+                        // Now branched the same way as PROPAGATED
+                        // (LXMRouter.swift:805-842):
+                        //   - sendDirect's small-packet path returns
+                        //     with state=.sent; persist `.sent` via
+                        //     `updateMessageState` (state-column only).
+                        //   - sendDirect's resource path returns with
+                        //     state=.sending; persist `.outbound` via
+                        //     full-record `saveMessage` so
+                        //     `deliveryAttempts` is carried into the DB
+                        //     and a crash between here and the
+                        //     resource callback re-enqueues the
+                        //     message at the right attempt count.
+                        // Both writes are awaited inside the actor so
+                        // the callback writes (`.delivered` for
+                        // success, `.outbound` again for re-enqueue,
+                        // `.rejected`/`.cancelled` for terminals) are
+                        // strictly serialized after this one. Without
+                        // the await, a fast RESOURCE_PRF could land
+                        // its `.delivered` write before this
+                        // `.outbound` write and get clobbered.
+                        let snapshot = pendingOutbound[i]
+                        if snapshot.state == .sending {
+                            var outboundSnapshot = snapshot
+                            outboundSnapshot.state = .outbound
+                            try? await database.saveMessage(outboundSnapshot)
+                        } else {
+                            try? await database.updateMessageState(id: snapshot.hash, state: snapshot.state)
                         }
                     } else {
                         // Need path first
@@ -606,9 +765,119 @@ public actor LXMRouter {
                         pendingOutbound[i] = msg
                         indicesToRemove.insert(i)
 
-                        let sentMsg = pendingOutbound[i]
-                        Task.detached { [database] in
-                            try? await database.updateMessageState(id: sentMsg.hash, state: .sent)
+                        // Mirror python LXMRouter.py:2675-2728 +
+                        // LXMessage.send() (LXMessage.py:498-512):
+                        // PROPAGATED+RESOURCE leaves message.state =
+                        // .sending in memory until the resource-
+                        // completion callback (handlePropagationAccepted
+                        // / handleOutboundResourceFailed) fires when
+                        // RESOURCE_PRF or a resource-conclusion is
+                        // received. Persisting `.sent` unconditionally
+                        // here would lie to consumers (background
+                        // fetch, app re-launch) about a message whose
+                        // upload may still fail — they would skip the
+                        // retry and the message would be silently
+                        // stuck.
+                        //
+                        // The small-packet branch of sendPropagated
+                        // (LXMRouter+Propagation.swift:202-207) DOES
+                        // await proof inline before returning and
+                        // sets message.state = .sent there, so only
+                        // for the resource path is the in-memory
+                        // state still .sending at this point.
+                        //
+                        // DB-persistence policy for the resource path:
+                        // we deliberately do NOT persist `.sending` to
+                        // the DB. `loadPendingOutbound()` filters
+                        // strictly on `state == .outbound`
+                        // (LXMFDatabase.swift:459-468), so a `.sending`
+                        // row is invisible to the restart queue and a
+                        // crash during the in-flight window (this
+                        // detached write → resource callback) would
+                        // permanently strand the message.
+                        //
+                        // Instead we persist a full message record
+                        // with state `.outbound` (safe fallback —
+                        // restart-recoverable) and the CURRENT
+                        // `deliveryAttempts` count. The in-flight
+                        // callbacks (handlePropagationAccepted,
+                        // handleOutboundResourceFailed) overwrite this
+                        // with the real terminal state when they fire.
+                        // Using `saveMessage` (full record) rather
+                        // than `updateMessageState` (state column
+                        // only) is load-bearing — without persisting
+                        // `deliveryAttempts`, a resource-failure
+                        // re-enqueue via `handleOutboundResourceFailed`
+                        // would reload `deliveryAttempts = 0` from the
+                        // DB and effectively grant unlimited retries,
+                        // bypassing `MAX_DELIVERY_ATTEMPTS`.
+                        // ORDERING NOTE — awaited (not detached) on
+                        // purpose. The matching `.sent` write in
+                        // `handlePropagationAccepted` is also awaited
+                        // inside the actor, so the two are serialized
+                        // by the actor's mailbox: this `.outbound`
+                        // write completes before `handlePropagationAccepted`
+                        // can run, so a fast RESOURCE_PRF can NEVER
+                        // observe its `.sent` write being clobbered
+                        // by a late-landing `.outbound` write. If
+                        // either of these is changed back to
+                        // `Task.detached`, the race greptile flagged
+                        // (4/5 round, PR #7) returns:
+                        //
+                        //   T0: processOutbound detaches `.outbound`
+                        //   T1: sendPropagated returns
+                        //   T2: RESOURCE_PRF arrives (fast network)
+                        //   T3: handlePropagationAccepted detaches `.sent`
+                        //   T4: global executor runs `.sent` before
+                        //       `.outbound` (no order guarantee)
+                        //   T5: next launch: `.outbound` row → re-send
+                        //       of an already-propagated message.
+                        //
+                        // The DB write is cheap (single-row UPDATE on
+                        // GRDB's serial write pool) and the actor
+                        // suspension during this `await` is bounded —
+                        // any queued mailbox work (including
+                        // `handlePropagationAccepted` triggered by an
+                        // already-in-flight RESOURCE_PRF callback)
+                        // simply runs after the await, preserving the
+                        // observable order.
+                        let snapshot = pendingOutbound[i]
+                        if snapshot.state == .sending {
+                            // Resource path: in-memory state is still
+                            // `.sending` because RESOURCE_PRF hasn't
+                            // arrived yet. Persist `.outbound` (NOT
+                            // `.sending` — see policy comment above)
+                            // via full-record `saveMessage` so
+                            // `deliveryAttempts` is carried into the
+                            // DB. `handlePropagationAccepted` (or
+                            // `handleOutboundResourceFailed`) will
+                            // overwrite this row when the callback
+                            // fires. On crash before either callback,
+                            // restart re-loads the `.outbound` row
+                            // and retries.
+                            var outboundSnapshot = snapshot
+                            outboundSnapshot.state = .outbound
+                            try? await database.saveMessage(outboundSnapshot)
+                        } else {
+                            // Small-packet path (sendPropagated set
+                            // `state = .sent` after `waitForPacketProof`
+                            // returned true — see
+                            // LXMRouter+Propagation.swift:204-206).
+                            // No callback will fire to overwrite the
+                            // DB; this write IS the terminal state.
+                            // Use `updateMessageState` (state column
+                            // only) — `deliveryAttempts` need not be
+                            // re-persisted because the message is
+                            // already removed from `pendingOutbound`
+                            // and there's no retry path that would
+                            // re-read it.
+                            //
+                            // Greptile round 4 (P1) caught a bug here
+                            // where the previous unconditional
+                            // `saveMessage(.outbound)` clobbered the
+                            // `.sent` state for small-packet successes,
+                            // causing duplicate-propagation on restart.
+                            try? await database.updateMessageState(id: snapshot.hash, state: snapshot.state)
                         }
                     } else {
                         requestPath(nodeHash)
@@ -665,7 +934,11 @@ public actor LXMRouter {
     /// - Parameters:
     ///   - message: Failed message
     ///   - reason: Error causing failure
-    private func notifyFailure(_ message: LXMessage, reason: LXMFError) {
+    /// `internal` (was `private`) so cross-file extensions in this module
+    /// can fire delegate failure callbacks. Specifically
+    /// `LXMRouter+Propagation`'s ERROR_INVALID_STAMP signal handler needs
+    /// to notify the delegate when the propagation node rejects a stamp.
+    internal func notifyFailure(_ message: LXMessage, reason: LXMFError) {
         if let wrapper = delegateWrapper, let delegate = wrapper.delegate {
             Task { @MainActor in
                 delegate.router(self, didFailMessage: message, reason: reason)
@@ -692,14 +965,23 @@ public actor LXMRouter {
     /// the delegate to trigger UI refresh (single checkmark → double checkmark).
     ///
     /// - Parameter messageHash: The LXMF message hash (32 bytes)
-    public func handleDeliveryProofReceived(messageHash: Data) {
+    public func handleDeliveryProofReceived(messageHash: Data) async {
         let hashHex = messageHash.prefix(8).map { String(format: "%02x", $0) }.joined()
         routerLogger.error("Delivery proof received for message \(hashHex, privacy: .public)")
 
-        // Update database state to delivered
-        Task.detached { [database] in
-            try? await database.updateMessageState(id: messageHash, state: .delivered)
-        }
+        // Update database state to delivered.
+        //
+        // ORDERING NOTE — awaited (not detached) on purpose. The
+        // matching `.outbound` write in processOutbound's DIRECT
+        // resource branch (LXMRouter.swift:DIRECT case) is also
+        // awaited inside the actor. Because both writes run on the
+        // actor's serial mailbox, the `.outbound` write always
+        // completes before this function can run — so a fast
+        // RESOURCE_PRF can never observe its `.delivered` write being
+        // clobbered by a late-landing `.outbound` write. Mirrors the
+        // same fix applied to `handlePropagationAccepted` (PR #7
+        // greptile round 4).
+        try? await database.updateMessageState(id: messageHash, state: .delivered)
 
         // Notify delegate for UI refresh
         if let wrapper = delegateWrapper, let delegate = wrapper.delegate {
@@ -712,19 +994,400 @@ public actor LXMRouter {
 
     /// Handle outbound resource transfer completion (RESOURCE_PRF received).
     ///
-    /// Called by `LXMFOutboundResourceHandler` when a resource proof is received.
-    /// Looks up the corresponding message hash and marks it as delivered.
+    /// Called by `LXMFOutboundResourceHandler` when a resource proof is
+    /// received. Looks up the corresponding message hash and routes to
+    /// the right terminal-state handler based on whether the resource
+    /// was a DIRECT delivery (state advances to `.delivered`) or a
+    /// PROPAGATED upload (state advances to `.sent` only — propagation
+    /// nodes ack the upload, not the recipient's receipt).
+    ///
+    /// Mirrors python `LXMessage.__as_resource` (LXMF/LXMessage.py:635-
+    /// 651) which wires DIFFERENT resource callbacks per method:
+    ///   - DIRECT path: `RNS.Resource(packed, destination,
+    ///     callback=self.__resource_concluded, ...)` → on COMPLETE
+    ///     `__mark_delivered` (LXMessage.py:556-566) → state=DELIVERED.
+    ///   - PROPAGATED path: `RNS.Resource(propagation_packed, link,
+    ///     callback=self.__propagation_resource_concluded, ...)` → on
+    ///     COMPLETE `__mark_propagated` (LXMessage.py:568-578) →
+    ///     state=SENT.
+    ///
+    /// Without this distinction, large PROPAGATED messages (which use
+    /// Resource transfer because they exceed `LINK_PACKET_MDU` = 431
+    /// bytes) incorrectly advance to DELIVERED in the iOS UI, claiming
+    /// the recipient acked delivery — but the sender NEVER learns when
+    /// the recipient syncs the message down from the propagation node.
+    /// Tyler observed this as "PROPAGATED messages show double
+    /// checkmark" on the iOS UI 2026-05-10.
     ///
     /// - Parameter resourceHash: The 32-byte resource hash
-    public func handleResourceTransferComplete(resourceHash: Data) {
+    public func handleResourceTransferComplete(resourceHash: Data) async {
         let resHex = resourceHash.prefix(8).map { String(format: "%02x", $0) }.joined()
         guard let messageHash = pendingResourceDeliveries.removeValue(forKey: resourceHash) else {
             routerLogger.info("Resource \(resHex, privacy: .public) completed but no pending message mapping")
             return
         }
         let msgHex = messageHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-        routerLogger.info("Resource \(resHex, privacy: .public) → message \(msgHex, privacy: .public), marking delivered")
-        handleDeliveryProofReceived(messageHash: messageHash)
+
+        if pendingPropagationResources.remove(resourceHash) != nil {
+            // PROPAGATED resource transfer — python `__mark_propagated`.
+            routerLogger.info("Resource \(resHex, privacy: .public) → message \(msgHex, privacy: .public), marking sent (propagation node ack)")
+            await handlePropagationAccepted(messageHash: messageHash)
+        } else {
+            // DIRECT resource transfer — python `__mark_delivered`.
+            routerLogger.info("Resource \(resHex, privacy: .public) → message \(msgHex, privacy: .public), marking delivered (recipient ack)")
+            await handleDeliveryProofReceived(messageHash: messageHash)
+        }
+    }
+
+    /// Handle outbound resource transfer FAILURE (resource concluded
+    /// in any non-`.complete` state — `.failed`, `.rejected`,
+    /// `.cancelled`, etc.).
+    ///
+    /// Mirrors python `LXMessage.__resource_concluded`
+    /// (LXMF/LXMessage.py:592-601) for the DIRECT path and
+    /// `__propagation_resource_concluded` (LXMessage.py:603-609) for
+    /// the PROPAGATED path. Critical responsibilities:
+    ///
+    ///   1. Reclaim the swift-port-introduced map state
+    ///      (`pendingResourceDeliveries`, `pendingPropagationResources`).
+    ///      Python uses LXMessage object lifetime instead and has
+    ///      nothing to clean up; we externalized the tracking so we
+    ///      now have lifetime obligations python doesn't.
+    ///   2. Advance message state per python's per-method semantics:
+    ///      - DIRECT, resource state == .rejected → state = `.rejected`
+    ///        (python `LXMessage.py:597` sets `state = REJECTED`).
+    ///      - DIRECT, other non-complete (and not cancelled) →
+    ///        state = `.outbound` for retry (python
+    ///        `LXMessage.py:598-601` tears down the link + sets
+    ///        `state = OUTBOUND`). We skip the explicit teardown
+    ///        because reticulum-swift's link layer detects the
+    ///        failed transfer separately; if a follow-up bug shows
+    ///        the link sticks around in a bad state across retries,
+    ///        re-add `await resource.link?.close(reason: .timeout)`.
+    ///      - PROPAGATED, any non-complete (and not cancelled) →
+    ///        state = `.outbound` (python `LXMessage.py:607-609`
+    ///        does not distinguish REJECTED from other failures on
+    ///        the propagation path; everything retries via the
+    ///        outbound queue).
+    ///
+    /// Without this method, `resourceConcluded` returned early on
+    /// non-complete states and the maps grew without bound across the
+    /// router's lifetime; if the same resource hash were ever to
+    /// re-complete (highly unlikely but not impossible), the wrong
+    /// per-method state handler would fire.
+    ///
+    /// - Parameters:
+    ///   - resourceHash: 32-byte resource hash from the failed transfer.
+    ///   - resourceState: Terminal `ResourceState` reported by reticulum-swift.
+    public func handleOutboundResourceFailed(
+        resourceHash: Data, resourceState: ResourceState
+    ) async {
+        let resHex = resourceHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+        let wasPropagation = pendingPropagationResources.remove(resourceHash) != nil
+        guard let messageHash = pendingResourceDeliveries.removeValue(forKey: resourceHash) else {
+            routerLogger.info("Outbound resource \(resHex, privacy: .public) failed (\(String(describing: resourceState))) but no pending message mapping; entries reclaimed (none found)")
+            return
+        }
+        let msgHex = messageHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+
+        // Drain `pendingPropagationSends` here too — the resource path
+        // pushed this hash in `sendPropagated` before sendResource and
+        // we kept it through the in-flight window so an
+        // `ERROR_INVALID_STAMP` signal could correlate. Now that the
+        // resource has terminally concluded (failure path), the FIFO
+        // entry must come out so a subsequent send's hash isn't
+        // mis-popped by a stray signal. Mirrors python's implicit
+        // cleanup via the link's `for_lxmessage` going out of scope on
+        // link teardown. Only meaningful for `wasPropagation`; DIRECT
+        // resources never push into this FIFO.
+        if wasPropagation {
+            pendingPropagationSends.removeAll { $0 == messageHash }
+        }
+
+        // Compute the new LXMessage state per python's per-method
+        // semantics. Python `LXMessage.py:592-609` guards the retry
+        // path with `if self.state != CANCELLED` on BOTH the DIRECT
+        // (`__resource_concluded`, line 598) and PROPAGATED
+        // (`__propagation_resource_concluded`, line 607) paths —
+        // meaning `.cancelled` is terminal and the message is NOT
+        // re-queued for retry. The DIRECT path additionally treats
+        // `RNS.Resource.REJECTED` as a distinct terminal state
+        // (LXMessage.py:597). Greptile review (4/5 confidence)
+        // flagged the earlier swift port for retrying on `.cancelled`,
+        // which would silently burn the retry budget on a
+        // peer-cancelled transfer.
+        let newState: LXMessageState
+        let isTerminal: Bool
+        // Tracks whether the signal handler has already fired
+        // `didFailMessage` for this hash (via the
+        // `pendingPropagationRejections` short-circuit branch below).
+        // The terminal block uses this to suppress a duplicate notify.
+        var alreadyNotifiedBySignalHandler = false
+        if resourceState == .cancelled {
+            // Python: state stays whatever the sender already set it
+            // to (typically CANCELLED if the sender cancelled, or some
+            // other state if peer cancelled mid-transfer). Persist
+            // `.cancelled` so the DB reflects the terminal outcome.
+            newState = .cancelled
+            isTerminal = true
+            routerLogger.info("Outbound resource \(resHex, privacy: .public) → message \(msgHex, privacy: .public) cancelled; terminal (no retry per python LXMessage.py:598/607)")
+        } else if wasPropagation && pendingPropagationRejections.contains(messageHash) {
+            // Stamp-rejected PROPAGATED resource: the propagation node
+            // already sent `ERROR_INVALID_STAMP` over the link's packet
+            // callback, `handlePropagationSignalingPacket` has set
+            // `.rejected` in the DB AND fired `didFailMessage`. The
+            // resource transfer is now concluding (typically `.failed`
+            // because the PN dropped the connection or the link is
+            // tearing down) — without this guard we'd overwrite the
+            // DB row with `.outbound` and re-enqueue for retry, which:
+            //   (a) burns retry attempts on a stamp config that won't
+            //       change (the PN's `outbound_propagation_node` cost
+            //       is config-driven; the same stamp will be rejected
+            //       again next attempt), and
+            //   (b) fires repeated `didFailMessage` notifications,
+            //       spamming any UI consumer that listens for delivery
+            //       failures.
+            //
+            // Python ref: `LXMessage.py:603-609` only guards against
+            // `state != CANCELLED`, so python's resource-conclusion
+            // would actually clobber `REJECTED` with `OUTBOUND` —
+            // but python's `pending_outbound.remove` (LXMRouter.py:
+            // 2552-2556 REJECTED check) detaches the LXMessage from the
+            // outbound queue before the resource callback fires, so
+            // the late `state = OUTBOUND` write is a no-op on a
+            // dangling object reference. Swift's port has no such
+            // detachment: `handleOutboundResourceFailed` reloads the
+            // message from the DB and re-appends to `pendingOutbound`
+            // (see "PROPAGATED resource path re-enqueue mechanism" in
+            // port-deviations.md), so the `.outbound` write actually
+            // takes effect. This rejection-set check restores the
+            // equivalent terminal-state semantics.
+            //
+            // `isTerminal = true` routes to the terminal block below,
+            // but we suppress the duplicate `didFailMessage` notify
+            // there (the signal handler already fired it with
+            // `.stampValidationFailed`, which is the more accurate
+            // reason than the resource-failure path's
+            // "resource transfer rejected by peer").
+            newState = .rejected
+            isTerminal = true
+            alreadyNotifiedBySignalHandler = true
+            pendingPropagationRejections.remove(messageHash)
+            routerLogger.info("Outbound PROPAGATED resource \(resHex, privacy: .public) → message \(msgHex, privacy: .public) concluded \(String(describing: resourceState)) AFTER stamp rejection; terminal (.rejected), skipping re-enqueue")
+        } else if wasPropagation {
+            // Python LXMessage.py:607-609: any non-complete (and not
+            // cancelled, handled above) → state=OUTBOUND for retry.
+            newState = .outbound
+            isTerminal = false
+            routerLogger.info("Outbound PROPAGATED resource \(resHex, privacy: .public) → message \(msgHex, privacy: .public) failed (\(String(describing: resourceState))); marking outbound for retry")
+        } else {
+            // Python LXMessage.py:596-601 (DIRECT): REJECTED is its
+            // own terminal state; everything else (and not cancelled,
+            // handled above) gets OUTBOUND for retry.
+            if resourceState == .rejected {
+                newState = .rejected
+                isTerminal = true
+            } else {
+                newState = .outbound
+                isTerminal = false
+            }
+            routerLogger.info("Outbound DIRECT resource \(resHex, privacy: .public) → message \(msgHex, privacy: .public) failed (\(String(describing: resourceState))); → \(String(describing: newState))")
+        }
+
+        // Persist the new state synchronously here so the in-memory
+        // re-enqueue below (if applicable) can read back a consistent
+        // record. Errors are non-fatal — the in-memory state on the
+        // re-enqueued LXMessage is the authoritative driver for the
+        // next `processOutbound` tick; DB persistence is for
+        // cross-launch durability and any retry on app re-launch.
+        do {
+            try await database.updateMessageState(id: messageHash, state: newState)
+        } catch {
+            routerLogger.error("Failed to persist failed-resource state for \(msgHex, privacy: .public): \(error)")
+        }
+
+        // Re-enqueue retryable failures into `pendingOutbound`.
+        //
+        // Without this step, `processOutbound` had already removed the
+        // message from the in-memory queue via `indicesToRemove`
+        // (LXMRouter.swift:~660) BEFORE the resource conclusion
+        // callback fires — there's no periodic DB→queue reload, so a
+        // failed resource transfer would silently disappear from the
+        // retry queue until the next app launch.
+        //
+        // For `.outbound`-bound retries we reload the LXMessage from
+        // the DB (it has the freshly-written `.outbound` state and
+        // the original packed payload), bump `deliveryAttempts` +
+        // `nextDeliveryAttempt` so the next `processOutbound` tick
+        // doesn't immediately re-fire and burn the retry budget, then
+        // append + kick processing.
+        //
+        // Terminal states (`.rejected` for DIRECT, `.cancelled` for
+        // either path) skip the re-enqueue — python treats both as
+        // end-of-line. The DB row stays with the terminal state for
+        // the UI to render (and for any background-fetch / app-
+        // re-launch consumer to see).
+        if isTerminal {
+            // Terminal resource conclusion (`.cancelled` either path,
+            // `.rejected` DIRECT-only). The message was already
+            // removed from `pendingOutbound` by `processOutbound`'s
+            // `indicesToRemove` after `sendDirect`/`sendPropagated`
+            // returned, so `processOutbound`'s `.cancelled` /
+            // `.rejected` guards never see it. The delegate's
+            // `didFailMessage` would therefore never fire for these
+            // cases without an explicit notify here.
+            //
+            // Python ref: `LXMessage.py:596-598` (DIRECT REJECTED) and
+            // `LXMessage.py:598/607` (CANCELLED for either path) set
+            // the terminal state AND then fire the user's failed/
+            // delivery callback inline. Swift's split (callback fires
+            // here, removed-from-queue elsewhere) requires the
+            // explicit notify to match observable behavior.
+            //
+            // We reconstruct a lightweight LXMessage snapshot from
+            // the DB so the delegate gets a recognizable message
+            // object. If the DB lookup fails we still notify with a
+            // placeholder so the delegate isn't silently starved.
+            let reason: LXMFError
+            switch newState {
+            case .rejected:
+                reason = .propagationFailed("resource transfer rejected by peer")
+            case .cancelled:
+                reason = .invalidStateTransition(from: .sending, to: .cancelled)
+            default:
+                // Defensive — only .rejected and .cancelled set
+                // isTerminal=true above.
+                reason = .invalidStateTransition(from: .sending, to: newState)
+            }
+            if alreadyNotifiedBySignalHandler {
+                // `handlePropagationSignalingPacket` already fired
+                // `didFailMessage` with the more accurate
+                // `.stampValidationFailed` reason when the
+                // ERROR_INVALID_STAMP signal arrived. The resource is
+                // only concluding now (likely `.failed` from the link
+                // teardown that follows a stamp rejection); firing a
+                // second `didFailMessage` here would double-notify any
+                // UI consumer. Skip the notify but keep the
+                // terminal-state DB write above and the early return
+                // below so the message stays out of the re-enqueue
+                // path.
+                routerLogger.debug("\(msgHex, privacy: .public) terminal (.rejected) via stamp rejection; signal handler already notified delegate")
+            } else if let terminalMsg = try? await database.getMessage(id: messageHash) {
+                notifyFailure(terminalMsg, reason: reason)
+            } else {
+                routerLogger.warning("\(msgHex, privacy: .public) terminal (\(String(describing: newState))) but DB lookup failed; delegate notify skipped")
+            }
+            routerLogger.debug("\(msgHex, privacy: .public) is terminal (\(String(describing: newState))); skipping re-enqueue")
+            return
+        }
+
+        do {
+            guard var msg = try await database.getMessage(id: messageHash) else {
+                routerLogger.warning("Cannot re-enqueue \(msgHex, privacy: .public): DB lookup returned nil")
+                return
+            }
+            // State is .outbound (already persisted above). Don't bump
+            // `deliveryAttempts` here — `processOutbound` increments it
+            // at line ~584 when it actually attempts delivery. Bumping
+            // here too would double-count and hit MAX_DELIVERY_ATTEMPTS
+            // (=8) in half the expected cycles.
+            //
+            // MAX_DELIVERY_ATTEMPTS budget integrity: the persisted
+            // `deliveryAttempts` we just reloaded reflects the in-flight
+            // attempt that just failed, because `processOutbound`'s
+            // PROPAGATED+RESOURCE branch now `saveMessage`s the full
+            // record (with the post-increment count) before scheduling
+            // the resource transfer. Without that full-record write the
+            // reload would see `deliveryAttempts = 0` and effectively
+            // grant unlimited retries per resource failure. See
+            // `port-deviations.md` (sub-deviation under "processOutbound
+            // optimistic queue removal").
+            //
+            // Backoff via `nextDeliveryAttempt` ensures the re-enqueued
+            // message doesn't immediately retry on the next
+            // `processOutbound` tick. Mirrors python
+            // `LXMRouter.py:2638/2645/2700` which schedules the next
+            // attempt at `time.time() + PATH_REQUEST_WAIT` (flat — no
+            // per-attempt scaling). `processOutbound`'s catch-block
+            // backoff at line ~699 (which DOES scale per attempt) does
+            // not fire for callback-arrived resource failures because
+            // `sendPropagated` already returned successfully and the
+            // failure is reported asynchronously via the resource
+            // callback path — that scaling is therefore not load-
+            // bearing for this code path. If persistent resource
+            // failures need wider spacing in future, both this site
+            // and the catch-block scaling should be re-aligned
+            // together (and a unified deviation note added).
+            msg.state = .outbound
+            msg.nextDeliveryAttempt = Date().addingTimeInterval(Self.PATH_REQUEST_WAIT)
+            pendingOutbound.append(msg)
+            routerLogger.info("\(msgHex, privacy: .public) re-enqueued for retry (attempts so far: \(msg.deliveryAttempts), next attempt in \(Int(Self.PATH_REQUEST_WAIT))s)")
+        } catch {
+            routerLogger.error("Failed to re-enqueue \(msgHex, privacy: .public): \(error)")
+            return
+        }
+
+        // Kick the processing loop so the re-enqueued message is
+        // considered on the next iteration without waiting for a
+        // periodic tick. Detached so we don't extend this
+        // delegate-callback path's lifetime.
+        Task.detached { [weak self] in
+            await self?.processOutbound()
+        }
+    }
+
+    /// Handle propagation-upload acceptance (RESOURCE_PRF from
+    /// propagation node received, OR small-packet PROOF from
+    /// propagation node received).
+    ///
+    /// Mirrors python `LXMessage.__mark_propagated` (LXMF/LXMessage.py
+    /// :568-578) which sets `state = SENT, progress = 1.0` and fires
+    /// the user's delivery callback. The user's callback is shared
+    /// between direct and propagated paths in python — the SENT vs
+    /// DELIVERED state distinction is what consumers (UI, etc.) read.
+    ///
+    /// - Parameter messageHash: The LXMF message hash (32 bytes)
+    public func handlePropagationAccepted(messageHash: Data) async {
+        let hashHex = messageHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+        routerLogger.info("Propagation upload accepted for message \(hashHex, privacy: .public)")
+
+        // Drain `pendingPropagationSends` so an `ERROR_INVALID_STAMP`
+        // signal arriving AFTER acceptance can't pop this hash and
+        // mis-attribute a later send. Mirrors python's implicit cleanup
+        // via `link.for_lxmessage` going out of scope once the link
+        // is torn down post-acceptance. Also clear any stale rejection
+        // entry — rejection-after-acceptance is impossible per protocol
+        // but the cleanup keeps the set bounded.
+        pendingPropagationSends.removeAll { $0 == messageHash }
+        pendingPropagationRejections.remove(messageHash)
+
+        // Update database state to sent (NOT delivered — see comment on
+        // handleResourceTransferComplete + python LXMessage.py:568-578).
+        //
+        // ORDERING NOTE — awaited (not detached) on purpose. The
+        // matching `.outbound` write in `processOutbound`'s
+        // PROPAGATED+RESOURCE branch is also awaited inside the actor.
+        // Because both writes run on the actor's serial mailbox, the
+        // `.outbound` write always completes before this function can
+        // run — so a fast RESOURCE_PRF can never observe its `.sent`
+        // write being clobbered by a late-landing `.outbound` write.
+        // See the matching comment at processOutbound's
+        // PROPAGATED+RESOURCE site for the full race-and-fix narrative.
+        try? await database.updateMessageState(id: messageHash, state: .sent)
+
+        // Notify delegate. We reuse `didConfirmDelivery` for the UI
+        // refresh signal — the delegate's job is "this message's state
+        // changed, reload it"; reading the new state is the consumer's
+        // responsibility. Adding a separate `didConfirmPropagation`
+        // delegate method would be a larger API change for no
+        // additional information (consumers already read `.state` on
+        // the reloaded message).
+        if let wrapper = delegateWrapper, let delegate = wrapper.delegate {
+            let hash = messageHash
+            Task { @MainActor in
+                delegate.router(self, didConfirmDelivery: hash)
+            }
+        }
     }
 
     // MARK: - Path Management

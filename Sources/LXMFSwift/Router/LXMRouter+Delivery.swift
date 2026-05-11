@@ -40,17 +40,31 @@ final class LXMFOutboundResourceHandler: ResourceCallbacks, @unchecked Sendable 
 
     func resourceConcluded(_ resource: Resource) async {
         let state = await resource.state
-        guard state == .complete else {
-            routerLogger.warning("Outbound resource concluded in state \(String(describing: state)), not complete")
-            return
-        }
         guard let resourceHash = await resource.hash else {
-            routerLogger.warning("Outbound resource concluded but no hash")
+            // No hash means we have no way to map back to the message.
+            // Without a hash there's also nothing in the maps to leak.
+            routerLogger.warning("Outbound resource concluded but no hash; map cleanup skipped (nothing to clean)")
             return
         }
         let resHex = resourceHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-        routerLogger.info("Outbound resource \(resHex) transfer confirmed by receiver")
-        await router.handleResourceTransferComplete(resourceHash: resourceHash)
+
+        if state == .complete {
+            routerLogger.info("Outbound resource \(resHex) transfer confirmed by receiver")
+            await router.handleResourceTransferComplete(resourceHash: resourceHash)
+        } else {
+            // Non-complete terminal state (.failed, .rejected, .cancelled,
+            // etc). Mirror python `LXMessage.__resource_concluded` /
+            // `__propagation_resource_concluded` (LXMF/LXMessage.py:592-609):
+            // unconditional dispatch on terminal state, branch by per-method
+            // semantics inside `handleOutboundResourceFailed`. Critically,
+            // the cleanup ALSO reclaims the swift-port-side map state
+            // (pendingResourceDeliveries + pendingPropagationResources)
+            // that the early-return predecessor leaked.
+            routerLogger.warning("Outbound resource \(resHex) concluded in non-complete state \(String(describing: state)); marking message for retry / failure per python parity")
+            await router.handleOutboundResourceFailed(
+                resourceHash: resourceHash, resourceState: state
+            )
+        }
     }
 }
 
@@ -97,17 +111,42 @@ extension LXMRouter {
             throw LXMFError.notPacked
         }
 
-        // Look up path entry for destination to get their public key
+        // Resolve recipient encryption material. For self-send (own
+        // delivery destinations), the path table has no entry — announces
+        // leave the device, they don't loop back into the local table —
+        // so we must check `deliveryDestinations` first. Mirrors python
+        // `RNS.Identity.recall(hash)`'s "is this hash local?" branch.
+        // Same pattern as `sendPropagated` — see LXMRouter+Propagation
+        // for the full python ref discussion.
         let destHex = message.destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-        guard let pathEntry = await pathTable.lookup(destinationHash: message.destinationHash) else {
-            throw LXMFError.destinationNotFound
+        let effectiveKey: Data
+        let pathRatchet: Data?
+        let publicKeysForHash: Data
+        if let localDest = deliveryDestinations[message.destinationHash]?.0,
+           let localIdentity = localDest.identity {
+            // Local destination: use its base key (no ratchet — that's
+            // a per-recipient announce concept and we are the recipient).
+            // `encryptionPublicKey` is a Curve25519 PublicKey type;
+            // `publicKeys` is the wire-format Data (concat of enc + sign
+            // public keys). For the HKDF salt and the SINGLE-destination
+            // encrypt below, we want the raw Data form.
+            effectiveKey = localIdentity.encryptionPublicKey.rawRepresentation
+            pathRatchet = nil
+            publicKeysForHash = localIdentity.publicKeys
+            routerLogger.debug("OPP self-send: resolving \(destHex) via local delivery destination")
+        } else {
+            guard let pathEntry = await pathTable.lookup(destinationHash: message.destinationHash) else {
+                throw LXMFError.destinationNotFound
+            }
+            // Get recipient's encryption public key (use ratchet if
+            // available, otherwise base key). When a destination announces
+            // with a ratchet, we MUST use the ratchet key for forward
+            // secrecy.
+            effectiveKey = pathEntry.effectiveEncryptionKey
+            pathRatchet = pathEntry.ratchet
+            publicKeysForHash = pathEntry.publicKeys
         }
-
-        // Get recipient's encryption public key (use ratchet if available, otherwise base key)
-        // When a destination announces with a ratchet, we MUST use the ratchet key for
-        // forward secrecy - the recipient will decrypt using their current ratchet private key.
-        let effectiveKey = pathEntry.effectiveEncryptionKey
-        let hasRatchet = pathEntry.ratchet != nil && pathEntry.ratchet!.count == 32
+        let hasRatchet = pathRatchet != nil && pathRatchet!.count == 32
         let keyHex = effectiveKey.prefix(8).map { String(format: "%02x", $0) }.joined()
         routerLogger.debug("Using encryption key[0:8]=\(keyHex), hasRatchet=\(hasRatchet)")
 
@@ -123,7 +162,7 @@ extension LXMRouter {
         // CRITICAL: Python RNS uses identity hash as HKDF salt, NOT destination hash!
         // Identity hash = SHA256(publicKeys)[:16]
         // This must match Python RNS Identity.get_salt() which returns self.hash
-        let identityHash = Hashing.truncatedHash(pathEntry.publicKeys)
+        let identityHash = Hashing.truncatedHash(publicKeysForHash)
         let identityHashHex = identityHash.prefix(8).map { String(format: "%02x", $0) }.joined()
         routerLogger.debug("Using identityHash[0:8]=\(identityHashHex) as HKDF salt")
 
@@ -239,19 +278,44 @@ extension LXMRouter {
             throw error
         }
 
-        // Identify ourselves to the remote peer so they can respond
-        do {
-            try await link.identify(identity: identity)
-            directSendLogger.info("identified to remote peer")
-        } catch {
-            directSendLogger.warning("identify failed (non-fatal): \(error)")
-        }
+        // DO NOT proactively identify on the DIRECT link.
+        //
+        // Python's LXMRouter does NOT identify-as-router on the
+        // outbound delivery link. The python identify call lives in
+        // `LXMRouter.py:2530-2540` ("backchannel identification") and
+        // happens *after* a message is delivered, using the SOURCE
+        // delivery destination's identity (not the router identity).
+        // The purpose: tell the recipient "you can reply to my
+        // delivery destination over this same link." Swift's
+        // `link.identify(identity: routerIdentity)` was identifying
+        // with the wrong identity AND at the wrong moment, which
+        // confused some receivers (echo bot in particular: smoke
+        // direct_echo failed with state=SENT but no echo back —
+        // tearing the link / mismatched identity context made the
+        // bot's `on_delivery` handler not fire).
+        //
+        // The PROPAGATED path made the same fix earlier (LXMRouter
+        // +Propagation.swift) referencing python LXMRouter.py:2682-2720.
+        //
+        // If a backchannel-identify becomes necessary for two-way
+        // direct chat (which the echo bot exercises), it should be
+        // a separate post-send step using the source delivery
+        // identity, mirroring python LXMRouter.py:2530-2540.
 
         // Update message state
         message.state = .sending
 
         directSendLogger.info("packed size=\(packed.count), LINK_PACKET_MAX=\(LXMFConstants.LINK_PACKET_MAX_CONTENT)")
 
+        // Branch tracks which path we took so the post-send state
+        // transition can honor python's per-method semantics
+        // (LXMessage.py:498-512): small-packet sets state=SENT
+        // immediately because the packet has been transmitted (the
+        // delivery proof later advances to DELIVERED); resource path
+        // leaves state at SENDING because the resource is still being
+        // transferred and `__mark_delivered` (LXMessage.py:556-566)
+        // fires on `__resource_concluded` COMPLETE.
+        let usedResourcePath: Bool
         // Send based on message size
         if packed.count <= LXMFConstants.LINK_PACKET_MAX_CONTENT {
             // Small enough for link DATA packet
@@ -297,10 +361,10 @@ extension LXMRouter {
 
             try await sendLinkDataWithProofCallback(
                 packet: packet,
-                destinationHash: destHash,
                 messageHash: message.hash,
                 transport: transport
             )
+            usedResourcePath = false
         } else {
             // Need Resource for large message
             directSendLogger.info("Message too large for link packet (\(packed.count) > \(LXMFConstants.LINK_PACKET_MAX_CONTENT)), using Resource transfer")
@@ -324,11 +388,32 @@ extension LXMRouter {
                 directSendLogger.info("Registered resource \(resHashHex) → message \(msgHashHex) for delivery confirmation")
                 pendingResourceDeliveries[resHash] = msgHash
             }
+            usedResourcePath = true
         }
 
-        // Mark as sent
-        message.state = .sent
-        directSendLogger.info("Message marked sent for dest=\(destHashHex)")
+        // Post-send state transition (python LXMessage.py:498-512).
+        //
+        // Small-packet path: the packet has been transmitted; state=
+        // SENT now and `handleDeliveryProofReceived` advances to
+        // DELIVERED when proof arrives. Same as PROPAGATED small-packet
+        // (LXMRouter+Propagation.swift's `sendPropagated` post-
+        // waitForPacketProof state flip).
+        //
+        // Resource path: state stays at .sending — the resource is
+        // still being transferred. `handleResourceTransferComplete` →
+        // `handleDeliveryProofReceived` advances to .delivered on
+        // RESOURCE_PRF; `handleOutboundResourceFailed` re-enqueues
+        // with state=.outbound on resource conclusion failure. The
+        // matching DB persistence policy in `processOutbound`'s
+        // DIRECT branch writes `.outbound` (NOT `.sending`) for the
+        // resource-path case so a crash between this return and the
+        // resource conclusion re-enqueues the message on next launch.
+        if !usedResourcePath {
+            message.state = .sent
+            directSendLogger.info("Message marked sent for dest=\(destHashHex) (small-packet path)")
+        } else {
+            directSendLogger.info("Message left at .sending for dest=\(destHashHex) (resource path; awaiting RESOURCE_PRF)")
+        }
 
         // Notify delegate
         notifyUpdate(message)
@@ -367,21 +452,29 @@ extension LXMRouter {
             deliveryLinks.removeValue(forKey: destinationHash)
         }
 
-        // Look up path entry to get recipient's public keys
-        guard let pathTable = self.pathTable else {
-            throw LXMFError.transportNotAvailable
-        }
-
-        guard let pathEntry = await pathTable.lookup(destinationHash: destinationHash) else {
-            throw LXMFError.destinationNotFound
-        }
-
-        // Create public-key-only Identity from path entry's public keys
+        // Resolve recipient identity. For self-send (own delivery
+        // destinations), the path table has no entry — announces leave
+        // the device, they don't loop back into the local table — so
+        // check `deliveryDestinations` first. Mirrors python
+        // `RNS.Identity.recall(hash)`. Same pattern as `sendPropagated`
+        // and `sendOpportunistic`.
         let recipientIdentity: Identity
-        do {
-            recipientIdentity = try Identity(publicKeyBytes: pathEntry.publicKeys)
-        } catch {
-            throw LXMFError.invalidMessageFormat("Invalid recipient public keys: \(error.localizedDescription)")
+        if let localDest = deliveryDestinations[destinationHash]?.0,
+           let localIdentity = localDest.identity {
+            recipientIdentity = localIdentity
+            routerLogger.debug("DIRECT self-link: resolving \(destHex) via local delivery destination")
+        } else {
+            guard let pathTable = self.pathTable else {
+                throw LXMFError.transportNotAvailable
+            }
+            guard let pathEntry = await pathTable.lookup(destinationHash: destinationHash) else {
+                throw LXMFError.destinationNotFound
+            }
+            do {
+                recipientIdentity = try Identity(publicKeyBytes: pathEntry.publicKeys)
+            } catch {
+                throw LXMFError.invalidMessageFormat("Invalid recipient public keys: \(error.localizedDescription)")
+            }
         }
 
         // Debug: print identity hash
@@ -531,10 +624,10 @@ extension LXMRouter {
     /// this block, but the logic itself is independent of link state.
     ///
     /// - Parameters:
-    ///   - packet: encrypted link DATA packet to send.
-    ///   - destinationHash: the recipient's destination hash (used by
-    ///     `transport.sendLinkData` for path-table HEADER_2 routing
-    ///     decisions; the packet itself is addressed to the linkId).
+    ///   - packet: encrypted link DATA packet to send. The packet is
+    ///     addressed to the linkId; `transport.sendLinkData` routes
+    ///     it to the link's pinned `attached_interface` per python
+    ///     `Transport.outbound` (RNS/Transport.py:1122-1130).
     ///   - messageHash: hash of the LXMessage; the proof callback
     ///     calls `handleDeliveryProofReceived(messageHash:)` with
     ///     this so the right outbound message advances to `.delivered`.
@@ -542,7 +635,6 @@ extension LXMRouter {
     ///     and send through.
     internal func sendLinkDataWithProofCallback(
         packet: Packet,
-        destinationHash: Data,
         messageHash: Data,
         transport: ReticulumTransport
     ) async throws {
@@ -551,7 +643,7 @@ extension LXMRouter {
             await self?.handleDeliveryProofReceived(messageHash: messageHash)
         }
         do {
-            try await transport.sendLinkData(packet: packet, destinationHash: destinationHash)
+            try await transport.sendLinkData(packet: packet)
         } catch {
             await transport.removeProofCallback(truncatedHash: packetTruncatedHash)
             throw error
