@@ -416,9 +416,20 @@ extension LXMRouter {
                         // implicit. Swift's separate in-memory queue +
                         // SQLite DB means we must write explicitly.
                         let msgHash = msg.hash
-                        Task.detached { [database] in
-                            try? await database.updateMessageState(id: msgHash, state: .rejected)
-                        }
+                        // ORDERING NOTE — awaited (not detached) on
+                        // purpose. The other PROPAGATED-path DB writes
+                        // (`.outbound` in processOutbound,
+                        // `.sent` in handlePropagationAccepted) are
+                        // also awaited inside the actor; a detached
+                        // write here would land on the global executor
+                        // outside the actor's mailbox and could
+                        // interleave with a subsequent `processOutbound`
+                        // tick or a fast `handlePropagationAccepted`,
+                        // leaving the DB in the wrong terminal state
+                        // (`.outbound` overwriting `.rejected`, or vice
+                        // versa). See port-deviations.md sub-deviation
+                        // "PROPAGATED resource path DB write ORDERING".
+                        try? await database.updateMessageState(id: msgHash, state: .rejected)
                         notifyFailure(msg, reason: .stampValidationFailed)
                         let hashHex = msg.hash.prefix(8).map { String(format: "%02x", $0) }.joined()
                         propLogger.error("[PROP_SIGNAL] cancelled outbound \(hashHex) as REJECTED (DB updated)")
