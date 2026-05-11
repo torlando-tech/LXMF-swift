@@ -737,9 +737,44 @@ public actor LXMRouter {
                         // already-in-flight RESOURCE_PRF callback)
                         // simply runs after the await, preserving the
                         // observable order.
-                        var snapshot = pendingOutbound[i]
-                        snapshot.state = .outbound
-                        try? await database.saveMessage(snapshot)
+                        let snapshot = pendingOutbound[i]
+                        if snapshot.state == .sending {
+                            // Resource path: in-memory state is still
+                            // `.sending` because RESOURCE_PRF hasn't
+                            // arrived yet. Persist `.outbound` (NOT
+                            // `.sending` — see policy comment above)
+                            // via full-record `saveMessage` so
+                            // `deliveryAttempts` is carried into the
+                            // DB. `handlePropagationAccepted` (or
+                            // `handleOutboundResourceFailed`) will
+                            // overwrite this row when the callback
+                            // fires. On crash before either callback,
+                            // restart re-loads the `.outbound` row
+                            // and retries.
+                            var outboundSnapshot = snapshot
+                            outboundSnapshot.state = .outbound
+                            try? await database.saveMessage(outboundSnapshot)
+                        } else {
+                            // Small-packet path (sendPropagated set
+                            // `state = .sent` after `waitForPacketProof`
+                            // returned true — see
+                            // LXMRouter+Propagation.swift:204-206).
+                            // No callback will fire to overwrite the
+                            // DB; this write IS the terminal state.
+                            // Use `updateMessageState` (state column
+                            // only) — `deliveryAttempts` need not be
+                            // re-persisted because the message is
+                            // already removed from `pendingOutbound`
+                            // and there's no retry path that would
+                            // re-read it.
+                            //
+                            // Greptile round 4 (P1) caught a bug here
+                            // where the previous unconditional
+                            // `saveMessage(.outbound)` clobbered the
+                            // `.sent` state for small-packet successes,
+                            // causing duplicate-propagation on restart.
+                            try? await database.updateMessageState(id: snapshot.hash, state: snapshot.state)
+                        }
                     } else {
                         requestPath(nodeHash)
                         pendingOutbound[i].nextDeliveryAttempt = Date().addingTimeInterval(Self.PATH_REQUEST_WAIT)
