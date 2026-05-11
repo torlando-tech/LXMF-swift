@@ -344,9 +344,18 @@ extension LXMRouter {
         // through the full LINK_TIMEOUT (30s) and retries indefinitely.
         //
         // This was the proximate cause of iOS issue #67.
+        // Note: closure captures `[weak self]` only — we do NOT
+        // capture `link` strongly. reticulum-swift's
+        // `Link.setPacketCallback` stores this closure on the Link
+        // actor itself (Link.swift:230-245), so a strong `link`
+        // capture would create a Link → closure → Link retain
+        // cycle and the Link would never deinit. `link` was a
+        // dead-parameter for `handlePropagationSignalingPacket`
+        // anyway (the body doesn't reference it), so dropping the
+        // capture is both cycle-safe and signature-cleaner.
         await link.setPacketCallback { [weak self] data, _ in
             guard let self = self else { return }
-            await self.handlePropagationSignalingPacket(data, link: link)
+            await self.handlePropagationSignalingPacket(data)
         }
 
         propLogger.error("[PROP_LINK] Link initiated, waiting for active state...")
@@ -377,7 +386,7 @@ extension LXMRouter {
     /// through this propagation node is the most likely target. We
     /// scan `pendingOutbound` for the topmost message that's
     /// `.propagated` AND `.sending` and reject that one.
-    func handlePropagationSignalingPacket(_ data: Data, link: Link) async {
+    func handlePropagationSignalingPacket(_ data: Data) async {
         do {
             let unpacked = try unpackLXMF(data)
             guard case .array(let elements) = unpacked,
