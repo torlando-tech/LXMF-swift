@@ -263,11 +263,30 @@ copy-modify-writeback queue pattern. Python's mechanism doesn't
 port directly. The pair of side-channel fields is the smallest
 correct alternative.
 
-**Re-sync note:** if reticulum-swift gains a public
-`Link.userInfo` / `Link.attachedObject` hook (or LXMF-swift gains
-an in-process link→message map), both fields can collapse into
-a single direct lookup, mirroring python more faithfully. Until
-then the FIFO + rejections set is the path-of-least-divergence.
+**Residual risk (acknowledged):** the FIFO is GLOBAL (one queue
+across all propagation node links). Two propagated messages in
+flight in the same `processOutbound` pass, combined with a
+stamp-rejection signal arriving >15s late (after the first
+message's `waitForPacketProof` timeout drained its hash) can
+mis-attribute the signal to the second message. Greptile-iterator
+round 7 surfaced this on 2026-05-10; expert-lxmf REJECTED the
+in-line mitigation as over-engineering for a low-exposure
+residual risk. Real fix tracked as follow-up.
+
+**Re-sync note:**
+  - Lower-cost swift-side fix (preferred, no upstream blocker):
+    scope the FIFO per-link by keying on `propagationLinks`
+    nodeHash. The signal handler already receives the packet
+    callback on a specific link; threading nodeHash through the
+    handler signature lets us pop only from THAT link's FIFO.
+    Reduces the mis-attribution window to "two messages in
+    flight to the SAME PN simultaneously."
+  - Full python parity (blocked upstream): if reticulum-swift
+    gains a public `Link.userInfo` / `Link.attachedObject` hook,
+    both fields can collapse into a single direct lookup,
+    mirroring python's `link.for_lxmessage` exactly. Until
+    then the global FIFO + rejections set is the
+    path-of-least-divergence in this PR's scope.
 
 **Sub-deviation (`pendingPropagationRejections` short-circuit in
 `handleOutboundResourceFailed`, PR #7 round 5):** when the
