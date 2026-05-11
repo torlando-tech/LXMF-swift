@@ -124,6 +124,49 @@ public actor LXMRouter {
     /// claiming "delivered" is a false positive.
     public var pendingPropagationResources: Set<Data> = []
 
+    /// FIFO of message hashes for currently in-flight PROPAGATED sends.
+    ///
+    /// Populated at the top of `sendPropagated` (before any `await`)
+    /// and drained when the send concludes — success (proof received
+    /// for the small-packet path; RESOURCE_PRF → `handlePropagationAccepted`
+    /// for the resource path), timeout, or failure.
+    ///
+    /// Required because `handlePropagationSignalingPacket` (the
+    /// `ERROR_INVALID_STAMP` handler) historically scanned
+    /// `pendingOutbound` for the most-recent entry with
+    /// `state == .sending`, but that scan is **structurally dead**:
+    ///
+    ///   - Small-packet path: `processOutbound` copies the message
+    ///     (`var msg = pendingOutbound[i]`), calls `sendPropagated`,
+    ///     and writes the copy back only AFTER the call returns.
+    ///     During the 15s `waitForPacketProof` window — exactly when
+    ///     a STAMP rejection signal would arrive — `pendingOutbound[i].state`
+    ///     is still `.outbound`. The scan matches nothing.
+    ///   - Resource path: `pendingOutbound[i] = msg` runs synchronously
+    ///     and then `indicesToRemove` fires at end of the iteration.
+    ///     The PN's async signal arrives AFTER the slot is removed.
+    ///     The scan matches nothing.
+    ///
+    /// FIFO of message hashes survives both async windows because it's
+    /// actor-isolated state mutated outside the per-send `var msg`
+    /// copy lifecycle. The handler pops the most-recent hash, looks it
+    /// up by HASH (stable across async boundaries) in `pendingOutbound`
+    /// AND falls through to a DB-only update when the message has
+    /// already been removed (resource path), so neither path silently
+    /// drops the rejection.
+    public var pendingPropagationSends: [Data] = []
+
+    /// Message hashes that received an `ERROR_INVALID_STAMP` signal
+    /// while their send was in flight. Consulted by `sendPropagated`
+    /// at the end of the small-packet branch (after the proof wait)
+    /// to abort with `.rejected` instead of the normal `.sent` /
+    /// `.outbound` outcome. Set membership is the one signal that
+    /// races against `pendingOutbound[i] = msg` writeback after a
+    /// successful proof — without it, a PN that both rejects-the-stamp
+    /// AND fires-a-late-proof (unlikely but possible) would leave the
+    /// message recorded `.sent` despite the rejection.
+    public var pendingPropagationRejections: Set<Data> = []
+
     /// Active propagation links (separate cache from delivery links)
     public var propagationLinks: [Data: Link] = [:]
 
@@ -999,6 +1042,20 @@ public actor LXMRouter {
         }
         let msgHex = messageHash.prefix(8).map { String(format: "%02x", $0) }.joined()
 
+        // Drain `pendingPropagationSends` here too — the resource path
+        // pushed this hash in `sendPropagated` before sendResource and
+        // we kept it through the in-flight window so an
+        // `ERROR_INVALID_STAMP` signal could correlate. Now that the
+        // resource has terminally concluded (failure path), the FIFO
+        // entry must come out so a subsequent send's hash isn't
+        // mis-popped by a stray signal. Mirrors python's implicit
+        // cleanup via the link's `for_lxmessage` going out of scope on
+        // link teardown. Only meaningful for `wasPropagation`; DIRECT
+        // resources never push into this FIFO.
+        if wasPropagation {
+            pendingPropagationSends.removeAll { $0 == messageHash }
+        }
+
         // Compute the new LXMessage state per python's per-method
         // semantics. Python `LXMessage.py:592-609` guards the retry
         // path with `if self.state != CANCELLED` on BOTH the DIRECT
@@ -1184,6 +1241,16 @@ public actor LXMRouter {
     public func handlePropagationAccepted(messageHash: Data) async {
         let hashHex = messageHash.prefix(8).map { String(format: "%02x", $0) }.joined()
         routerLogger.info("Propagation upload accepted for message \(hashHex, privacy: .public)")
+
+        // Drain `pendingPropagationSends` so an `ERROR_INVALID_STAMP`
+        // signal arriving AFTER acceptance can't pop this hash and
+        // mis-attribute a later send. Mirrors python's implicit cleanup
+        // via `link.for_lxmessage` going out of scope once the link
+        // is torn down post-acceptance. Also clear any stale rejection
+        // entry — rejection-after-acceptance is impossible per protocol
+        // but the cleanup keeps the set bounded.
+        pendingPropagationSends.removeAll { $0 == messageHash }
+        pendingPropagationRejections.remove(messageHash)
 
         // Update database state to sent (NOT delivered — see comment on
         // handleResourceTransferComplete + python LXMessage.py:568-578).

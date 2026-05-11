@@ -876,6 +876,171 @@ final class LXMRouterProofCallbackTests: XCTestCase {
     // (`direct_echo` / `propagated_echo` in Columba's phone harness)
     // until reticulum-swift exposes a public test-state hook.
 
+    // MARK: - Propagation signaling packet (ERROR_INVALID_STAMP)
+    //
+    // Regression coverage for the dead-code bug greptile flagged in
+    // PR #7: the old `handlePropagationSignalingPacket` scanned
+    // `pendingOutbound` for `state == .sending`, but that scan never
+    // matched on either path:
+    //   - Small-packet path: `processOutbound` writes the message back
+    //     into `pendingOutbound[i]` only AFTER `sendPropagated` returns,
+    //     so during the in-flight window `state` is still `.outbound`.
+    //   - Resource path: `pendingOutbound[i] = msg` writeback runs
+    //     synchronously then `indicesToRemove` removes the slot before
+    //     the async signal can arrive.
+    //
+    // Fix wires the in-flight hash through `pendingPropagationSends`
+    // (FIFO) at the top of `sendPropagated`, and the signal handler now
+    // pops + persists `.rejected` + flips the pendingOutbound slot (if
+    // still present). These tests pin the new behavior.
+
+    /// Small-packet-style scenario: the message is still in
+    /// `pendingOutbound` at `.outbound` (`processOutbound`'s post-call
+    /// writeback hasn't run yet) when the signal arrives. Handler must:
+    /// pop the hash from `pendingPropagationSends`, insert into
+    /// `pendingPropagationRejections`, persist `.rejected` to the DB,
+    /// flip the in-memory `pendingOutbound[i].state` to `.rejected`
+    /// (so `processOutbound`'s `.rejected` guard removes it on the
+    /// next tick without burning a retry slot), and fire
+    /// `didFailMessage` with `.stampValidationFailed`.
+    func testHandlePropagationSignalingPacketRejectsInFlightSmallPacket() async throws {
+        let router = try await makeRouter()
+
+        let srcIdentity = Identity()
+        let destHash = Data((0..<16).map { _ in UInt8.random(in: 0...255) })
+        var msg = LXMessage(
+            destinationHash: destHash,
+            sourceIdentity: srcIdentity,
+            content: Data("prop-stamp-rejected".utf8),
+            title: Data(),
+            fields: nil,
+            desiredMethod: .propagated
+        )
+        _ = try msg.pack()
+        try await router.testSaveMessage(msg)
+        await router.testAppendPendingOutbound(msg)
+        await router.testAppendPendingPropagationSends(msg.hash)
+
+        let recorder = await MainActor.run { FailureRecorder() }
+        await router.setDelegate(recorder)
+
+        // msgpack-encoded `[ERROR_INVALID_STAMP]` — same shape python's
+        // peer sends back when the stamp check fails (python ref:
+        // `LXMRouter.py:2131` — `msgpack.packb([LXMPeer.ERROR_INVALID_STAMP])`).
+        let signal = packLXMF(.array([.uint(UInt64(PropagationConstants.ERROR_INVALID_STAMP))]))
+        await router.handlePropagationSignalingPacket(signal)
+
+        let finalState = try await waitForMessageState(
+            router, messageHash: msg.hash, expected: .rejected
+        )
+        XCTAssertEqual(finalState, .rejected,
+            "Signal handler must persist `.rejected` to the DB. " +
+            "Got \(String(describing: finalState)).")
+
+        let queueLen = await router.testPendingPropagationSendsCount
+        XCTAssertEqual(queueLen, 0,
+            "pendingPropagationSends FIFO must be drained after the " +
+            "signal is consumed.")
+
+        let rejectionsContains = await router.testPendingPropagationRejectionsContains(msg.hash)
+        XCTAssertTrue(rejectionsContains,
+            "pendingPropagationRejections must include the hash so the " +
+            "small-packet `sendPropagated` post-wait check can pick it " +
+            "up and throw `.rejected`.")
+
+        let outboundState = await router.testPendingOutboundState(forHash: msg.hash)
+        XCTAssertEqual(outboundState, .rejected,
+            "pendingOutbound[i].state must be flipped to `.rejected` " +
+            "so processOutbound's `.rejected` guard removes the slot " +
+            "without burning a retry.")
+
+        // Delegate callback dispatches on @MainActor — give it a beat.
+        try await Task.sleep(nanoseconds: 100_000_000)
+        let recorded = await MainActor.run { recorder.failures }
+        XCTAssertEqual(recorded.count, 1,
+            "Delegate must receive exactly one didFailMessage callback.")
+        XCTAssertEqual(recorded.first?.hash, msg.hash,
+            "didFailMessage must fire with the rejected message.")
+        if case .stampValidationFailed = recorded.first?.reason {
+            // expected
+        } else {
+            XCTFail("didFailMessage reason must be .stampValidationFailed; " +
+                "got \(String(describing: recorded.first?.reason))")
+        }
+    }
+
+    /// Resource-path scenario: the message has already been removed
+    /// from `pendingOutbound` (resource path completes the
+    /// `indicesToRemove` cleanup before RESOURCE_PRF or
+    /// ERROR_INVALID_STAMP arrives). Handler must still: pop the hash,
+    /// insert into rejections, persist `.rejected`, AND fire
+    /// `didFailMessage` via a DB lookup fallback.
+    func testHandlePropagationSignalingPacketRejectsInFlightResourcePath() async throws {
+        let router = try await makeRouter()
+
+        let srcIdentity = Identity()
+        let destHash = Data((0..<16).map { _ in UInt8.random(in: 0...255) })
+        var msg = LXMessage(
+            destinationHash: destHash,
+            sourceIdentity: srcIdentity,
+            content: Data("prop-stamp-rejected-resource".utf8),
+            title: Data(),
+            fields: nil,
+            desiredMethod: .propagated
+        )
+        _ = try msg.pack()
+        try await router.testSaveMessage(msg)
+        // Deliberately do NOT append to `pendingOutbound` — that
+        // models the resource-path window between the
+        // `pendingOutbound[i] = msg` writeback / `indicesToRemove`
+        // cleanup and a stray ERROR_INVALID_STAMP arriving on the
+        // propagation link's packet callback.
+        await router.testAppendPendingPropagationSends(msg.hash)
+
+        let recorder = await MainActor.run { FailureRecorder() }
+        await router.setDelegate(recorder)
+
+        let signal = packLXMF(.array([.uint(UInt64(PropagationConstants.ERROR_INVALID_STAMP))]))
+        await router.handlePropagationSignalingPacket(signal)
+
+        let finalState = try await waitForMessageState(
+            router, messageHash: msg.hash, expected: .rejected
+        )
+        XCTAssertEqual(finalState, .rejected,
+            "Resource-path: signal handler must still persist `.rejected` " +
+            "even when the message has already left pendingOutbound. " +
+            "Got \(String(describing: finalState)).")
+
+        let queueLen = await router.testPendingPropagationSendsCount
+        XCTAssertEqual(queueLen, 0, "FIFO must be drained.")
+
+        try await Task.sleep(nanoseconds: 100_000_000)
+        let recorded = await MainActor.run { recorder.failures }
+        XCTAssertEqual(recorded.count, 1,
+            "Delegate must receive one didFailMessage via the " +
+            "DB-lookup fallback path even when pendingOutbound is empty.")
+        XCTAssertEqual(recorded.first?.hash, msg.hash)
+    }
+
+    /// Defensive: signal arrives with no in-flight send. Must no-op
+    /// (no DB mutation, no delegate call, no crash). Mirrors python's
+    /// behavior when `packet.link.for_lxmessage` isn't set — the
+    /// signal is logged and dropped.
+    func testHandlePropagationSignalingPacketNoOpOnEmptyFIFO() async throws {
+        let router = try await makeRouter()
+
+        let recorder = await MainActor.run { FailureRecorder() }
+        await router.setDelegate(recorder)
+
+        let signal = packLXMF(.array([.uint(UInt64(PropagationConstants.ERROR_INVALID_STAMP))]))
+        await router.handlePropagationSignalingPacket(signal)
+
+        try await Task.sleep(nanoseconds: 100_000_000)
+        let recorded = await MainActor.run { recorder.failures }
+        XCTAssertEqual(recorded.count, 0,
+            "Empty-FIFO signal must NOT fire didFailMessage.")
+    }
+
     func testHandleResourceTransferCompleteNoOpOnUnknownHash() async throws {
         // Defensive: if RESOURCE_PRF fires twice (re-delivery) or for a
         // hash that's already been cleared, the early-return must not
@@ -933,6 +1098,54 @@ extension LXMRouter {
         try await database.getMessage(id: id)
     }
 
+    /// Append a message hash to `pendingPropagationSends`. Mirrors what
+    /// `sendPropagated` does at the top of its prop-path branch (FIFO
+    /// push before any `await`), but exposed for tests that drive
+    /// `handlePropagationSignalingPacket` directly without spinning up
+    /// a real transport/link to call `sendPropagated`.
+    fileprivate func testAppendPendingPropagationSends(_ hash: Data) {
+        pendingPropagationSends.append(hash)
+    }
+
+    /// Append a message to the in-memory `pendingOutbound` queue —
+    /// models the small-packet-path state where the slot still exists
+    /// (`processOutbound`'s post-call writeback / `indicesToRemove`
+    /// haven't run yet) when an `ERROR_INVALID_STAMP` arrives.
+    fileprivate func testAppendPendingOutbound(_ message: LXMessage) {
+        pendingOutbound.append(message)
+    }
+
+    /// Snapshot helpers for asserting on actor-isolated state. Returning
+    /// scalar values avoids exposing the underlying collections via the
+    /// `public` accessors that would normally trigger Sendable warnings.
+    fileprivate var testPendingPropagationSendsCount: Int {
+        pendingPropagationSends.count
+    }
+
+    fileprivate func testPendingPropagationRejectionsContains(_ hash: Data) -> Bool {
+        pendingPropagationRejections.contains(hash)
+    }
+
+    fileprivate func testPendingOutboundState(forHash hash: Data) -> LXMessageState? {
+        pendingOutbound.first(where: { $0.hash == hash })?.state
+    }
+}
+
+/// Records `didFailMessage` callbacks so the signal-handler tests can
+/// assert the delegate is fired with the expected reason. Lives on
+/// `@MainActor` because the delegate protocol requires it.
+@MainActor
+private final class FailureRecorder: LXMRouterDelegate {
+    struct Failure {
+        let hash: Data
+        let reason: LXMFError
+    }
+    var failures: [Failure] = []
+    nonisolated func router(_ router: LXMRouter, didFailMessage message: LXMessage, reason: LXMFError) {
+        Task { @MainActor in
+            failures.append(Failure(hash: message.hash, reason: reason))
+        }
+    }
 }
 
 // MARK: - Mock interfaces

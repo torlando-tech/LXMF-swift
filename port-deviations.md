@@ -192,6 +192,83 @@ with `persistPendingState` covering durability, the explicit
 per-write `await`s can collapse back to a single batched flush.
 Until then, leave both writes awaited.
 
+**Sub-deviation (`pendingPropagationSends` + `pendingPropagationRejections`
+side-channel for `ERROR_INVALID_STAMP`, PR #7 round 4):** the
+swift port maintains two router-side data structures —
+`pendingPropagationSends: [Data]` (FIFO of in-flight prop-send
+message hashes) and `pendingPropagationRejections: Set<Data>`
+(hashes that received an `ERROR_INVALID_STAMP` signal while in
+flight) — that have no python analog.
+
+**Python reference:** `LXMF/LXMRouter.py:2498-2511` —
+`propagation_transfer_signalling_packet`:
+
+```python
+if signal == LXMPeer.ERROR_INVALID_STAMP:
+    if hasattr(packet, "link") and hasattr(packet.link, "for_lxmessage"):
+        lxm = packet.link.for_lxmessage   # link → LXMessage back-pointer
+        self.cancel_outbound(lxm.message_id, cancel_state=LXMessage.REJECTED)
+```
+
+Python attaches the in-flight LXMessage to the `RNS.Link` as
+`link.for_lxmessage` before sending. The signal handler reads the
+LXMessage directly off `packet.link.for_lxmessage` — O(1) lookup,
+no scan, no race. The mutated `LXMessage.state` is observed by
+the next `process_outbound` tick (because the LXMessage object
+in `pending_outbound` IS the same object the link points to).
+
+**Swift port reality:** reticulum-swift's `Link` has no
+`for_lxmessage` (or equivalent) back-pointer to LXMF-side state.
+Adding one would require an upstream reticulum-swift API change.
+Additionally, the swift port's `processOutbound` operates on a
+`var msg = pendingOutbound[i]` COPY and writes back only after the
+per-method send returns; during that window
+`pendingOutbound[i].state` is still `.outbound`, NOT `.sending`,
+so a "scan pendingOutbound for state==.sending" approach (which
+LXMF-swift originally used) is structurally dead code: the scan
+never matches in the small-packet path because the in-array state
+hasn't transitioned, and the scan never matches in the resource
+path because the slot is already removed by `indicesToRemove`
+before the async signal arrives.
+
+**Swift change:** two router-side fields tracking in-flight
+prop-sends by message HASH (stable across async boundaries),
+populated at the top of `sendPropagated` (before any `await`) and
+drained on success / timeout / signal:
+
+  - `pendingPropagationSends: [Data]` — FIFO queue. The most-
+    recent push is the most-recent in-flight send, which is the
+    one a single arriving `ERROR_INVALID_STAMP` signal almost
+    certainly refers to (the PN can't multiplex per-message
+    signaling without the message_id in the payload, which python
+    doesn't include).
+  - `pendingPropagationRejections: Set<Data>` — populated by the
+    signal handler, consulted by `sendPropagated`'s small-packet
+    branch after `waitForPacketProof` returns. If the in-flight
+    message's hash was added to the rejections set during the
+    proof-wait window, sendPropagated overrides the normal
+    `.sent` / `.outbound` outcome with `.rejected` and throws.
+
+Together they restore python's `cancel_outbound(cancel_state=
+REJECTED)` semantics: the signal handler updates DB state +
+notifies the delegate immediately; sendPropagated's caller
+sees the rejection on return AND a late-arriving proof (race
+case where the PN both rejects the stamp and delivers the
+message) is correctly classified as `.rejected` rather than
+`.sent`.
+
+**Reason:** Category (a) — language/runtime accommodation for
+the missing reticulum-swift Link back-pointer plus swift's
+copy-modify-writeback queue pattern. Python's mechanism doesn't
+port directly. The pair of side-channel fields is the smallest
+correct alternative.
+
+**Re-sync note:** if reticulum-swift gains a public
+`Link.userInfo` / `Link.attachedObject` hook (or LXMF-swift gains
+an in-process link→message map), both fields can collapse into
+a single direct lookup, mirroring python more faithfully. Until
+then the FIFO + rejections set is the path-of-least-divergence.
+
 ### `lxmfDelivery` — broadcast-echo-only self-echo gate
 
 **Site:** `Sources/LXMFSwift/Router/LXMRouter.swift` — `lxmfDelivery(_:method:)`,

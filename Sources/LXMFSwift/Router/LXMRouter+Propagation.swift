@@ -169,6 +169,15 @@ extension LXMRouter {
         message.state = .sending
         notifyUpdate(message)
 
+        // Register this message as in-flight BEFORE any further await
+        // so that `handlePropagationSignalingPacket` can correlate an
+        // arriving ERROR_INVALID_STAMP signal back to this send.
+        // (See port-deviations.md "pendingPropagationSends side-channel"
+        // for why this is necessary and how it mirrors python's
+        // `link.for_lxmessage` back-pointer.)
+        let inFlightHash = message.hash
+        pendingPropagationSends.append(inFlightHash)
+
         // Send based on size (Python: LINK_PACKET_MAX_CONTENT = RNS.Link.MDU = 431)
         if propagationPayload.count <= LXMFConstants.LINK_PACKET_MDU {
             // Small enough for link DATA packet
@@ -196,10 +205,32 @@ extension LXMRouter {
             // Compute packet hash BEFORE sending (for proof matching)
             let packetHash = packet.getFullHash()
 
-            try await transport.sendLinkData(packet: packet)
+            do {
+                try await transport.sendLinkData(packet: packet)
+            } catch {
+                pendingPropagationSends.removeAll { $0 == inFlightHash }
+                throw error
+            }
 
             // Wait for proof from propagation node (confirms message accepted)
             let proved = await transport.waitForPacketProof(packetHash: packetHash, timeout: 15)
+
+            // After the proof wait, check whether a STAMP rejection
+            // signal landed for this message. The signal handler
+            // populates `pendingPropagationRejections` while we were
+            // awaiting; if our hash is there, the PN rejected the
+            // upload and we must classify the message terminal
+            // regardless of whether a (spurious) late proof also
+            // arrived. Mirrors python `cancel_outbound(...
+            // cancel_state=REJECTED)` (LXMRouter.py:2508).
+            if pendingPropagationRejections.remove(inFlightHash) != nil {
+                pendingPropagationSends.removeAll { $0 == inFlightHash }
+                message.state = .rejected
+                notifyUpdate(message)
+                throw LXMFError.propagationFailed("propagation node rejected stamp (ERROR_INVALID_STAMP)")
+            }
+
+            pendingPropagationSends.removeAll { $0 == inFlightHash }
             if proved {
                 // Python `__mark_propagated` flips state to SENT (LXMessage.py:570).
                 message.state = .sent
@@ -233,9 +264,20 @@ extension LXMRouter {
             let outboundHandler = LXMFOutboundResourceHandler(router: self)
             await link.setResourceCallbacks(outboundHandler)
 
-            let resource = try await link.sendResource(
-                data: propagationPayload, requestId: nil, isResponse: false
-            )
+            let resource: Resource
+            do {
+                resource = try await link.sendResource(
+                    data: propagationPayload, requestId: nil, isResponse: false
+                )
+            } catch {
+                // sendResource threw before we could register the
+                // resource → message hash mapping. Drain
+                // pendingPropagationSends so a subsequent
+                // ERROR_INVALID_STAMP signal doesn't pop a hash that
+                // belongs to a send we never actually started.
+                pendingPropagationSends.removeAll { $0 == inFlightHash }
+                throw error
+            }
 
             if let resHash = await resource.hash {
                 pendingResourceDeliveries[resHash] = message.hash
@@ -258,13 +300,22 @@ extension LXMRouter {
                 // we can't map RESOURCE_PRF back to this message. Throw so
                 // processOutbound's retry path runs rather than leaving the
                 // message in .sending forever.
+                pendingPropagationSends.removeAll { $0 == inFlightHash }
                 message.state = .outbound
                 notifyUpdate(message)
                 throw LXMFError.propagationFailed("propagation resource has no hash; cannot wire proof callback")
             }
-            // NOTE: state stays .sending here. handleResourceTransferComplete
-            // routes via handlePropagationAccepted to flip state → .sent
-            // when RESOURCE_PRF arrives (python ref: __mark_propagated).
+            // NOTE: state stays .sending here. The resource is now
+            // in-flight; `pendingPropagationSends` retains
+            // `inFlightHash` so an arriving ERROR_INVALID_STAMP signal
+            // can correlate. Drain happens in
+            // `handlePropagationAccepted` (success) or
+            // `handleOutboundResourceFailed` (failure) — both must
+            // call `pendingPropagationSends.removeAll { $0 == messageHash }`
+            // for the prop path to keep the FIFO consistent.
+            // handleResourceTransferComplete routes via
+            // handlePropagationAccepted to flip state → .sent when
+            // RESOURCE_PRF arrives (python ref: __mark_propagated).
         }
     }
 
@@ -406,46 +457,80 @@ extension LXMRouter {
             switch code {
             case PropagationConstants.ERROR_INVALID_STAMP:
                 propLogger.error("[PROP_SIGNAL] ERROR_INVALID_STAMP — propagation node rejected outbound stamp")
-                // Best-effort match-and-reject of the most recently-sent
-                // PROPAGATED message that's still in flight.
+                // Resolve the in-flight PROPAGATED send by popping the
+                // most-recent hash from `pendingPropagationSends`. See
+                // the field docstring on LXMRouter.pendingPropagationSends
+                // for why this is structurally necessary — the previous
+                // `for i in pendingOutbound.indices.reversed() { ... state == .sending }`
+                // scan was dead code on both paths (small-packet: state
+                // is still `.outbound` because writeback happens AFTER
+                // `sendPropagated` returns; resource: slot is already
+                // removed via `indicesToRemove`).
+                //
+                // Python ref: `LXMRouter.py:2498-2511` uses
+                // `link.for_lxmessage` (a per-link back-pointer) to
+                // identify which outbound LXMessage owns the rejection
+                // signal. Swift can't replicate the python pattern
+                // because reticulum-swift's Link doesn't expose a
+                // mutable per-link user-data slot we can attach an
+                // LXMessage ref to. We approximate with a FIFO keyed on
+                // message hash; FIFO + actor isolation gives us LIFO
+                // matching that's "the most-recently-started send" —
+                // the same semantics python achieves via the back-pointer.
+                guard let inFlightHash = pendingPropagationSends.popLast() else {
+                    propLogger.warning("[PROP_SIGNAL] ERROR_INVALID_STAMP received but pendingPropagationSends is empty")
+                    return
+                }
+                // Mark in the rejections set so the small-packet branch
+                // of `sendPropagated`, when it resumes from
+                // `waitForPacketProof`, observes the rejection and
+                // throws `.rejected` instead of returning successfully.
+                // For the resource path this set is just a tombstone —
+                // the resource hash → message hash map drives the
+                // real callback flow.
+                pendingPropagationRejections.insert(inFlightHash)
+                let hashHex = inFlightHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+                // Persist `.rejected` to the DB synchronously so a
+                // background-fetch / app-re-launch consumer sees the
+                // same terminal outcome the UI does. Mirrors python
+                // LXMessage.py:597 (REJECTED is a terminal state and
+                // is written to the DB-backing LXMessage object).
+                // Awaited (not detached) inside the actor for the same
+                // ordering reason as the other PROPAGATED-path DB
+                // writes — see port-deviations.md sub-deviation
+                // "PROPAGATED resource path DB write ORDERING".
+                try? await database.updateMessageState(id: inFlightHash, state: .rejected)
+                // Resolve a target LXMessage object to notify the
+                // delegate. For the small-packet path the message is
+                // still in `pendingOutbound` (state `.outbound`,
+                // because writeback runs after `sendPropagated`
+                // returns) — flip it to `.rejected` so the
+                // `pendingOutbound[i].state == .rejected` guard at the
+                // top of `processOutbound` removes it on the next tick
+                // without burning a retry slot. For the resource path
+                // the slot was already removed via `indicesToRemove`;
+                // fall back to a DB lookup so the delegate's
+                // `didFailMessage` callback fires with a recognizable
+                // message object.
+                var notified = false
                 for i in pendingOutbound.indices.reversed() {
-                    var msg = pendingOutbound[i]
-                    if msg.method == .propagated && msg.state == .sending {
-                        msg.state = .rejected
-                        pendingOutbound[i] = msg
-                        // Persist the terminal `.rejected` state to the
-                        // DB so a background-fetch / app-re-launch
-                        // consumer sees the same outcome the UI does.
-                        // Greptile review (4/5 confidence) flagged the
-                        // earlier in-memory-only flip as a parity gap:
-                        // python's terminal-state handlers (e.g.
-                        // LXMessage.py:597 setting REJECTED) update
-                        // the LXMessage object that's already the DB-
-                        // backing source-of-truth, so persistence is
-                        // implicit. Swift's separate in-memory queue +
-                        // SQLite DB means we must write explicitly.
-                        let msgHash = msg.hash
-                        // ORDERING NOTE — awaited (not detached) on
-                        // purpose. The other PROPAGATED-path DB writes
-                        // (`.outbound` in processOutbound,
-                        // `.sent` in handlePropagationAccepted) are
-                        // also awaited inside the actor; a detached
-                        // write here would land on the global executor
-                        // outside the actor's mailbox and could
-                        // interleave with a subsequent `processOutbound`
-                        // tick or a fast `handlePropagationAccepted`,
-                        // leaving the DB in the wrong terminal state
-                        // (`.outbound` overwriting `.rejected`, or vice
-                        // versa). See port-deviations.md sub-deviation
-                        // "PROPAGATED resource path DB write ORDERING".
-                        try? await database.updateMessageState(id: msgHash, state: .rejected)
-                        notifyFailure(msg, reason: .stampValidationFailed)
-                        let hashHex = msg.hash.prefix(8).map { String(format: "%02x", $0) }.joined()
-                        propLogger.error("[PROP_SIGNAL] cancelled outbound \(hashHex) as REJECTED (DB updated)")
-                        return
+                    if pendingOutbound[i].hash == inFlightHash &&
+                       pendingOutbound[i].method == .propagated {
+                        pendingOutbound[i].state = .rejected
+                        notifyFailure(pendingOutbound[i], reason: .stampValidationFailed)
+                        notified = true
+                        propLogger.error("[PROP_SIGNAL] cancelled outbound \(hashHex) as REJECTED (in-memory + DB)")
+                        break
                     }
                 }
-                propLogger.warning("[PROP_SIGNAL] ERROR_INVALID_STAMP received but no pending propagated message in .sending found")
+                if !notified {
+                    if let rejectedMsg = try? await database.getMessage(id: inFlightHash) {
+                        notifyFailure(rejectedMsg, reason: .stampValidationFailed)
+                        propLogger.error("[PROP_SIGNAL] cancelled \(hashHex) as REJECTED via DB (resource path or post-removal)")
+                    } else {
+                        propLogger.warning("[PROP_SIGNAL] cancelled \(hashHex) as REJECTED but DB lookup failed; delegate notify skipped")
+                    }
+                }
             default:
                 propLogger.warning("[PROP_SIGNAL] unknown signal code 0x\(String(format: "%02x", code))")
             }
