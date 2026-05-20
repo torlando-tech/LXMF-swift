@@ -14,3 +14,7 @@ Package.resolved
 
 # macOS
 .DS_Store
+Derived/*
+*.xcodeproj
+*.xcworkspace
+
