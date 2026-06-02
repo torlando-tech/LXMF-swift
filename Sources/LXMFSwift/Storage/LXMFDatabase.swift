@@ -30,20 +30,45 @@ public actor LXMFDatabase {
     ///
     /// - Parameter path: Database file path
     /// - Throws: DatabaseError if initialization fails
-    public init(path: String) throws {
-        // Configure database
+    public init(path: String, readonly: Bool = false) throws {
+        // App <-> Network-Extension share this database across processes (Model B).
+        // The writer (the NE) must survive iOS's 0xDEAD10CC "file busy while suspended"
+        // kill; the app opens read-only with `readonly: true`. (GRDB DatabaseSharing.)
         var config = Configuration()
+        config.readonly = readonly
+        // Suspend cleanly when iOS backgrounds the process holding a lock, instead of
+        // being 0xDEAD10CC-killed.
+        config.observesSuspensionNotifications = true
+        // Take write locks up front to avoid cross-process SQLITE_BUSY upgrade deadlocks.
+        config.defaultTransactionKind = .immediate
         config.prepareDatabase { db in
-            // Enable WAL mode for concurrent reads during writes
-            try db.execute(sql: "PRAGMA journal_mode=WAL")
-            // Set synchronous mode to NORMAL for better performance
-            try db.execute(sql: "PRAGMA synchronous=NORMAL")
+            if !readonly {
+                // Enable WAL mode for concurrent reads during writes
+                try db.execute(sql: "PRAGMA journal_mode=WAL")
+                // Set synchronous mode to NORMAL for better performance
+                try db.execute(sql: "PRAGMA synchronous=NORMAL")
+            }
             // Retry for up to 5 seconds if the database is locked
             try db.execute(sql: "PRAGMA busy_timeout=5000")
         }
 
         // Create database pool (allows concurrent reads during writes in WAL mode)
         dbPool = try DatabasePool(path: path, configuration: config)
+
+        #if os(iOS)
+        // Deliver-while-locked: the NE must read/write after first unlock even when the
+        // device is subsequently locked. Pin the data-protection class on the DB and its
+        // -wal/-shm sidecar files to CompleteUntilFirstUserAuthentication.
+        if !readonly {
+            let fm = FileManager.default
+            for suffix in ["", "-wal", "-shm"] where fm.fileExists(atPath: path + suffix) {
+                try? fm.setAttributes(
+                    [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+                    ofItemAtPath: path + suffix
+                )
+            }
+        }
+        #endif
 
         // Run migrations
         var migrator = DatabaseMigrator()
