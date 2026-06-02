@@ -50,8 +50,14 @@ public actor LXMRouter {
     /// Interval between outbound processing cycles
     public static let PROCESSING_INTERVAL: TimeInterval = 1
 
-    /// Duplicate detection cache expiry (1 hour)
-    public static let DUPLICATE_CACHE_EXPIRY: TimeInterval = 3600
+    /// Baseline message expiry — matches python LXMRouter.MESSAGE_EXPIRY (30 days).
+    public static let MESSAGE_EXPIRY: TimeInterval = 30 * 24 * 60 * 60
+
+    /// Duplicate-delivery cache retention. Matches python's locally_delivered_transient_ids
+    /// window of MESSAGE_EXPIRY*6 (~180 days) — NOT 1 hour; too short a window would
+    /// re-accept a duplicate once it expired. The cache is persisted across restarts (see
+    /// local_deliveries), mirroring python (LXMRouter.py:956-961).
+    public static let DUPLICATE_CACHE_EXPIRY: TimeInterval = MESSAGE_EXPIRY * 6
 
     /// Maximum age (seconds) for pending outbound messages before marking as failed.
     /// Prevents crash loops from stuck messages that can never be delivered.
@@ -80,8 +86,12 @@ public actor LXMRouter {
 
     /// Duplicate detection cache: transient ID -> timestamp
     /// Transient ID is message.hash (32 bytes)
-    /// Cached for 1 hour to prevent processing duplicates
+    /// Persisted across restarts (see local_deliveries) to prevent re-processing duplicates.
     var deliveredTransientIDs: [Data: Date] = [:]
+
+    /// Path to the persisted duplicate-delivery cache (`<db-dir>/local_deliveries`),
+    /// mirroring python's `<storagepath>/local_deliveries`. nil for in-memory test DBs.
+    private var localDeliveriesPath: String?
 
     /// Cached stamp costs from announces: destination_hash -> (timestamp, cost)
     public var outboundStampCosts: [Data: (Date, Int)] = [:]
@@ -239,6 +249,19 @@ public actor LXMRouter {
     public init(identity: Identity, databasePath: String) async throws {
         self.identity = identity
         self.database = try LXMFDatabase(path: databasePath)
+
+        // Persist the duplicate-delivery dedup next to the message DB so it survives a
+        // process restart (python loads `<storagepath>/local_deliveries`, LXMRouter.py:212-216).
+        // nil for `:memory:` test DBs. Loaded via a static helper because instance methods
+        // can't be called until all stored properties are initialized.
+        if databasePath != ":memory:" {
+            let dir = (databasePath as NSString).deletingLastPathComponent
+            if !dir.isEmpty {
+                let path = (dir as NSString).appendingPathComponent("local_deliveries")
+                self.localDeliveriesPath = path
+                self.deliveredTransientIDs = Self.loadLocalDeliveries(from: path)
+            }
+        }
 
         // Load pending outbound from database (restore after crash/restart)
         // Wrapped in do/catch to prevent corrupt messages from crashing init
@@ -502,11 +525,8 @@ public actor LXMRouter {
                 return false
             }
 
-            // Add to duplicate cache with current timestamp
-            deliveredTransientIDs[message.hash] = Date()
-
-            // Clean expired entries from duplicate cache
-            cleanDuplicateCache()
+            // Record as delivered: cache + prune + persist so dedup survives a restart.
+            recordDelivered(message.hash)
 
             // Apply physical stats if provided
             if let stats = physicalStats {
@@ -927,6 +947,66 @@ public actor LXMRouter {
         deliveredTransientIDs = deliveredTransientIDs.filter { (_, timestamp) in
             now.timeIntervalSince(timestamp) < expiry
         }
+    }
+
+    /// Load the persisted locally-delivered transient-id cache (a msgpack map of
+    /// {transient_id(bin) : timestamp(float)}). Faithful port of python loading
+    /// `<storagepath>/local_deliveries` (LXMRouter.py:212-216). Static so it can run from
+    /// `init` before all stored properties are initialized.
+    static func loadLocalDeliveries(from path: String) -> [Data: Date] {
+        guard FileManager.default.fileExists(atPath: path),
+              let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let value = try? unpackLXMF(data),
+              case .map(let entries) = value else {
+            return [:]
+        }
+        var loaded: [Data: Date] = [:]
+        for (key, val) in entries {
+            guard case .binary(let transientID) = key else { continue }
+            let ts: Double
+            switch val {
+            case .double(let d): ts = d
+            case .float(let f): ts = Double(f)
+            case .uint(let u): ts = Double(u)
+            case .int(let i): ts = Double(i)
+            default: continue
+            }
+            loaded[transientID] = Date(timeIntervalSince1970: ts)
+        }
+        return loaded
+    }
+
+    /// Persist the locally-delivered transient-id cache. Faithful port of python
+    /// save_locally_delivered_transient_ids (LXMRouter.py:1177-1184): a msgpack map of
+    /// {transient_id(bin) : timestamp(float)} written to `<db-dir>/local_deliveries`.
+    func saveDeliveredTransientIDs() {
+        guard let path = localDeliveriesPath else { return }
+        var entries: [LXMFMessagePackValue: LXMFMessagePackValue] = [:]
+        for (transientID, date) in deliveredTransientIDs {
+            entries[.binary(transientID)] = .double(date.timeIntervalSince1970)
+        }
+        do {
+            try packLXMF(.map(entries)).write(to: URL(fileURLWithPath: path), options: .atomic)
+            #if os(iOS)
+            // The Network Extension writes this while the device is locked → match the
+            // deliver-while-locked data-protection class.
+            try? FileManager.default.setAttributes(
+                [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+                ofItemAtPath: path
+            )
+            #endif
+        } catch {
+            routerLogger.warning("Failed to persist local_deliveries: \(error)")
+        }
+    }
+
+    /// Record a transient id (= LXMF message hash) as locally delivered: cache it, prune
+    /// expired entries, and persist so the dedup survives a process restart. Mirrors python
+    /// adding to locally_delivered_transient_ids + save (LXMRouter.py:1365).
+    func recordDelivered(_ transientID: Data) {
+        deliveredTransientIDs[transientID] = Date()
+        cleanDuplicateCache()
+        saveDeliveredTransientIDs()
     }
 
     /// Notify delegate of message failure.
