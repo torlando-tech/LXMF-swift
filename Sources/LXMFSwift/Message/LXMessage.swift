@@ -179,6 +179,55 @@ public struct LXMessage {
         }
 
         // Create payload array WITHOUT stamp (for hash computation)
+        var payloadArray = buildPayloadArray()
+
+        // Encode payload WITHOUT stamp (for hash)
+        let payloadForHash = LXMFMessagePackValue.array(payloadArray)
+        let packedPayloadForHash = packLXMF(payloadForHash)
+
+        // Compute hash
+        var hashedPart = Data()
+        hashedPart.append(destinationHash)
+        hashedPart.append(sourceHash)
+        hashedPart.append(packedPayloadForHash)
+        self.hash = Data(SHA256.hash(data: hashedPart))
+
+        // Create signed part
+        var signedPart = Data()
+        signedPart.append(hashedPart)
+        signedPart.append(self.hash)
+
+        // Sign
+        self.signature = try identity.sign(signedPart)
+        self.signatureValidated = true
+
+        // Now add stamp to payload if present
+        if let stamp = stamp {
+            payloadArray.append(.binary(stamp))
+        }
+
+        // Pack final payload (with stamp if present)
+        let finalPayload = LXMFMessagePackValue.array(payloadArray)
+        let packedFinalPayload = packLXMF(finalPayload)
+
+        // Assemble wire format
+        var packed = Data()
+        packed.append(destinationHash)
+        packed.append(sourceHash)
+        packed.append(signature)
+        packed.append(packedFinalPayload)
+
+        self.packed = packed
+        self.state = .outbound
+
+        return packed
+    }
+
+    /// Builds the msgpack payload array `[timestamp, title, content, fields]`
+    /// used both for the hash and for the wire body. Extracted from `pack()`
+    /// so `makeLocal(...)` can reproduce the exact same encoding. Does not
+    /// append the stamp (callers add it after the hash is computed).
+    private func buildPayloadArray() -> [LXMFMessagePackValue] {
         var payloadArray: [LXMFMessagePackValue] = [
             .double(timestamp),
             .binary(title),
@@ -223,46 +272,67 @@ public struct LXMessage {
             payloadArray[3] = .map(fieldsMap)
         }
 
-        // Encode payload WITHOUT stamp (for hash)
-        let payloadForHash = LXMFMessagePackValue.array(payloadArray)
-        let packedPayloadForHash = packLXMF(payloadForHash)
+        return payloadArray
+    }
 
-        // Compute hash
+    // MARK: - Local insertion
+
+    /// Builds a fully-formed, persistable message that did **not** travel over
+    /// LXMF — e.g. one delivered by an external transport (Bluetooth) that we
+    /// want stored and displayed alongside real LXMF traffic.
+    ///
+    /// Produces a valid wire-format `packed` blob (so it round-trips through
+    /// `MessageRecord`/`toLXMessage()` like any other row) and a content-derived
+    /// `hash` (the primary key), but uses a **placeholder zero signature** since
+    /// there is no source private key to sign with. `signatureValidated` is
+    /// therefore left `false`. Set `state` to a terminal value
+    /// (`.delivered`) and choose `incoming` for the direction; the message
+    /// never enters the router's outbound queue.
+    public static func makeLocal(
+        destinationHash: Data,
+        sourceHash: Data,
+        content: Data,
+        title: Data,
+        fields: [UInt8: Any]?,
+        timestamp: Double,
+        state: LXMessageState,
+        incoming: Bool
+    ) -> LXMessage {
+        var message = LXMessage(
+            destinationHash: destinationHash,
+            sourceHash: sourceHash,
+            content: content,
+            title: title,
+            timestamp: timestamp,
+            state: state,
+            incoming: incoming
+        )
+        message.fields = fields
+
+        let payloadArray = message.buildPayloadArray()
+        let packedPayload = packLXMF(.array(payloadArray))
+
+        // Hash exactly as `pack()`: SHA256(dest + source + msgpack(payload)).
         var hashedPart = Data()
         hashedPart.append(destinationHash)
         hashedPart.append(sourceHash)
-        hashedPart.append(packedPayloadForHash)
-        self.hash = Data(SHA256.hash(data: hashedPart))
+        hashedPart.append(packedPayload)
+        message.hash = Data(SHA256.hash(data: hashedPart))
 
-        // Create signed part
-        var signedPart = Data()
-        signedPart.append(hashedPart)
-        signedPart.append(self.hash)
+        // Unsigned: placeholder signature keeps the wire layout intact
+        // (dest + source + signature + payload) so unpack can read it back.
+        let signature = Data(repeating: 0, count: LXMFConstants.SIGNATURE_LENGTH)
+        message.signature = signature
+        message.signatureValidated = false
 
-        // Sign
-        self.signature = try identity.sign(signedPart)
-        self.signatureValidated = true
-
-        // Now add stamp to payload if present
-        if let stamp = stamp {
-            payloadArray.append(.binary(stamp))
-        }
-
-        // Pack final payload (with stamp if present)
-        let finalPayload = LXMFMessagePackValue.array(payloadArray)
-        let packedFinalPayload = packLXMF(finalPayload)
-
-        // Assemble wire format
         var packed = Data()
         packed.append(destinationHash)
         packed.append(sourceHash)
         packed.append(signature)
-        packed.append(packedFinalPayload)
+        packed.append(packedPayload)
+        message.packed = packed
 
-        self.packed = packed
-        self.state = .outbound
-
-        return packed
+        return message
     }
 
     // MARK: - Unpacking
