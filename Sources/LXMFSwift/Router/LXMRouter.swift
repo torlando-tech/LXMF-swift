@@ -23,6 +23,9 @@ import ReticulumSwift
 import os.log
 
 private let routerLogger = Logger(subsystem: "net.reticulum.lxmf", category: "LXMRouter")
+/// Diagnostics on the shared `net.reticulum` subsystem so the direct-send
+/// decision points show under the same console filter as the BLE logs.
+private let directDbgLogger = Logger(subsystem: "net.reticulum", category: "DIRECT-DBG")
 
 /// LXMF message router actor.
 ///
@@ -46,6 +49,13 @@ public actor LXMRouter {
 
     /// Time to wait after requesting path before next attempt
     public static let PATH_REQUEST_WAIT: TimeInterval = 15
+    /// Fast retry for transient link-establishment failures (e.g. the
+    /// responder tearing down the just-created link → "destination_closed",
+    /// or an establishment timeout). These usually clear on a quick
+    /// re-attempt, so we skip the per-attempt exponential backoff and retry
+    /// promptly — otherwise large (.direct/resource) messages stall for tens
+    /// of seconds behind it.
+    public static let LINK_RETRY_WAIT: TimeInterval = 2.5
 
     /// Interval between outbound processing cycles
     public static let PROCESSING_INTERVAL: TimeInterval = 1
@@ -103,6 +113,33 @@ public actor LXMRouter {
 
     /// Active and pending links for direct delivery
     public var deliveryLinks: [Data: Link] = [:]
+
+    /// In-flight link establishments, keyed by destination. Concurrent callers
+    /// (warm-link refresh, outbound send, processOutbound retries) await the
+    /// same Task instead of each starting a rival link that would orphan the
+    /// others. Cleared when the establishment completes.
+    var establishmentTasks: [Data: Task<Link, Error>] = [:]
+
+    /// Destinations the host app currently senses as physically nearby.
+    /// Forwarded to the transport's route selection (prefer direct BLE/MPC
+    /// interfaces) and replayed on `setTransport` so a hint set before the
+    /// transport attaches isn't lost.
+    public internal(set) var nearbyDestinations: Set<Data> = []
+
+    /// Sent-but-unproven tracking. A message that reached `.sent` (single
+    /// checkmark) but whose delivery proof never arrives would otherwise sit
+    /// there forever — nothing retries it. Entries are rescued back into
+    /// `pendingOutbound` when (a) the transport reports the destination's
+    /// path/link died, or (b) the confirmation deadline passes (swept by the
+    /// 1s `processOutbound` loop). Cleared on proof arrival.
+    struct PendingConfirmation: Sendable {
+        let destinationHash: Data
+        /// Truncated hash of the sent packet — used to remove the
+        /// registered proof callback when the message is rescued.
+        let packetTruncatedHash: Data
+        let deadline: Date
+    }
+    var awaitingConfirmation: [Data: PendingConfirmation] = [:]
 
     /// Map outbound resource hash → message hash for delivery confirmation.
     /// When RESOURCE_PRF is received, we look up the message hash here to mark it delivered.
@@ -307,6 +344,151 @@ public actor LXMRouter {
         self.transport = transport
         // Access path table from transport for route lookups
         self.pathTable = await transport.getPathTable()
+
+        // Subscribe to routing events so in-flight deliveries fail over
+        // promptly when a direct interface/link dies instead of waiting
+        // out establishment timeouts and backoff.
+        await transport.setOnTransportEvent { [weak self] event in
+            await self?.handleTransportEvent(event)
+        }
+
+        // Replay a nearby hint that was set before the transport attached.
+        if !nearbyDestinations.isEmpty {
+            await transport.setNearbyDestinations(nearbyDestinations)
+        }
+    }
+
+    /// Replace the set of destinations the app senses as nearby. Forwarded
+    /// to the transport, which prefers direct (BLE/MPC) interfaces for these
+    /// destinations and fails over to infrastructure automatically.
+    ///
+    /// - Parameter destinations: 16-byte lxmf.delivery destination hashes
+    public func setNearbyDestinations(_ destinations: Set<Data>) async {
+        nearbyDestinations = destinations
+        await transport?.setNearbyDestinations(destinations)
+    }
+
+    // MARK: - Transport Event Handling (failover)
+
+    /// React to transport routing events.
+    ///
+    /// The transport guarantees events fire AFTER its path table was
+    /// updated, so any re-query below already reflects surviving routes.
+    func handleTransportEvent(_ event: ReticulumTransport.TransportEvent) async {
+        switch event {
+        case .pathsInvalidated(let destinationHashes, _):
+            for destination in destinationHashes {
+                await handleDirectPathLost(destination: destination)
+            }
+
+        case .linkClosed(_, let destinationHash, _):
+            await handleDirectPathLost(destination: destinationHash)
+
+        case .preferredPathChanged(let destinationHash):
+            await migrateLinkIfBeneficial(destination: destinationHash)
+        }
+    }
+
+    /// A path or link to `destination` died. Evict cached link state, fail
+    /// any in-flight establishment fast, re-arm queued messages for an
+    /// immediate retry (over whatever path transport now prefers), and
+    /// rescue sent-but-unproven messages.
+    public func handleDirectPathLost(destination: Data) async {
+        let destHex = destination.prefix(8).map { String(format: "%02x", $0) }.joined()
+
+        // 1. Evict the dead link and cancel any in-flight establishment so
+        //    awaiting senders fail fast with linkFailed (→ 2.5s retry)
+        //    instead of burning the establishment timeout on a dead radio.
+        let hadLink = deliveryLinks.removeValue(forKey: destination) != nil
+        if let task = establishmentTasks.removeValue(forKey: destination) {
+            task.cancel()
+        }
+
+        // 2. Re-arm queued messages: retry now, without consuming an extra
+        //    attempt — the path change isn't the message's fault.
+        var rearmed = 0
+        for i in pendingOutbound.indices where pendingOutbound[i].destinationHash == destination {
+            pendingOutbound[i].nextDeliveryAttempt = Date()
+            rearmed += 1
+        }
+
+        // 3. Rescue sent-but-unproven messages to this destination.
+        let rescued = await rescueUnconfirmedMessages(destination: destination)
+
+        if hadLink || rearmed > 0 || rescued > 0 {
+            routerLogger.info("Path lost to \(destHex, privacy: .public): link evicted=\(hadLink), re-armed=\(rearmed), rescued=\(rescued)")
+            // 4. Kick processing so the retry happens this tick, not the next.
+            Task { [weak self] in await self?.processOutbound() }
+        }
+    }
+
+    /// Passive link migration: when the preferred path for a destination
+    /// changes (e.g. the peer became nearby) and the cached link sits on a
+    /// non-preferred interface, close it gracefully while idle so the next
+    /// send re-establishes over the preferred wire. Never touches a link
+    /// with an in-flight resource transfer.
+    private func migrateLinkIfBeneficial(destination: Data) async {
+        guard let transport,
+              let link = deliveryLinks[destination],
+              await link.state == .active else { return }
+
+        // Conservative idleness check: skip migration while ANY outbound
+        // resource is in flight (per-destination attribution would need a
+        // DB roundtrip; missing a migration is harmless — it's passive).
+        guard pendingResourceDeliveries.isEmpty else { return }
+
+        guard let preferred = await transport.preferredOutboundInterfaceId(for: destination),
+              let attached = await link.attachedInterfaceId,
+              preferred != attached else { return }
+
+        let destHex = destination.prefix(8).map { String(format: "%02x", $0) }.joined()
+        routerLogger.info("Migrating link to \(destHex, privacy: .public): preferred wire is now '\(preferred, privacy: .public)' (was '\(attached, privacy: .public)')")
+        await link.close(reason: .initiatorClosed)
+        deliveryLinks.removeValue(forKey: destination)
+    }
+
+    /// Rescue sent-but-unproven messages back into the outbound queue.
+    ///
+    /// - Parameter destination: rescue only entries for this destination,
+    ///   or nil to rescue entries whose confirmation deadline has passed.
+    /// - Returns: number of messages rescued
+    @discardableResult
+    func rescueUnconfirmedMessages(destination: Data?) async -> Int {
+        let now = Date()
+        var rescuedCount = 0
+        for (messageHash, pending) in awaitingConfirmation {
+            let matches: Bool
+            if let destination {
+                matches = pending.destinationHash == destination
+            } else {
+                matches = now >= pending.deadline
+            }
+            guard matches else { continue }
+            awaitingConfirmation.removeValue(forKey: messageHash)
+            await transport?.removeProofCallback(truncatedHash: pending.packetTruncatedHash)
+
+            let msgHex = messageHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+            guard var message = try? await database.getMessage(id: messageHash) else {
+                routerLogger.warning("Cannot rescue \(msgHex, privacy: .public): DB lookup failed")
+                continue
+            }
+            // A late proof may have landed during the awaits above (the
+            // proof handler also clears awaitingConfirmation, but we may
+            // have removed our entry first) — never resend a delivered
+            // message.
+            guard message.state != .delivered else { continue }
+            // Dedup: never double-enqueue the same message.
+            guard !pendingOutbound.contains(where: { $0.hash == messageHash }) else { continue }
+
+            message.state = .outbound
+            message.nextDeliveryAttempt = Date()
+            try? await database.saveMessage(message)
+            pendingOutbound.append(message)
+            rescuedCount += 1
+            routerLogger.info("Rescued sent-but-unproven message \(msgHex, privacy: .public) for retry (attempts so far: \(message.deliveryAttempts))")
+            notifyUpdate(message)
+        }
+        return rescuedCount
     }
 
     /// Set the ratchet manager for forward secrecy on sync decryption.
@@ -380,6 +562,11 @@ public actor LXMRouter {
                 routerLogger.info("Message fits in opportunistic: \(packedPayloadSize) bytes")
             }
         }
+
+        let enqDestHex = message.destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+        let enqMethod = String(describing: message.method)
+        let enqFallback = String(describing: message.fallbackMethod)
+        directDbgLogger.notice("[DIRECT-DBG] handleOutbound enqueued: dest=\(enqDestHex, privacy: .public) method=\(enqMethod, privacy: .public) fallback=\(enqFallback, privacy: .public)")
 
         // Add to pending outbound queue
         pendingOutbound.append(message)
@@ -570,6 +757,11 @@ public actor LXMRouter {
         processingOutbound = true
         defer { processingOutbound = false }
 
+        // Deadline sweep for sent-but-unproven messages (no extra timer —
+        // this loop already runs every PROCESSING_INTERVAL). Expired
+        // entries are re-enqueued below and picked up by this very pass.
+        await rescueUnconfirmedMessages(destination: nil)
+
         // Track indices to remove (use index-based access so struct mutations persist)
         var indicesToRemove: IndexSet = []
 
@@ -627,6 +819,25 @@ public actor LXMRouter {
 
             // Check if max delivery attempts exceeded
             if pendingOutbound[i].deliveryAttempts >= Self.MAX_DELIVERY_ATTEMPTS {
+                // Python parity (LXMRouter.process_outbound,
+                // try_propagation_on_fail): before declaring failure,
+                // switch the SAME message to .propagated when allowed —
+                // same hash, no second UI bubble. Attempts reset so the
+                // propagation path gets its own budget.
+                if pendingOutbound[i].tryPropagationOnFail,
+                   pendingOutbound[i].method != .propagated,
+                   outboundPropagationNode != nil {
+                    let destHex = pendingOutbound[i].destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+                    routerLogger.info("Max attempts for \(destHex, privacy: .public) via \(String(describing: self.pendingOutbound[i].method), privacy: .public); switching same message to .propagated")
+                    pendingOutbound[i].method = .propagated
+                    pendingOutbound[i].deliveryAttempts = 0
+                    pendingOutbound[i].nextDeliveryAttempt = nil
+                    pendingOutbound[i].state = .outbound
+                    try? await database.saveMessage(pendingOutbound[i])
+                    notifyUpdate(pendingOutbound[i])
+                    continue
+                }
+
                 pendingOutbound[i].state = .failed
                 let failedMsg = pendingOutbound[i]
                 indicesToRemove.insert(i)
@@ -690,8 +901,10 @@ public actor LXMRouter {
                     let attempt = pendingOutbound[i].deliveryAttempts
                     routerLogger.info("Direct delivery: dest=\(destHashHex), hasPath=\(hasPathToRecipient), attempt=\(attempt)")
                     routerLogger.debug("Checking path to \(destHashHex), hasPath=\(hasPathToRecipient)")
+                    directDbgLogger.notice("[DIRECT-DBG] processOutbound .direct: dest=\(destHashHex, privacy: .public) hasPath=\(hasPathToRecipient, privacy: .public) attempt=\(attempt, privacy: .public)")
                     if hasPathToRecipient {
                         // Attempt link-based send (copy out for inout async call)
+                        directDbgLogger.notice("[DIRECT-DBG] processOutbound .direct: hasPath=true → starting sendDirect to \(destHashHex, privacy: .public)")
                         routerLogger.info("Starting sendDirect to \(destHashHex)")
                         var msg = pendingOutbound[i]
                         try await sendDirect(&msg)
@@ -741,6 +954,7 @@ public actor LXMRouter {
                         }
                     } else {
                         // Need path first
+                        directDbgLogger.notice("[DIRECT-DBG] processOutbound .direct: hasPath=false → requestPath for \(destHashHex, privacy: .public), waiting (message stays onroute)")
                         routerLogger.warning("No path to \(destHashHex), requesting path")
                         routerLogger.debug("No path to \(destHashHex), requesting path")
                         requestPath(pendingOutbound[i].destinationHash)
@@ -889,9 +1103,17 @@ public actor LXMRouter {
                     break
                 }
             } catch {
-                // Delivery failed, will retry on next cycle
-                // Schedule retry with exponential backoff
-                let backoffSeconds = min(Double(pendingOutbound[i].deliveryAttempts) * Self.PATH_REQUEST_WAIT, 300.0)
+                // Delivery failed, will retry on next cycle.
+                let backoffSeconds: TimeInterval
+                if case LXMFError.linkFailed = error {
+                    // Transient link-establishment failure — retry fast (within
+                    // MAX_DELIVERY_ATTEMPTS) rather than the per-attempt
+                    // exponential backoff, so a flaky responder teardown only
+                    // costs seconds, not tens of seconds, for large messages.
+                    backoffSeconds = Self.LINK_RETRY_WAIT
+                } else {
+                    backoffSeconds = min(Double(pendingOutbound[i].deliveryAttempts) * Self.PATH_REQUEST_WAIT, 300.0)
+                }
                 pendingOutbound[i].nextDeliveryAttempt = Date().addingTimeInterval(backoffSeconds)
                 let destHex = pendingOutbound[i].destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
                 routerLogger.error("Delivery failed for \(destHex): \(error.localizedDescription), retrying in \(backoffSeconds)s")
@@ -968,6 +1190,18 @@ public actor LXMRouter {
     public func handleDeliveryProofReceived(messageHash: Data) async {
         let hashHex = messageHash.prefix(8).map { String(format: "%02x", $0) }.joined()
         routerLogger.error("Delivery proof received for message \(hashHex, privacy: .public)")
+
+        // Confirmation arrived — stop tracking for rescue.
+        awaitingConfirmation.removeValue(forKey: messageHash)
+
+        // Late-proof race: if the message was already rescued back into
+        // pendingOutbound (path-lost or deadline), flip its in-memory state
+        // so processOutbound's `.delivered` guard removes it instead of
+        // re-sending. (Mutating in place — never removing — keeps any
+        // in-progress processOutbound iteration's indices valid.)
+        if let index = pendingOutbound.firstIndex(where: { $0.hash == messageHash }) {
+            pendingOutbound[index].state = .delivered
+        }
 
         // Update database state to delivered.
         //
@@ -1319,9 +1553,14 @@ public actor LXMRouter {
             // and the catch-block scaling should be re-aligned
             // together (and a unified deviation note added).
             msg.state = .outbound
-            msg.nextDeliveryAttempt = Date().addingTimeInterval(Self.PATH_REQUEST_WAIT)
+            // Path-aware backoff: with multi-path transport, an interface
+            // loss mid-transfer usually leaves a surviving path (e.g. TCP
+            // after BLE walked away) — retry fast over it. Only when no
+            // path remains do we wait out a path request.
+            let retryWait = await hasPath(msg.destinationHash) ? Self.LINK_RETRY_WAIT : Self.PATH_REQUEST_WAIT
+            msg.nextDeliveryAttempt = Date().addingTimeInterval(retryWait)
             pendingOutbound.append(msg)
-            routerLogger.info("\(msgHex, privacy: .public) re-enqueued for retry (attempts so far: \(msg.deliveryAttempts), next attempt in \(Int(Self.PATH_REQUEST_WAIT))s)")
+            routerLogger.info("\(msgHex, privacy: .public) re-enqueued for retry (attempts so far: \(msg.deliveryAttempts), next attempt in \(Int(retryWait))s)")
         } catch {
             routerLogger.error("Failed to re-enqueue \(msgHex, privacy: .public): \(error)")
             return

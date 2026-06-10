@@ -20,6 +20,9 @@ import ReticulumSwift
 import os.log
 
 private let directSendLogger = Logger(subsystem: "net.reticulum.lxmf", category: "DirectSend")
+/// Diagnostics on the shared `net.reticulum` subsystem so the whole direct
+/// delivery chain shows under one console filter (alongside the BLE logs).
+private let directDbgLogger = Logger(subsystem: "net.reticulum", category: "DIRECT-DBG")
 private let routerLogger = Logger(subsystem: "net.reticulum.lxmf", category: "LXMRouter")
 
 // MARK: - Outbound Resource Handler
@@ -40,6 +43,7 @@ final class LXMFOutboundResourceHandler: ResourceCallbacks, @unchecked Sendable 
 
     func resourceConcluded(_ resource: Resource) async {
         let state = await resource.state
+        directDbgLogger.notice("[DIRECT-DBG] outbound resourceConcluded: state=\(String(describing: state), privacy: .public) (sender side — .complete means receiver confirmed)")
         guard let resourceHash = await resource.hash else {
             // No hash means we have no way to map back to the message.
             // Without a hash there's also nothing in the maps to leak.
@@ -232,6 +236,15 @@ extension LXMRouter {
         // Mark as sent
         message.state = .sent
 
+        // Track for rescue: if the proof never arrives (path died, packet
+        // lost), the message is re-enqueued on path-lost events or when the
+        // confirmation deadline passes — it must not sit at .sent forever.
+        awaitingConfirmation[msgHash] = PendingConfirmation(
+            destinationHash: message.destinationHash,
+            packetTruncatedHash: packetTruncatedHash,
+            deadline: Date().addingTimeInterval(LXMFConstants.DELIVERY_CONFIRMATION_TIMEOUT)
+        )
+
         // Notify delegate
         notifyUpdate(message)
     }
@@ -254,6 +267,7 @@ extension LXMRouter {
         let packedSize = message.packed?.count ?? 0
         let method = String(describing: message.method)
         directSendLogger.info("sendDirect called: dest=\(destHashHex), packed=\(packedSize) bytes, method=\(method)")
+        directDbgLogger.notice("[DIRECT-DBG] sendDirect entered: dest=\(destHashHex, privacy: .public) packed=\(packedSize, privacy: .public) bytes")
 
         guard let transport = self.transport else {
             directSendLogger.error("transport not available")
@@ -265,16 +279,36 @@ extension LXMRouter {
             throw LXMFError.notPacked
         }
 
+        // Route preference by payload size: a resource transfer (anything
+        // over the single-link-packet limit) is hundreds of windowed parts —
+        // a few KB/s over BLE versus seconds over TCP/WLAN. Prefer
+        // infrastructure for it when a live indirect path exists; with no
+        // infrastructure (true offline) the direct mesh still carries it.
+        // Small link-packet messages keep the default nearby-direct routing.
+        let isResourceTransfer = packed.count > LXMFConstants.LINK_PACKET_MAX_CONTENT
+        var routeHint: ReticulumTransport.RouteHint? = nil
+        if isResourceTransfer,
+           await transport.hasLivePath(for: message.destinationHash, linkClass: .indirect) {
+            routeHint = .preferIndirect
+            directSendLogger.info("large transfer (\(packed.count) bytes): preferring indirect path")
+        }
+
         // Get or establish link to destination
         directSendLogger.info("getting/establishing link to \(destHashHex)")
         let link: Link
         do {
-            link = try await getOrEstablishLink(to: message.destinationHash, transport: transport)
+            link = try await getOrEstablishLink(
+                to: message.destinationHash,
+                transport: transport,
+                routeHint: routeHint
+            )
             let linkId = await link.linkId
             let linkIdHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
             directSendLogger.info("link established: linkId=\(linkIdHex)")
+            directDbgLogger.notice("[DIRECT-DBG] sendDirect: link active linkId=\(linkIdHex, privacy: .public) → will send data + register proof")
         } catch {
             directSendLogger.error("link establishment failed: \(error)")
+            directDbgLogger.notice("[DIRECT-DBG] sendDirect: link establishment FAILED to \(destHashHex, privacy: .public): \(error.localizedDescription, privacy: .public)")
             throw error
         }
 
@@ -364,6 +398,14 @@ extension LXMRouter {
                 messageHash: message.hash,
                 transport: transport
             )
+            // Track for rescue (same as the opportunistic path): a small
+            // DIRECT message whose link dies before the proof returns is
+            // re-enqueued on path-lost events / confirmation deadline.
+            awaitingConfirmation[message.hash] = PendingConfirmation(
+                destinationHash: message.destinationHash,
+                packetTruncatedHash: packet.getTruncatedHash(),
+                deadline: Date().addingTimeInterval(LXMFConstants.DELIVERY_CONFIRMATION_TIMEOUT)
+            )
             usedResourcePath = false
         } else {
             // Need Resource for large message
@@ -375,11 +417,13 @@ extension LXMRouter {
             let outboundHandler = LXMFOutboundResourceHandler(router: self)
             await link.setResourceCallbacks(outboundHandler)
 
+            directDbgLogger.notice("[DIRECT-DBG] resource path: calling link.sendResource for \(packed.count, privacy: .public) bytes over link")
             let resource = try await link.sendResource(data: packed, requestId: nil, isResponse: false)
             let numParts = await resource.numParts
             let resHash = await resource.hash
             let resHashHex = resHash?.prefix(8).map { String(format: "%02x", $0) }.joined() ?? "nil"
             directSendLogger.info("Resource created: hash=\(resHashHex), parts=\(numParts), advertisement sent")
+            directDbgLogger.notice("[DIRECT-DBG] resource path: advertisement sent hash=\(resHashHex, privacy: .public) parts=\(numParts, privacy: .public) — awaiting receiver part-requests + RESOURCE_PRF")
 
             // Register resource hash → message hash for delivery confirmation
             if let resHash = resHash {
@@ -438,19 +482,82 @@ extension LXMRouter {
     /// - Throws: LXMFError if link establishment fails
     ///
     /// Reference: RNS Link.py, Python LXMF LXMRouter direct delivery
-    private func getOrEstablishLink(to destinationHash: Data, transport: ReticulumTransport) async throws -> Link {
-        let destHex = destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-
-        // Check for existing delivery link
-        if let link = deliveryLinks[destinationHash] {
-            // Verify link is still active
-            let state = await link.state
-            if state == .active {
+    private func getOrEstablishLink(
+        to destinationHash: Data,
+        transport: ReticulumTransport,
+        routeHint: ReticulumTransport.RouteHint? = nil
+    ) async throws -> Link {
+        // Reuse an already-active link — unless a large transfer wants
+        // infrastructure and the cached link sits on a slow direct wire
+        // (BLE/MPC). In that case close it gracefully and establish fresh
+        // over the indirect path; small follow-up sends simply reuse the
+        // new TCP link.
+        if let link = deliveryLinks[destinationHash], await link.state == .active {
+            if routeHint == .preferIndirect,
+               let attached = await link.attachedInterfaceId,
+               await transport.linkClass(ofInterface: attached) == .direct {
+                directDbgLogger.notice("[DIRECT-DBG] re-establishing link to \(destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined(), privacy: .public): cached link on direct wire '\(attached, privacy: .public)', large transfer prefers indirect")
+                await link.close(reason: .initiatorClosed)
+                deliveryLinks.removeValue(forKey: destinationHash)
+            } else {
                 return link
             }
-            // Remove stale link
-            deliveryLinks.removeValue(forKey: destinationHash)
         }
+        // Coalesce concurrent establishment for the same destination. Without
+        // this, warm-link refresh + the outbound send + processOutbound retries
+        // all call here during one another's `await`s; each removes the other's
+        // half-open link and starts a rival, so none ever reaches .active and
+        // every attempt times out (the "re-establishing every 8s" churn).
+        // Sharing one in-flight Task per destination ends the thrash.
+        if let inflight = establishmentTasks[destinationHash] {
+            return try await inflight.value
+        }
+        let task: Task<Link, Error> = Task { [weak self] in
+            guard let self else { throw LXMFError.transportNotAvailable }
+            return try await self.establishLink(to: destinationHash, transport: transport, routeHint: routeHint)
+        }
+        establishmentTasks[destinationHash] = task
+        do {
+            let link = try await task.value
+            // Only clear if it's still OUR task — handleDirectPathLost may
+            // have already removed (and cancelled) it during the await.
+            if establishmentTasks[destinationHash] == task {
+                establishmentTasks[destinationHash] = nil
+            }
+            return link
+        } catch is CancellationError {
+            // Establishment was cancelled by handleDirectPathLost (the
+            // path/interface died). Map to linkFailed so processOutbound's
+            // catch applies the fast LINK_RETRY_WAIT instead of the
+            // per-attempt exponential backoff.
+            if establishmentTasks[destinationHash] == task {
+                establishmentTasks[destinationHash] = nil
+            }
+            throw LXMFError.linkFailed("Link establishment cancelled (path lost)")
+        } catch {
+            if establishmentTasks[destinationHash] == task {
+                establishmentTasks[destinationHash] = nil
+            }
+            throw error
+        }
+    }
+
+    /// Performs the actual link establishment. Always invoked through
+    /// `getOrEstablishLink`, which guarantees only one runs per destination at
+    /// a time (see `establishmentTasks`).
+    private func establishLink(
+        to destinationHash: Data,
+        transport: ReticulumTransport,
+        routeHint: ReticulumTransport.RouteHint? = nil
+    ) async throws -> Link {
+        let destHex = destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+
+        // A coalesced caller may have just finished establishing; reuse it.
+        if let link = deliveryLinks[destinationHash], await link.state == .active {
+            return link
+        }
+        // Drop any stale (non-active) link before establishing a fresh one.
+        deliveryLinks.removeValue(forKey: destinationHash)
 
         // Resolve recipient identity. For self-send (own delivery
         // destinations), the path table has no entry — announces leave
@@ -515,7 +622,7 @@ extension LXMRouter {
         // in pendingLinks so PROOF packets can be routed to it
         let link: Link
         do {
-            link = try await transport.initiateLink(to: destination, identity: localIdentity)
+            link = try await transport.initiateLink(to: destination, identity: localIdentity, routeHint: routeHint)
             let linkId = await link.linkId
             let linkIdHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
         } catch {
@@ -529,7 +636,7 @@ extension LXMRouter {
         // Link will transition: pending -> handshake -> active
         // when PROOF packet is received
         do {
-            try await waitForLinkActive(link, timeout: LXMFConstants.LINK_ESTABLISHMENT_TIMEOUT)
+            try await waitForLinkActive(link, timeout: LXMFConstants.DIRECT_LINK_ESTABLISHMENT_TIMEOUT)
         } catch {
             // Clean up stale pending link from transport to prevent accumulation.
             // Without this, each failed attempt leaves a stale entry in pendingLinks,
@@ -571,6 +678,13 @@ extension LXMRouter {
         var lastState: LinkState = .pending
         var pollCount = 0
         while Date() < deadline {
+            // Fail fast when handleDirectPathLost cancelled this
+            // establishment — the radio is gone; polling out the full
+            // timeout just delays the failover retry.
+            if Task.isCancelled {
+                routerLogger.info("Link \(linkIdHex) establishment cancelled (path lost)")
+                throw LXMFError.linkFailed("Link establishment cancelled (path lost)")
+            }
             let state = await link.state
             pollCount += 1
             if pollCount % 10 == 0 {
@@ -589,8 +703,9 @@ extension LXMRouter {
                 try? await Task.sleep(for: .milliseconds(100))
                 routerLogger.debug("Link \(linkIdHex) ready to send")
                 return
-            case .closed:
+            case .closed(let reason):
                 routerLogger.warning("Link \(linkIdHex) closed unexpectedly")
+                directDbgLogger.notice("[DIRECT-DBG] waitForLinkActive: link \(linkIdHex, privacy: .public) went .closed during establishment, reason=\(String(describing: reason), privacy: .public)")
                 throw LXMFError.linkFailed("Link closed unexpectedly")
             default:
                 // Still pending or handshaking, wait and retry
@@ -639,6 +754,7 @@ extension LXMRouter {
         transport: ReticulumTransport
     ) async throws {
         let packetTruncatedHash = packet.getTruncatedHash()
+        directDbgLogger.notice("[DIRECT-DBG] registered proof callback, awaiting proof for packet truncatedHash=\(packetTruncatedHash.prefix(8).map { String(format: "%02x", $0) }.joined(), privacy: .public)")
         await transport.registerProofCallback(truncatedHash: packetTruncatedHash) { [weak self] in
             await self?.handleDeliveryProofReceived(messageHash: messageHash)
         }

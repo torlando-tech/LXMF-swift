@@ -108,6 +108,12 @@ public struct LXMessage {
     /// - .propagated: skip direct, go straight to propagation node
     public var fallbackMethod: LXDeliveryMethod?
 
+    /// When true, a message that exhausts its delivery attempts is switched
+    /// to `.propagated` (same message, same hash) instead
+    /// of failing, provided an outbound propagation node is configured.
+    /// Mirrors Python `LXMessage.try_propagation_on_fail`.
+    public var tryPropagationOnFail: Bool = false
+
     /// Physical layer statistics (for received messages)
     public var rssi: Double?
     public var snr: Double?

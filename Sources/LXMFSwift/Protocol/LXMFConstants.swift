@@ -114,6 +114,21 @@ public enum LXMFConstants {
     /// Reference: RNS Link.ESTABLISHMENT_TIMEOUT_PER_HOP = 6 seconds
     public static let LINK_ESTABLISHMENT_TIMEOUT: TimeInterval = 30.0
 
+    /// Timeout for *direct delivery* link establishment (BLE/MPC mesh), which
+    /// is effectively single-hop. Successful handshakes complete in well under
+    /// a second, so the full 30s multi-hop budget only delays the lost-request
+    /// case: a request that draws no proof would otherwise sit 30s before the
+    /// fast retry (`LXMRouter.LINK_RETRY_WAIT`) kicks in. 10s gives a >10×
+    /// margin over a healthy handshake while letting a lost request fail fast.
+    public static let DIRECT_LINK_ESTABLISHMENT_TIMEOUT: TimeInterval = 10.0
+
+    /// Deadline for a delivery proof after a message reaches `.sent`.
+    /// Messages still unproven after this window are rescued back into the
+    /// outbound queue and retried (over whatever path transport now
+    /// prefers). 45s covers slow TCP relays; direct-path failures are
+    /// rescued much earlier by the transport's path-lost events.
+    public static let DELIVERY_CONFIRMATION_TIMEOUT: TimeInterval = 45.0
+
     // MARK: - Encryption Descriptions
 
     /// AES-128 encryption description
