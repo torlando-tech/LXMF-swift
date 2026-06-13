@@ -42,7 +42,10 @@ final class LXMFResourceHandler: ResourceCallbacks, @unchecked Sendable {
         // they don't silently leak), so gate on state before reading assembledData.
         let state = await resource.state
         guard state == .complete else {
-            routerLogger.error("Resource concluded in non-complete state \(state.description, privacy: .public) — not delivering")
+            // Expected lifecycle event: reticulum-swift fires this for failed/cancelled
+            // inbound transfers too (so they don't leak). Log at debug, not error — at
+            // error it reads like a malfunction and pollutes crash reporters / os_log.
+            routerLogger.debug("Resource concluded in non-complete state \(state.description, privacy: .public) — not delivering")
             return
         }
 

@@ -468,6 +468,40 @@ gate (or if swift's `LXMFDatabase` is reworked so that a duplicate
 hash insert is a true noop / error rather than an overwrite), this
 deviation should be revisited and possibly removed.
 
+### `saveDeliveredTransientIDs` — off-actor serial persistence (concurrency adaptation)
+
+**Site:** `Sources/LXMFSwift/Router/LXMRouter.swift` — `saveDeliveredTransientIDs`
+(`localDeliveriesWriteQueue` serial queue + snapshot dispatch), called from
+`recordDelivered`.
+
+**Python reference:** `LXMF/LXMRouter.py:1177-1184`
+(`save_locally_delivered_transient_ids`) — synchronously `msgpack.packb`s the whole
+`locally_delivered_transient_ids` dict and `write()`s it inline on the calling
+thread, on every delivery (and from maintenance).
+
+**Swift change:** `LXMRouter` is an `actor`; running python's inline synchronous
+serialize+atomic-write directly would hold the actor's serial executor (its mailbox)
+for the full I/O on every accepted inbound message, delaying every other queued
+router callback. Instead `saveDeliveredTransientIDs` takes a cheap snapshot of the
+dict **on the actor**, then serializes + writes it on a dedicated **serial**
+`DispatchQueue` (`localDeliveriesWriteQueue`). The serial queue preserves submission
+order, so the most-recent snapshot always wins the atomic write (a plain
+`Task.detached` per call would race the global executor and could persist a stale
+snapshot).
+
+**Reason:** Category (a) — a runtime need python's pattern can't express in the
+port: python's "synchronous write on whatever thread called us" maps onto a swift
+actor only by blocking that actor's serial executor. Durability semantics are
+unchanged — every `recordDelivered` still enqueues a full-dict write (save-on-every-
+delivery, same as python) — only *where* the bytes are serialized/written moves off
+the actor. The persisted file format (msgpack `{transient_id(bin): timestamp(float)}`)
+and the load path are byte-compatible with python.
+
+`flushPendingLocalDeliveries()` is a barrier on that serial queue for points where
+durability must be guaranteed synchronously (a graceful shutdown, or a test asserting
+the on-disk state); a real process restart drains the queue the same way. Python's
+inline write needs no such barrier because it is already synchronous.
+
 ## Resolved deviations
 
 (none yet — this file was created during the iOS smoke-pipeline

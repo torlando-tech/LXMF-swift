@@ -18,6 +18,7 @@
 //
 
 import Foundation
+import Dispatch
 import CryptoKit
 import ReticulumSwift
 import os.log
@@ -92,6 +93,13 @@ public actor LXMRouter {
     /// Path to the persisted duplicate-delivery cache (`<db-dir>/local_deliveries`),
     /// mirroring python's `<storagepath>/local_deliveries`. nil for in-memory test DBs.
     private var localDeliveriesPath: String?
+
+    /// Serial queue for persisting `local_deliveries` OFF the actor's executor (see
+    /// port-deviations.md). Writes are enqueued in order, so the most-recent snapshot
+    /// always wins the atomic write; the actor isn't blocked on disk I/O per message.
+    private let localDeliveriesWriteQueue = DispatchQueue(
+        label: "net.reticulum.lxmf.local-deliveries", qos: .utility
+    )
 
     /// Cached stamp costs from announces: destination_hash -> (timestamp, cost)
     public var outboundStampCosts: [Data: (Date, Int)] = [:]
@@ -981,22 +989,30 @@ public actor LXMRouter {
     /// {transient_id(bin) : timestamp(float)} written to `<db-dir>/local_deliveries`.
     func saveDeliveredTransientIDs() {
         guard let path = localDeliveriesPath else { return }
-        var entries: [LXMFMessagePackValue: LXMFMessagePackValue] = [:]
-        for (transientID, date) in deliveredTransientIDs {
-            entries[.binary(transientID)] = .double(date.timeIntervalSince1970)
-        }
-        do {
-            try packLXMF(.map(entries)).write(to: URL(fileURLWithPath: path), options: .atomic)
-            #if os(iOS)
-            // The Network Extension writes this while the device is locked → match the
-            // deliver-while-locked data-protection class.
-            try? FileManager.default.setAttributes(
-                [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
-                ofItemAtPath: path
-            )
-            #endif
-        } catch {
-            routerLogger.warning("Failed to persist local_deliveries: \(error)")
+        // Snapshot on the actor (cheap dict copy), then serialize + write off the
+        // actor's serial executor so the inbound hot path isn't blocked on disk I/O.
+        // The serial queue keeps writes ordered, so the latest snapshot always wins
+        // the atomic write. See port-deviations.md (python writes inline/synchronously,
+        // LXMRouter.py:1177-1184 — an actor can't without blocking its mailbox).
+        let snapshot = deliveredTransientIDs
+        localDeliveriesWriteQueue.async {
+            var entries: [LXMFMessagePackValue: LXMFMessagePackValue] = [:]
+            for (transientID, date) in snapshot {
+                entries[.binary(transientID)] = .double(date.timeIntervalSince1970)
+            }
+            do {
+                try packLXMF(.map(entries)).write(to: URL(fileURLWithPath: path), options: .atomic)
+                #if os(iOS)
+                // The Network Extension writes this while the device is locked → match the
+                // deliver-while-locked data-protection class.
+                try? FileManager.default.setAttributes(
+                    [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+                    ofItemAtPath: path
+                )
+                #endif
+            } catch {
+                routerLogger.warning("Failed to persist local_deliveries: \(error)")
+            }
         }
     }
 
@@ -1007,6 +1023,17 @@ public actor LXMRouter {
         deliveredTransientIDs[transientID] = Date()
         cleanDuplicateCache()
         saveDeliveredTransientIDs()
+    }
+
+    /// Block until every enqueued `local_deliveries` persistence has reached disk.
+    /// A barrier on the serial write queue: the hot path (`recordDelivered`) enqueues
+    /// writes without blocking the actor, and this drains them at a point where
+    /// durability must be guaranteed — a graceful shutdown, or a test asserting the
+    /// on-disk state. (A real process restart drains the queue the same way.)
+    func flushPendingLocalDeliveries() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            localDeliveriesWriteQueue.async { continuation.resume() }
+        }
     }
 
     /// Notify delegate of message failure.

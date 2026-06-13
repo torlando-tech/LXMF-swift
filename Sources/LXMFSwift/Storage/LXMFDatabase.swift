@@ -39,8 +39,12 @@ public actor LXMFDatabase {
         // Suspend cleanly when iOS backgrounds the process holding a lock, instead of
         // being 0xDEAD10CC-killed.
         config.observesSuspensionNotifications = true
-        // Take write locks up front to avoid cross-process SQLITE_BUSY upgrade deadlocks.
-        config.defaultTransactionKind = .immediate
+        // Take write locks up front to avoid cross-process SQLITE_BUSY upgrade
+        // deadlocks. Writer-only: a read-only pool issues deferred read transactions
+        // regardless, so this would be dead (and misleading) config on the reader.
+        if !readonly {
+            config.defaultTransactionKind = .immediate
+        }
         config.prepareDatabase { db in
             if !readonly {
                 // Enable WAL mode for concurrent reads during writes
