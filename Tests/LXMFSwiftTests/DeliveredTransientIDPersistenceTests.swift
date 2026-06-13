@@ -34,12 +34,15 @@ final class DeliveredTransientIDPersistenceTests: XCTestCase {
         await r1.recordDelivered(transientID)
         let inCache = await r1.deliveredTransientIDs[transientID]
         XCTAssertNotNil(inCache, "recordDelivered must populate the in-memory cache")
-        // The persistence write runs on a serial off-actor queue (non-blocking hot
-        // path); drain it so we assert durable on-disk state. A real process restart
-        // flushes the same queue before the next process opens the file.
+        // recordDelivered updates only the in-memory cache (python LXMRouter.py:1806);
+        // durable persistence happens on the maintenance cycle / post-sync / exit, not
+        // per delivery. Trigger + drain a save explicitly to assert the durable
+        // round-trip (what a maintenance tick or graceful shutdown does). The write runs
+        // on a serial off-actor queue, so flush it before reading the file.
+        await r1.saveDeliveredTransientIDs()
         await r1.flushPendingLocalDeliveries()
         XCTAssertTrue(FileManager.default.fileExists(atPath: dir + "local_deliveries"),
-                      "recordDelivered must persist local_deliveries next to the DB")
+                      "a persisted delivered-id cache must be written next to the DB")
 
         // Router #2 on the same path loads the persisted dedup (survives a restart).
         let r2 = try await LXMRouter(identity: identity, databasePath: dbPath)

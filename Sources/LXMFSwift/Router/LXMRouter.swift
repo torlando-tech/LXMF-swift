@@ -94,6 +94,14 @@ public actor LXMRouter {
     /// mirroring python's `<storagepath>/local_deliveries`. nil for in-memory test DBs.
     private var localDeliveriesPath: String?
 
+    /// Set when `deliveredTransientIDs` changed since the last persist. Python adds to
+    /// the cache in-memory on each delivery (LXMRouter.py:1806) and persists only on the
+    /// periodic maintenance cycle (:1365), after a propagation sync (:1588), and on exit
+    /// (`exit_handler`) — NOT per delivery. This flag drives that same cadence here so a
+    /// per-message DB-save failure can't durably blacklist a hash (the in-memory entry
+    /// is lost on restart, as in python, giving the sender a retry).
+    private var deliveredCacheDirty = false
+
     /// Serial queue for persisting `local_deliveries` OFF the actor's executor (see
     /// port-deviations.md). Writes are enqueued in order, so the most-recent snapshot
     /// always wins the atomic write; the actor isn't blocked on disk I/O per message.
@@ -933,6 +941,9 @@ public actor LXMRouter {
 
         // Persist state changes
         await persistPendingState()
+        // Durable delivered-dedup save on the maintenance cycle (python persists
+        // locally_delivered_transient_ids from its jobs/maintenance loop, LXMRouter.py:1365).
+        persistDeliveredTransientIDsIfDirty()
 
         // Schedule next processing cycle (unless shutdown)
         if !isShutdown {
@@ -1022,6 +1033,20 @@ public actor LXMRouter {
     func recordDelivered(_ transientID: Data) {
         deliveredTransientIDs[transientID] = Date()
         cleanDuplicateCache()
+        // In-memory only (python LXMRouter.py:1806). Durable persistence happens on the
+        // periodic maintenance cycle / after a prop sync / on exit — see
+        // `persistDeliveredTransientIDsIfDirty()` and `saveDeliveredTransientIDs()`.
+        deliveredCacheDirty = true
+    }
+
+    /// Persist the delivered-transient-id cache if it changed since the last save.
+    /// Called from the periodic processing cycle (and `notifySyncCompletion`, in the
+    /// Sync extension) — the swift analogue of python saving
+    /// `locally_delivered_transient_ids` from its maintenance loop (LXMRouter.py:1365),
+    /// not on every delivery. Internal (not private) so the cross-file extension reaches it.
+    func persistDeliveredTransientIDsIfDirty() {
+        guard deliveredCacheDirty else { return }
+        deliveredCacheDirty = false
         saveDeliveredTransientIDs()
     }
 

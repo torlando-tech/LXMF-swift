@@ -333,6 +333,10 @@ extension LXMRouter {
 
     /// Notify delegate of sync completion.
     private func notifySyncCompletion(newMessageCount: Int) {
+        // Durable delivered-dedup save after a propagation sync, mirroring python
+        // saving locally_delivered_transient_ids at the end of its transfer-concluded
+        // path (LXMRouter.py:1588) — synced messages were just recorded as delivered.
+        persistDeliveredTransientIDsIfDirty()
         if let wrapper = delegateWrapper, let delegate = wrapper.delegate {
             Task { @MainActor in
                 delegate.router(self, didCompleteSyncWithNewMessages: newMessageCount)

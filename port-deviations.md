@@ -468,34 +468,34 @@ gate (or if swift's `LXMFDatabase` is reworked so that a duplicate
 hash insert is a true noop / error rather than an overwrite), this
 deviation should be revisited and possibly removed.
 
-### `saveDeliveredTransientIDs` — off-actor serial persistence (concurrency adaptation)
+### `saveDeliveredTransientIDs` — off-actor serial write (concurrency adaptation)
 
 **Site:** `Sources/LXMFSwift/Router/LXMRouter.swift` — `saveDeliveredTransientIDs`
-(`localDeliveriesWriteQueue` serial queue + snapshot dispatch), called from
-`recordDelivered`.
+(`localDeliveriesWriteQueue` serial queue + snapshot dispatch).
 
 **Python reference:** `LXMF/LXMRouter.py:1177-1184`
 (`save_locally_delivered_transient_ids`) — synchronously `msgpack.packb`s the whole
-`locally_delivered_transient_ids` dict and `write()`s it inline on the calling
-thread, on every delivery (and from maintenance).
+`locally_delivered_transient_ids` dict and `write()`s it inline on the calling thread.
 
-**Swift change:** `LXMRouter` is an `actor`; running python's inline synchronous
-serialize+atomic-write directly would hold the actor's serial executor (its mailbox)
-for the full I/O on every accepted inbound message, delaying every other queued
-router callback. Instead `saveDeliveredTransientIDs` takes a cheap snapshot of the
-dict **on the actor**, then serializes + writes it on a dedicated **serial**
-`DispatchQueue` (`localDeliveriesWriteQueue`). The serial queue preserves submission
-order, so the most-recent snapshot always wins the atomic write (a plain
-`Task.detached` per call would race the global executor and could persist a stale
-snapshot).
+**Cadence (faithful, NOT a deviation):** python adds to `locally_delivered_transient_ids`
+**in-memory** on each delivery (`:1806`) and persists it only from the periodic
+maintenance loop (`:1365`), after a propagation sync (`:1588`), and on exit
+(`exit_handler`) — never per delivery. The swift port matches that: `recordDelivered`
+adds in-memory + sets `deliveredCacheDirty`; the persist runs from the periodic
+`processOutbound` maintenance tick (`persistDeliveredTransientIDsIfDirty`) and from
+`notifySyncCompletion` (post-sync). This is what keeps a per-message DB-save failure
+from durably blacklisting a hash — the in-memory entry is lost on restart, exactly as
+in python.
 
-**Reason:** Category (a) — a runtime need python's pattern can't express in the
-port: python's "synchronous write on whatever thread called us" maps onto a swift
-actor only by blocking that actor's serial executor. Durability semantics are
-unchanged — every `recordDelivered` still enqueues a full-dict write (save-on-every-
-delivery, same as python) — only *where* the bytes are serialized/written moves off
-the actor. The persisted file format (msgpack `{transient_id(bin): timestamp(float)}`)
-and the load path are byte-compatible with python.
+**The actual deviation — Category (a):** `LXMRouter` is an `actor`, and python's inline
+synchronous serialize+atomic-write would hold the actor's serial executor (its mailbox)
+for the full I/O. So `saveDeliveredTransientIDs` snapshots the dict **on the actor**,
+then serializes + writes it on a dedicated **serial** `DispatchQueue`
+(`localDeliveriesWriteQueue`). The serial queue preserves submission order so the
+most-recent snapshot wins the atomic write (a plain `Task.detached` per call would race
+the global executor and could persist a stale snapshot). Only *where* the bytes are
+written moves off the actor; the file format (msgpack `{transient_id(bin):
+timestamp(float)}`) and load path are byte-compatible with python.
 
 `flushPendingLocalDeliveries()` is a barrier on that serial queue for points where
 durability must be guaranteed synchronously (a graceful shutdown, or a test asserting
