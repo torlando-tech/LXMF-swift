@@ -172,7 +172,14 @@ public actor LXMFDatabase {
             try db.create(index: "idx_messages_reply_to", on: "messages", columns: ["reply_to_id"])
         }
 
-        try migrator.migrate(dbPool)
+        // Only the writer runs migrations: GRDB's migrator issues an internal
+        // `write {}` to atomically check/apply schema versions, which returns
+        // SQLITE_READONLY (throws) on a read-only pool. Under Model B the writer (the
+        // NE) owns the schema; the read-only app reader just opens the already-migrated
+        // store, so migrating from it would throw at init before any read could happen.
+        if !readonly {
+            try migrator.migrate(dbPool)
+        }
     }
 
     // MARK: - Message Operations
