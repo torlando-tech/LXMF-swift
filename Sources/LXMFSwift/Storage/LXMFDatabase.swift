@@ -494,8 +494,27 @@ public actor LXMFDatabase {
     /// - Throws: DatabaseError or LXMFError
     public func loadPendingOutbound() throws -> [LXMessage] {
         try dbPool.read { db in
+            // Reload `.outbound` (never-sent, awaiting first send) AND OPPORTUNISTIC
+            // messages persisted at `.sent` (sent, awaiting a delivery proof). Under
+            // Model B the iOS Network Extension is suspended/jetsammed mid-flight, so an
+            // opportunistic message awaiting its proof when the NE died must re-enter
+            // `pendingOutbound` on relaunch to be re-sent and earn a fresh proof —
+            // otherwise its in-memory proof callback (reticulum-swift, non-persisted) is
+            // gone and the message stays at a single checkmark forever. Python keeps
+            // `pending_outbound` in memory across its long-running process
+            // (LXMRouter.py:99); this reload emulates that durability for the jetsam-prone
+            // NE. SCOPED to `.opportunistic` on purpose: `.sent` is TERMINAL for
+            // PROPAGATED (the propagation node ack'd the upload, no recipient proof is
+            // expected — python removes it at LXMRouter.py:2544), so reloading a propagated
+            // `.sent` would wrongly re-upload it on every launch. DIRECT (a large-message
+            // fallback here) keeps its existing dequeue-at-`.sent` behavior. See
+            // port-deviations.md ("processOutbound keep-in-queue ... loadPendingOutbound").
             let records = try MessageRecord
-                .filter(Column("state") == LXMessageState.outbound.rawValue)
+                .filter(
+                    Column("state") == LXMessageState.outbound.rawValue
+                    || (Column("state") == LXMessageState.sent.rawValue
+                        && Column("method") == LXDeliveryMethod.opportunistic.rawValue)
+                )
                 .order(Column("timestamp").asc)
                 .fetchAll(db)
 

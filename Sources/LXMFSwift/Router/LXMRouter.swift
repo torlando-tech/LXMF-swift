@@ -51,6 +51,14 @@ public actor LXMRouter {
     /// Interval between outbound processing cycles
     public static let PROCESSING_INTERVAL: TimeInterval = 1
 
+    /// Wait between re-send attempts for a sent-but-unproven message (python
+    /// `LXMRouter.DELIVERY_RETRY_WAIT`, LXMRouter.py:32). An opportunistic / direct
+    /// small-packet message stays in `pendingOutbound` after it reaches `.sent` and is
+    /// re-sent on this cadence — earning a fresh delivery proof each time — until the
+    /// proof advances it to `.delivered` or `MAX_DELIVERY_ATTEMPTS` fails it. `nextDeliveryAttempt`
+    /// gates the re-send so the 1s processing loop can't turn this into a per-second storm.
+    public static let DELIVERY_RETRY_WAIT: TimeInterval = 10
+
     /// Baseline message expiry — matches python LXMRouter.MESSAGE_EXPIRY (30 days).
     public static let MESSAGE_EXPIRY: TimeInterval = 30 * 24 * 60 * 60
 
@@ -710,13 +718,28 @@ public actor LXMRouter {
                         try await sendOpportunistic(&msg)
                         pendingOutbound[i] = msg
                         routerLogger.info("sendOpportunistic completed for \(destHashHex)")
-                        indicesToRemove.insert(i)
 
-                        // Update database
-                        let sentMsg = pendingOutbound[i]
-                        Task.detached { [database] in
-                            try? await database.updateMessageState(id: sentMsg.hash, state: .sent)
-                        }
+                        // KEEP the message in `pendingOutbound` at `.sent` and schedule the
+                        // next attempt — do NOT dequeue it here. Opportunistic delivery is a
+                        // single fire-and-forget packet; advancement to `.delivered` depends
+                        // entirely on the returning delivery proof firing the in-memory proof
+                        // callback. If that packet OR its proof is lost (lossy mesh, or — under
+                        // Model B — the iOS Network Extension is suspended/jetsammed during the
+                        // proof window, dropping the in-memory `pendingProofCallbacks`), the
+                        // ONLY recovery is to re-send and earn a fresh proof. Mirrors python
+                        // `process_outbound`, which keeps opportunistic in `pending_outbound`
+                        // and re-sends every DELIVERY_RETRY_WAIT until DELIVERED or
+                        // MAX_DELIVERY_ATTEMPTS (LXMRouter.py:2585-2592). The entry is removed
+                        // only by the `.delivered` check at the top of this loop (set by
+                        // `handleDeliveryProofReceived`) or the MAX_DELIVERY_ATTEMPTS check.
+                        // (Previously it was dequeued here at `.sent`, so a single lost packet
+                        // or proof stranded the message at one checkmark forever — the reported
+                        // "sent messages don't always process the delivery proof" bug.)
+                        // `nextDeliveryAttempt` gates the re-send (shouldAttemptDelivery) so the
+                        // 1s loop can't resend-storm; the cycle-end `persistPendingState()`
+                        // saves the full record (state + `deliveryAttempts`), so the retry
+                        // budget survives an NE reload.
+                        pendingOutbound[i].nextDeliveryAttempt = Date().addingTimeInterval(Self.DELIVERY_RETRY_WAIT)
                     }
 
                 case .direct:
@@ -1114,6 +1137,18 @@ public actor LXMRouter {
         // same fix applied to `handlePropagationAccepted` (PR #7
         // greptile round 4).
         try? await database.updateMessageState(id: messageHash, state: .delivered)
+
+        // Flip the in-memory `pendingOutbound` entry to `.delivered` too. Now that a sent
+        // opportunistic message STAYS in the queue for retry (see processOutbound), the
+        // proof handler must mark it delivered in-memory so the next processOutbound pass
+        // removes it (the `.delivered` check) and STOPS re-sending — otherwise the loop
+        // would keep re-sending an already-delivered message until MAX_DELIVERY_ATTEMPTS.
+        // Mirrors python `__mark_delivered` setting `state = DELIVERED` in-memory
+        // (LXMessage.py:558-561), which is what makes `process_outbound` drop it
+        // (LXMRouter.py:2516-2519). No-op when the entry was already removed (e.g. DIRECT).
+        if let idx = pendingOutbound.firstIndex(where: { $0.hash == messageHash }) {
+            pendingOutbound[idx].state = .delivered
+        }
 
         // Notify delegate for UI refresh
         if let wrapper = delegateWrapper, let delegate = wrapper.delegate {

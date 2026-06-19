@@ -409,6 +409,56 @@ PROPAGATED treatment that landed earlier in this PR.
 in-flight `.outbound` DB write goes away and the resource
 callbacks just mutate in-memory state.
 
+**Sub-deviation (OPPORTUNISTIC keep-in-queue + `.sent` reload, 2026-06-19):**
+This is the "long-term refactor" from the re-sync note above, landed for the
+OPPORTUNISTIC path only. `processOutbound`'s opportunistic branch no longer
+`indicesToRemove.insert(i)`s the message at `.sent`; it leaves it in
+`pendingOutbound` and sets `nextDeliveryAttempt = now + DELIVERY_RETRY_WAIT`.
+The message is now removed only by the `.delivered` check at the top of the loop
+(set by `handleDeliveryProofReceived`, which also flips the in-memory entry to
+`.delivered`) or the `MAX_DELIVERY_ATTEMPTS` check. This brings the opportunistic
+path into **exact parity** with python `process_outbound`
+(`LXMRouter.py:2566-2592`): keep in `pending_outbound`, re-send every
+`DELIVERY_RETRY_WAIT` (new constant = 10, python `LXMRouter.py:32`) until
+DELIVERED or `fail_message`. It is divergence-REDUCING (the prior dequeue-at-`.sent`
+was the divergence). The explicit per-send `.sent` DB write is dropped — the
+cycle-end `persistPendingState()` covers durability now that the message stays
+queued.
+
+  - **Why it was a bug:** advancement to `.delivered` depended ENTIRELY on the
+    in-memory proof callback (`ReticulumTransport.pendingProofCallbacks`, not
+    persisted). A single lost packet/proof — or, under Model B, the iOS NE being
+    suspended/jetsammed during the proof window — stranded the message at one
+    checkmark forever (user-reported: "sent messages don't always process the
+    delivery proof").
+
+  - **Swift-specific reload — Category (a), no python analog:**
+    `loadPendingOutbound()` (`LXMFDatabase.swift`) now also reloads
+    `state == .sent && method == .opportunistic`, not just `.outbound`. Python
+    never reloads `pending_outbound` from disk (its process is long-lived,
+    `LXMRouter.py:99`); the swift port MUST, because the NE is jetsammed
+    mid-flight. The filter is SCOPED to `.opportunistic`: `.sent` is terminal for
+    PROPAGATED (python removes it at `LXMRouter.py:2544` — no recipient proof is
+    expected), so reloading propagated `.sent` would wrongly re-upload it every
+    launch. DIRECT keeps its existing dequeue-at-`.sent` behavior (it is only a
+    large-message fallback in Columba, and python's DIRECT retry is driven by the
+    link-packet receipt timeout callback `__link_packet_timed_out`, LXMessage.py:480
+    — a different mechanism the swift port has not yet wired; tracked as follow-up).
+
+  - **Duplicate-resend safety:** re-sending is inherent to python's design and is
+    deduped recipient-side by the stable `message.hash` transient id
+    (`LXMRouter.swift` `deliveredTransientIDs`, persisted via `recordDelivered`),
+    so the recipient shows exactly one row. Because the recipient's delivery
+    destination is PROVE_ALL, a duplicate resend still earns a proof, which is what
+    clears a stuck single-check (a mere callback re-registration could not — the
+    original packet's hash isn't persisted and re-encryption changes it).
+
+**Re-sync note:** the DIRECT path can be brought to full python parity later by
+wiring a link-packet receipt timeout callback (python `__link_packet_timed_out`)
+and keeping DIRECT in-queue at `.sending`; until then DIRECT relies on its
+in-memory proof callback + the per-NE-restart reload is intentionally
+opportunistic-only.
+
 ### `lxmfDelivery` — broadcast-echo-only self-echo gate
 
 **Site:** `Sources/LXMFSwift/Router/LXMRouter.swift` — `lxmfDelivery(_:method:)`,
