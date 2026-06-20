@@ -595,6 +595,23 @@ durability must be guaranteed synchronously (a graceful shutdown, or a test asse
 the on-disk state); a real process restart drains the queue the same way. Python's
 inline write needs no such barrier because it is already synchronous.
 
+**Sub-deviation (dedup rollback on failed store — Category (b) robustness, 2026-06-20):**
+`lxmfDelivery` calls `recordDelivered(message.hash)` BEFORE `database.saveMessage` (faithful
+to python `LXMRouter.py:1802-1806`, which sets `locally_delivered_transient_ids[hash]` before
+the delivery callback, so a concurrent duplicate arriving while the store is in flight is still
+rejected). But if the swift `saveMessage` THROWS, the message was never persisted; python leaves
+the dedup entry in place (a failed store there also blacklists the hash until the unpersisted
+in-memory entry is lost on restart). The swift port instead ROLLS BACK — `deliveredTransientIDs.removeValue(forKey:)`
++ re-mark dirty + `return false` (no delegate fire) — so the sender's retry can still be accepted
+and the message isn't permanently lost. Strictly more robust than python; flagged by greptile on PR #9.
+
+**Sub-deviation (`shutdown()` flushes the dedup cache — python-parity, 2026-06-20):**
+`shutdown()` is now `async` and calls `persistDeliveredTransientIDsIfDirty()` +
+`await flushPendingLocalDeliveries()` before teardown, so deliveries recorded since the last
+periodic flush reach disk on a graceful stop. Mirrors python's `exit_handler` calling
+`save_locally_delivered_transient_ids()` (LXMRouter.py:1365). Making `shutdown()` async is
+transparent — every caller already `await`s it (it's an actor method). Flagged by greptile on PR #9.
+
 ## Resolved deviations
 
 (none yet — this file was created during the iOS smoke-pipeline

@@ -333,8 +333,15 @@ public actor LXMRouter {
     /// Shutdown the router, stopping the processing loop.
     ///
     /// Call this when the router is no longer needed to clean up background tasks.
-    public func shutdown() {
+    public func shutdown() async {
         isShutdown = true
+        // Flush the delivered-dedup cache before teardown so deliveries from the last
+        // maintenance window (recordDelivered enqueues but persists only on the periodic
+        // cycle) aren't dropped on a graceful stop — mirrors python flushing from its
+        // exit_handler (LXMRouter.py:1365). Enqueue the latest snapshot, then await the
+        // serial-queue barrier so the write reaches disk before the process tears down.
+        persistDeliveredTransientIDsIfDirty()
+        await flushPendingLocalDeliveries()
     }
 
     /// Restart the router after a shutdown.
@@ -569,6 +576,17 @@ public actor LXMRouter {
                 try await database.saveMessage(message)
             } catch {
                 routerLogger.error("Failed to persist message: \(error)")
+                // Roll back the dedup entry. `recordDelivered` ran BEFORE the save (matching
+                // python LXMRouter.py:1806, so a concurrent duplicate arriving during the save
+                // `await` is still rejected) — but the save FAILED, so the message was never
+                // stored. Leaving the hash blacklisted would reject the sender's retry and lose
+                // the message permanently. Remove it (and re-mark dirty so the removal persists)
+                // so a retry can still be accepted, and bail without firing the delegate (there
+                // is nothing on disk to reload). Strictly more robust than python, which leaves
+                // the entry on a failed store — see port-deviations.md.
+                deliveredTransientIDs.removeValue(forKey: message.hash)
+                deliveredCacheDirty = true
+                return false
             }
 
             // Invoke delegate callback on main actor
