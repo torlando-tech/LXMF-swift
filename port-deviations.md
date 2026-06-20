@@ -477,13 +477,19 @@ proof" no-resend (LXMRouter.py:2618-2627). Removed only by the `.delivered` chec
      by `process_outbound`, and RNS never retransmits link DATA at the packet layer (confirmed:
      no packet RETRIES in Packet.py/Link.py) — the transport callback would add no observable
      benefit and, being non-persisted, would not survive an NE jetsam anyway.
-  2. python's receipt timeout is `max(rtt*6, ...)` (sub-second); the swift port collapses it into
-     the single `DELIVERY_RETRY_WAIT` (10s) gate. Observably equivalent because `rtt*6 << 10s`, so
-     the wire-visible inter-send interval (~10s) and total send count (~`MAX_DELIVERY_ATTEMPTS`)
-     are preserved; keeping the link alive during the proof-wait is divergence-REDUCING (a late
-     proof still lands on the existing link and clears the message).
+  2. python's receipt timeout is `max(rtt*6, ...)` (sub-second), but that only speeds link-death
+     DETECTION, NOT the re-send: python's `__link_packet_timed_out` (LXMessage.py:613-618) merely
+     tears the link + sets `OUTBOUND`, and `process_outbound`'s CLOSED branch then re-sends on
+     `next_delivery_attempt = now + DELIVERY_RETRY_WAIT` (LXMRouter.py:2647). So python's OBSERVABLE
+     re-send is itself 10s-gated, and the swift single-`DELIVERY_RETRY_WAIT` gate reproduces it
+     exactly (in fact marginally faster — swift reverts AND re-sends in the same pass). An rtt*6
+     fast-timeout (issue #10a) was ANALYZED AND REJECTED: it buys zero delivery latency while
+     tearing alive-but-slow links sub-second (LINKREQUEST→PROOF handshake churn on the
+     battery-constrained NE) and ORPHANING late proofs that the 10s model successfully delivers on
+     the still-alive link. Deliberate trade-off, not a missing feature; revisit only with mesh
+     telemetry showing a re-send model that is NOT `DELIVERY_RETRY_WAIT`-gated.
 
-Two swift-runtime concurrency accommodations guard against an actor-yield race that python
+Three swift-runtime concurrency accommodations guard against an actor-yield race that python
 has no analog for (python mutates the queued `LXMessage` in place on a single-threaded
 `process_outbound`; the swift actor releases its executor at every `await`, letting a queued
 `handleDeliveryProofReceived` interleave):
@@ -495,12 +501,26 @@ has no analog for (python mutates the queued `LXMessage` in place on a single-th
      a proof flipping the entry to `.delivered` during the teardown awaits would be clobbered
      back to `.outbound`, re-entering the retry loop until `MAX_DELIVERY_ATTEMPTS` (caught by
      greptile on PR #9).
+  3. The DIRECT unexpected-close handler (`handleLinkUnexpectedClose`, issue #10b) carries a
+     `linkId` IDENTITY GUARD — it acts only if `deliveryLinks[destinationHash]?.linkId` still
+     equals the link the callback fired for, so a stale callback from an OLD link (already
+     superseded by a re-send over a NEWER link) can't clobber the newer in-flight send — and it
+     RE-CHECKS `state == .sent` after its teardown await (same as #2).
 
-**Re-sync note:** two follow-ups remain for stricter parity (LXMF-swift issue #10): (a) an
-optional shorter `max(link.rtt*6, floor)` gate for faster dead-link detection (accepting more link
-churn), and (b) wiring `Link.setCloseCallback` so an UNEXPECTED early link close reverts
-`.sent`→`.outbound` immediately instead of after the `DELIVERY_RETRY_WAIT` window (python's CLOSED
-branch acts immediately, LXMRouter.py:2628-2647).
+**Issue #10 resolution (DIRECT parity, 2026-06-20):**
+  (a) rtt-based fast dead-link detection — ANALYZED AND REJECTED (see point 2 above): net-negative,
+      no delivery-latency gain, adds handshake churn + orphans late proofs.
+  (b) `Link.setCloseCallback` early-close reaction — IMPLEMENTED as a faithful port of python's
+      CLOSED branch (LXMRouter.py:2628-2647): on an UNEXPECTED link close, `handleLinkUnexpectedClose`
+      pops the dead link (2643-2644) + requests a fresh path (2631) + reverts the in-flight `.sent`
+      message to `.outbound`. The re-send stays `DELIVERY_RETRY_WAIT`-gated (`nextDeliveryAttempt`
+      is deliberately NOT bumped — python sets `now + DELIVERY_RETRY_WAIT` at 2647, NOT eager, and
+      the original send already armed that gate; bumping it would regress recovery), so it adds no
+      link-establishment churn over the landed code — only front-loads `request_path`. Our own
+      deliberate teardown is suppressed because `closeAndRemoveDeliveryLink` clears the close
+      callback before its close (reason `.timeout` alone can't distinguish our close from a
+      watchdog one). No reticulum-swift change required (`setCloseCallback` Link.swift:318,
+      fire-once-clear :1346, `TeardownReason`, `Link.rtt` :161 all already present).
 
 ### `lxmfDelivery` — broadcast-echo-only self-echo gate
 

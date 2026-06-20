@@ -1201,6 +1201,69 @@ public actor LXMRouter {
         }
     }
 
+    /// A DIRECT delivery link closed UNEXPECTEDLY (peer gone / network drop) while a
+    /// small-packet message was in flight. The swift analog of python's `process_outbound`
+    /// CLOSED branch (LXMRouter.py:2628-2647): pop the dead link and request a fresh path
+    /// at once, and revert the in-flight `.sent` message to `.outbound`, so recovery doesn't
+    /// wait out the full `DELIVERY_RETRY_WAIT` gate. Does NOT touch `nextDeliveryAttempt` or
+    /// kick `processOutbound` — python's re-send stays `DELIVERY_RETRY_WAIT`-gated
+    /// (LXMRouter.py:2647, NOT eager) and the original send already armed that gate; bumping
+    /// it would regress recovery. Wired by `getOrEstablishLink`; our own deliberate teardown
+    /// is suppressed because `closeAndRemoveDeliveryLink` clears the callback first.
+    internal func handleLinkUnexpectedClose(destinationHash: Data, linkId: Data, reason: TeardownReason) async {
+        // Identity guard: act only if THIS link is still the current delivery link for the
+        // destination. A stale callback from an OLDER link (already superseded by a fresh
+        // re-send over a NEWER link) must not clobber the newer in-flight send. No python
+        // analog — python's single-threaded poll can't observe a stale link object.
+        guard await deliveryLinks[destinationHash]?.linkId == linkId else { return }
+        let destHex = destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+        routerLogger.info("DIRECT link to \(destHex) closed unexpectedly (\(String(describing: reason))) — popping link + requesting path")
+
+        // Pop the dead link (mirrors python popping `direct_links`, LXMRouter.py:2643-2644).
+        await closeAndRemoveDeliveryLink(destinationHash)
+
+        // Revert the in-flight small-packet to `.outbound` so the next processOutbound pass
+        // re-sends it. The `.state == .sent` is IN the predicate (not a separate check after
+        // firstIndex) for two reasons: (1) it selects the RIGHT entry when multiple messages
+        // share the destination — a delivered-but-not-yet-removed one, or a second in-flight
+        // send — rather than whichever is first by index; (2) evaluated AFTER the teardown
+        // await, it doubles as the proof-landed re-check, so a proof that flipped the entry to
+        // `.delivered` meanwhile is simply not matched (not clobbered). The filter also excludes
+        // resource-path (`.sending`) messages, which own their conclusion handlers
+        // (handleResourceTransferComplete / handleOutboundResourceFailed).
+        if let idx = pendingOutbound.firstIndex(where: { $0.destinationHash == destinationHash && $0.state == .sent }) {
+            pendingOutbound[idx].state = .outbound
+            let snapshot = pendingOutbound[idx]
+            try? await database.saveMessage(snapshot)
+        }
+
+        // Front-load the path request (mirrors python LXMRouter.py:2631) so the
+        // re-establishment at the unchanged DELIVERY_RETRY_WAIT gate finds a path first-try
+        // instead of burning a PATH_REQUEST_WAIT cycle.
+        requestPath(destinationHash)
+    }
+
+    // MARK: - Test support
+    //
+    // `internal` seams (reached only via `@testable import`, never public API) so unit tests
+    // can drive actor-isolated state — `deliveryLinks` / `pendingOutbound` — without standing up
+    // a full link handshake. Mirrors reticulum-swift's own `_setStateForTesting` convention.
+
+    /// Seed a delivery link for `destinationHash` (test-only).
+    internal func _seedDeliveryLinkForTesting(_ link: Link, destinationHash: Data) {
+        deliveryLinks[destinationHash] = link
+    }
+
+    /// Append a pre-built message to `pendingOutbound` (test-only).
+    internal func _enqueuePendingForTesting(_ message: LXMessage) {
+        pendingOutbound.append(message)
+    }
+
+    /// Read the in-memory state of a queued message by hash (test-only).
+    internal func _pendingStateForTesting(messageHash: Data) -> LXMessageState? {
+        pendingOutbound.first(where: { $0.hash == messageHash })?.state
+    }
+
     /// Handle outbound resource transfer completion (RESOURCE_PRF received).
     ///
     /// Called by `LXMFOutboundResourceHandler` when a resource proof is
