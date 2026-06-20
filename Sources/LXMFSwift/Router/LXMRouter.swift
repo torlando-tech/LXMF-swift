@@ -716,8 +716,14 @@ public actor LXMRouter {
                         routerLogger.debug("Calling sendOpportunistic for \(destHashHex)")
                         var msg = pendingOutbound[i]
                         try await sendOpportunistic(&msg)
-                        pendingOutbound[i] = msg
                         routerLogger.info("sendOpportunistic completed for \(destHashHex)")
+
+                        // A delivery proof for an EARLIER send can land DURING the sendOpportunistic
+                        // await and flip the queue entry to `.delivered` (handleDeliveryProofReceived).
+                        // Don't clobber that terminal state with this send's `.sent` writeback — leave
+                        // it for the top-of-loop `.delivered` removal.
+                        guard pendingOutbound[i].state != .delivered else { break }
+                        pendingOutbound[i] = msg
 
                         // KEEP the message in `pendingOutbound` at `.sent` and schedule the
                         // next attempt — do NOT dequeue it here. Opportunistic delivery is a
@@ -743,65 +749,71 @@ public actor LXMRouter {
                     }
 
                 case .direct:
-                    // Direct delivery: over link
+                    // Direct delivery: over link.
                     let destHashHex = pendingOutbound[i].destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+
+                    // PROOF-WAIT TIMEOUT (python `__link_packet_timed_out`, LXMessage.py:613-618).
+                    // A small-packet DIRECT message stays in `pendingOutbound` at `.sent` after its
+                    // send (below) with `nextDeliveryAttempt = now + DELIVERY_RETRY_WAIT`. Reaching
+                    // this branch means `shouldAttemptDelivery` returned true — i.e. the proof-wait
+                    // window elapsed WITHOUT `handleDeliveryProofReceived` flipping it to `.delivered`.
+                    // So tear down the (possibly dead) delivery link and revert to `.outbound`, then
+                    // re-establish a FRESH link + re-send below. Mirrors python, whose timeout
+                    // callback calls `destination.teardown()` + sets state OUTBOUND and whose
+                    // `process_outbound` then pops `direct_links` and re-establishes
+                    // (LXMRouter.py:2628-2670). The single `deliveryAttempts` increment at the top of
+                    // this loop covers the whole revert+resend cycle. (Without this, a small-packet
+                    // DIRECT message whose link proof was lost — or whose NE was suspended during the
+                    // proof window — stranded at one checkmark, the same bug fixed for opportunistic.)
+                    if pendingOutbound[i].state == .sent {
+                        await closeAndRemoveDeliveryLink(pendingOutbound[i].destinationHash)
+                        pendingOutbound[i].state = .outbound
+                    }
+
                     let hasPathToRecipient = await hasPath(pendingOutbound[i].destinationHash)
                     let attempt = pendingOutbound[i].deliveryAttempts
                     routerLogger.info("Direct delivery: dest=\(destHashHex), hasPath=\(hasPathToRecipient), attempt=\(attempt)")
-                    routerLogger.debug("Checking path to \(destHashHex), hasPath=\(hasPathToRecipient)")
                     if hasPathToRecipient {
                         // Attempt link-based send (copy out for inout async call)
                         routerLogger.info("Starting sendDirect to \(destHashHex)")
                         var msg = pendingOutbound[i]
                         try await sendDirect(&msg)
-                        pendingOutbound[i] = msg
                         routerLogger.info("sendDirect completed to \(destHashHex)")
-                        indicesToRemove.insert(i)
 
-                        // DB persistence policy mirrors the PROPAGATED
-                        // branch's two-path treatment. Greptile flagged
-                        // (PR #7 round 5) that the previous unconditional
-                        // `Task.detached { .sent }` here left a large
-                        // DIRECT resource transfer with the DB at `.sent`
-                        // immediately after `sendDirect` returned — even
-                        // though the resource was still in flight. A
-                        // crash before RESOURCE_PRF arrived would leave
-                        // the message "sent" on disk with no
-                        // re-enqueue, and the recipient would never get
-                        // it.
-                        //
-                        // Now branched the same way as PROPAGATED
-                        // (LXMRouter.swift:805-842):
-                        //   - sendDirect's small-packet path returns
-                        //     with state=.sent; persist `.sent` via
-                        //     `updateMessageState` (state-column only).
-                        //   - sendDirect's resource path returns with
-                        //     state=.sending; persist `.outbound` via
-                        //     full-record `saveMessage` so
-                        //     `deliveryAttempts` is carried into the DB
-                        //     and a crash between here and the
-                        //     resource callback re-enqueues the
-                        //     message at the right attempt count.
-                        // Both writes are awaited inside the actor so
-                        // the callback writes (`.delivered` for
-                        // success, `.outbound` again for re-enqueue,
-                        // `.rejected`/`.cancelled` for terminals) are
-                        // strictly serialized after this one. Without
-                        // the await, a fast RESOURCE_PRF could land
-                        // its `.delivered` write before this
-                        // `.outbound` write and get clobbered.
-                        let snapshot = pendingOutbound[i]
-                        if snapshot.state == .sending {
-                            var outboundSnapshot = snapshot
-                            outboundSnapshot.state = .outbound
-                            try? await database.saveMessage(outboundSnapshot)
+                        // A delivery proof for an EARLIER send can land DURING the sendDirect await
+                        // and flip the queue entry to `.delivered` (handleDeliveryProofReceived). Do
+                        // NOT clobber that terminal state with this send's `.sent` writeback — leave
+                        // it for the top-of-loop `.delivered` removal.
+                        if pendingOutbound[i].state == .delivered {
+                            // proof won the race — nothing to persist or keep in queue.
                         } else {
-                            try? await database.updateMessageState(id: snapshot.hash, state: snapshot.state)
+                            pendingOutbound[i] = msg
+                            let snapshot = pendingOutbound[i]
+                            if snapshot.state == .sending {
+                                // RESOURCE path: the large transfer is in flight; its terminal state
+                                // is driven by handleResourceTransferComplete / handleOutboundResourceFailed
+                                // (via pendingResourceDeliveries). Persist `.outbound` (full record) so a
+                                // crash / NE restart mid-transfer re-enqueues it, and drop it from the
+                                // in-memory queue (the resource callbacks own its terminal state).
+                                var outboundSnapshot = snapshot
+                                outboundSnapshot.state = .outbound
+                                try? await database.saveMessage(outboundSnapshot)
+                                indicesToRemove.insert(i)
+                            } else {
+                                // SMALL-PACKET path (state == .sent): KEEP in `pendingOutbound` and wait
+                                // DELIVERY_RETRY_WAIT for the proof, mirroring the opportunistic path and
+                                // python DIRECT keeping the message in `pending_outbound` until DELIVERED
+                                // (LXMRouter.py:2517-2519). Re-sent over a fresh link on the next pass if
+                                // still unproven (the timeout-revert at the top of this case). Full-record
+                                // save so `deliveryAttempts` + state survive an NE reload (otherwise the
+                                // retry budget resets to 0 → unbounded retries).
+                                pendingOutbound[i].nextDeliveryAttempt = Date().addingTimeInterval(Self.DELIVERY_RETRY_WAIT)
+                                try? await database.saveMessage(pendingOutbound[i])
+                            }
                         }
                     } else {
                         // Need path first
                         routerLogger.warning("No path to \(destHashHex), requesting path")
-                        routerLogger.debug("No path to \(destHashHex), requesting path")
                         requestPath(pendingOutbound[i].destinationHash)
                         pendingOutbound[i].nextDeliveryAttempt = Date().addingTimeInterval(Self.PATH_REQUEST_WAIT)
                     }

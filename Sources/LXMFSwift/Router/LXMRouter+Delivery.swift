@@ -649,6 +649,21 @@ extension LXMRouter {
             throw error
         }
     }
+
+    /// Tear down the cached delivery link to `destinationHash` (sending a LINKCLOSE) and drop
+    /// it from `deliveryLinks` + the transport. The DIRECT analog of python
+    /// `__link_packet_timed_out` → `packet_receipt.destination.teardown()` (LXMessage.py:615)
+    /// and `process_outbound`'s link-CLOSED branch popping `direct_links` (LXMRouter.py:2638-2641):
+    /// when a small-packet DIRECT message's proof-wait window elapses with no proof, `processOutbound`
+    /// calls this so the message re-establishes a FRESH link on its re-send rather than reusing a
+    /// possibly-dead one. No-op if no link is cached. Reuses the same teardown primitives as the
+    /// stale-link cleanup in `getOrEstablishLink`. No reticulum-swift change required.
+    internal func closeAndRemoveDeliveryLink(_ destinationHash: Data) async {
+        guard let link = deliveryLinks.removeValue(forKey: destinationHash) else { return }
+        let linkId = await link.linkId
+        await link.close(reason: .timeout)
+        await transport?.unregisterLink(linkId: linkId)
+    }
 }
 
 

@@ -440,10 +440,9 @@ queued.
     mid-flight. The filter is SCOPED to `.opportunistic`: `.sent` is terminal for
     PROPAGATED (python removes it at `LXMRouter.py:2544` — no recipient proof is
     expected), so reloading propagated `.sent` would wrongly re-upload it every
-    launch. DIRECT keeps its existing dequeue-at-`.sent` behavior (it is only a
-    large-message fallback in Columba, and python's DIRECT retry is driven by the
-    link-packet receipt timeout callback `__link_packet_timed_out`, LXMessage.py:480
-    — a different mechanism the swift port has not yet wired; tracked as follow-up).
+    launch. DIRECT small-packet `.sent` is now ALSO reloaded (see the DIRECT
+    sub-deviation below); a DIRECT RESOURCE transfer is persisted at `.outbound`
+    (not `.sent`), so it is caught by the first clause and never double-handled.
 
   - **Duplicate-resend safety:** re-sending is inherent to python's design and is
     deduped recipient-side by the stable `message.hash` transient id
@@ -453,11 +452,48 @@ queued.
     clears a stuck single-check (a mere callback re-registration could not — the
     original packet's hash isn't persisted and re-encryption changes it).
 
-**Re-sync note:** the DIRECT path can be brought to full python parity later by
-wiring a link-packet receipt timeout callback (python `__link_packet_timed_out`)
-and keeping DIRECT in-queue at `.sending`; until then DIRECT relies on its
-in-memory proof callback + the per-NE-restart reload is intentionally
-opportunistic-only.
+**Sub-deviation (DIRECT small-packet keep-in-queue + proof-wait-timeout retry, 2026-06-19):**
+DIRECT small-packet now uses the SAME poll-based keep-in-queue model as opportunistic,
+rather than dequeuing at `.sent`. `processOutbound`'s `.direct` case keeps the message in
+`pendingOutbound` at `.sent` with `nextDeliveryAttempt = now + DELIVERY_RETRY_WAIT` and a
+full-record `saveMessage`; `loadPendingOutbound` reloads DIRECT `.sent`; `handleDeliveryProofReceived`
+already flips the in-memory entry to `.delivered` (shared with opportunistic). On a pass where
+the message is still `.sent` and the proof-wait window elapsed (`shouldAttemptDelivery` true),
+the top of the `.direct` case tears down the delivery link (`closeAndRemoveDeliveryLink` →
+`Link.close(.timeout)` + `transport.unregisterLink`), reverts `.sent`→`.outbound`, and re-sends
+over a FRESH link in the same pass. This mirrors python's `__link_packet_timed_out`
+(`destination.teardown()` + `state = OUTBOUND`, LXMessage.py:613-618) and `process_outbound`'s
+link-CLOSED branch popping `direct_links` + re-establishing on the `DELIVERY_RETRY_WAIT` cadence
+(LXMRouter.py:2628-2670). While awaiting the proof on a live link the message is SKIPPED by
+`shouldAttemptDelivery`, so no duplicate goes out during the wait — matching python's "waiting for
+proof" no-resend (LXMRouter.py:2618-2627). Removed only by the `.delivered` check or
+`MAX_DELIVERY_ATTEMPTS` (`fail_message` parity).
+
+**Two intentional divergences — Category (a):**
+  1. reticulum-swift has NO `set_timeout_callback` primitive (python `PacketReceipt`,
+     Packet.py:595-599): neither `pendingProofCallbacks` nor `receipts` fires on timeout — both
+     expire silently. So the proof-wait timeout is detected by the LXMF `processOutbound` POLL,
+     not by a transport callback. Faithful because python's DIRECT re-send is itself poll-driven
+     by `process_outbound`, and RNS never retransmits link DATA at the packet layer (confirmed:
+     no packet RETRIES in Packet.py/Link.py) — the transport callback would add no observable
+     benefit and, being non-persisted, would not survive an NE jetsam anyway.
+  2. python's receipt timeout is `max(rtt*6, ...)` (sub-second); the swift port collapses it into
+     the single `DELIVERY_RETRY_WAIT` (10s) gate. Observably equivalent because `rtt*6 << 10s`, so
+     the wire-visible inter-send interval (~10s) and total send count (~`MAX_DELIVERY_ATTEMPTS`)
+     are preserved; keeping the link alive during the proof-wait is divergence-REDUCING (a late
+     proof still lands on the existing link and clears the message).
+
+Also a swift-runtime concurrency accommodation shared by both branches: after the `inout`
+`sendDirect`/`sendOpportunistic` copy-out, the `pendingOutbound[i] = msg` write-back is GUARDED on
+`state != .delivered`, so a proof that landed during the send `await` (flipping the entry to
+`.delivered`) is not clobbered back to `.sent`. Python has no analog — it mutates the queued
+`LXMessage` object in place (no copy-out/write-back), so there is no clobber to guard against.
+
+**Re-sync note:** two follow-ups remain for stricter parity (LXMF-swift issue #10): (a) an
+optional shorter `max(link.rtt*6, floor)` gate for faster dead-link detection (accepting more link
+churn), and (b) wiring `Link.setCloseCallback` so an UNEXPECTED early link close reverts
+`.sent`→`.outbound` immediately instead of after the `DELIVERY_RETRY_WAIT` window (python's CLOSED
+branch acts immediately, LXMRouter.py:2628-2647).
 
 ### `lxmfDelivery` — broadcast-echo-only self-echo gate
 
