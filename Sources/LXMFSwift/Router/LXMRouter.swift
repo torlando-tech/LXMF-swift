@@ -767,8 +767,20 @@ public actor LXMRouter {
                     // proof window — stranded at one checkmark, the same bug fixed for opportunistic.)
                     if pendingOutbound[i].state == .sent {
                         await closeAndRemoveDeliveryLink(pendingOutbound[i].destinationHash)
-                        pendingOutbound[i].state = .outbound
+                        // `closeAndRemoveDeliveryLink` awaits (the actor yields its executor),
+                        // so a queued `handleDeliveryProofReceived` can flip this entry to
+                        // `.delivered` during the teardown. RE-CHECK before reverting — an
+                        // unconditional `.outbound` here would clobber a just-delivered message
+                        // back into the retry loop (it would re-send until MAX_DELIVERY_ATTEMPTS).
+                        if pendingOutbound[i].state == .sent {
+                            pendingOutbound[i].state = .outbound
+                        }
                     }
+
+                    // If a proof landed during the teardown above (entry now `.delivered`),
+                    // skip the re-send entirely — the top-of-loop `.delivered` check removes
+                    // it on the next pass. Avoids a wasted duplicate send.
+                    if pendingOutbound[i].state == .delivered { break }
 
                     let hasPathToRecipient = await hasPath(pendingOutbound[i].destinationHash)
                     let attempt = pendingOutbound[i].deliveryAttempts

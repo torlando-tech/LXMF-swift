@@ -483,11 +483,18 @@ proof" no-resend (LXMRouter.py:2618-2627). Removed only by the `.delivered` chec
      are preserved; keeping the link alive during the proof-wait is divergence-REDUCING (a late
      proof still lands on the existing link and clears the message).
 
-Also a swift-runtime concurrency accommodation shared by both branches: after the `inout`
-`sendDirect`/`sendOpportunistic` copy-out, the `pendingOutbound[i] = msg` write-back is GUARDED on
-`state != .delivered`, so a proof that landed during the send `await` (flipping the entry to
-`.delivered`) is not clobbered back to `.sent`. Python has no analog — it mutates the queued
-`LXMessage` object in place (no copy-out/write-back), so there is no clobber to guard against.
+Two swift-runtime concurrency accommodations guard against an actor-yield race that python
+has no analog for (python mutates the queued `LXMessage` in place on a single-threaded
+`process_outbound`; the swift actor releases its executor at every `await`, letting a queued
+`handleDeliveryProofReceived` interleave):
+  1. After the `inout` `sendDirect`/`sendOpportunistic` copy-out, the `pendingOutbound[i] = msg`
+     write-back is GUARDED on `state != .delivered`, so a proof that landed during the send
+     `await` (flipping the entry to `.delivered`) is not clobbered back to `.sent`.
+  2. The DIRECT timeout-revert RE-CHECKS `state == .sent` AFTER `closeAndRemoveDeliveryLink`
+     (which awaits link teardown), before reverting `.sent`→`.outbound`. Without the re-check,
+     a proof flipping the entry to `.delivered` during the teardown awaits would be clobbered
+     back to `.outbound`, re-entering the retry loop until `MAX_DELIVERY_ATTEMPTS` (caught by
+     greptile on PR #9).
 
 **Re-sync note:** two follow-ups remain for stricter parity (LXMF-swift issue #10): (a) an
 optional shorter `max(link.rtt*6, floor)` gate for faster dead-link detection (accepting more link
