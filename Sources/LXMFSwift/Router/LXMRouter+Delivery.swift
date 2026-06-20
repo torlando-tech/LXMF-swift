@@ -543,6 +543,21 @@ extension LXMRouter {
             throw error
         }
 
+        // Wire an unexpected-close callback on the now-ACTIVE link — the swift analog of
+        // python's `process_outbound` CLOSED branch (LXMRouter.py:2628-2647). If the link
+        // drops unexpectedly (peer gone / network drop) while a DIRECT small-packet is in
+        // flight, react at once — pop the dead link + request a fresh path — instead of
+        // waiting out the full DELIVERY_RETRY_WAIT gate. Wired only here, AFTER the link is
+        // active (mirroring python's `activated_at != None` guard, LXMRouter.py:2629), so the
+        // handshake-failure cleanup above never has a callback to reason about. Capture the
+        // linkId for the handler's identity guard (so a stale OLD-link callback can't clobber
+        // a message already re-sent over a NEWER link).
+        let establishedLinkId = await link.linkId
+        await link.setCloseCallback { [weak self] reason in
+            await self?.handleLinkUnexpectedClose(
+                destinationHash: destinationHash, linkId: establishedLinkId, reason: reason)
+        }
+
         return link
     }
 
@@ -661,6 +676,12 @@ extension LXMRouter {
     internal func closeAndRemoveDeliveryLink(_ destinationHash: Data) async {
         guard let link = deliveryLinks.removeValue(forKey: destinationHash) else { return }
         let linkId = await link.linkId
+        // Clear the unexpected-close callback BEFORE our DELIBERATE teardown so our own
+        // close doesn't re-enter `handleLinkUnexpectedClose`. `reason == .timeout` is
+        // otherwise indistinguishable from a watchdog-driven close, so callback-presence —
+        // not the reason — is the our-own-close vs unexpected-close discriminator. A no-op
+        // if the link already fired (it clears its own callback on fire).
+        await link.setCloseCallback(nil)
         await link.close(reason: .timeout)
         await transport?.unregisterLink(linkId: linkId)
     }
