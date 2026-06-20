@@ -1223,12 +1223,15 @@ public actor LXMRouter {
         await closeAndRemoveDeliveryLink(destinationHash)
 
         // Revert the in-flight small-packet to `.outbound` so the next processOutbound pass
-        // re-sends it. RE-CHECK `.sent` AFTER the teardown await so a proof that landed
-        // meanwhile isn't clobbered (same guard as the timeout-revert). The `.sent` filter
-        // excludes resource-path (`.sending`) messages — those have their own conclusion
-        // handlers (handleResourceTransferComplete / handleOutboundResourceFailed).
-        if let idx = pendingOutbound.firstIndex(where: { $0.destinationHash == destinationHash }),
-           pendingOutbound[idx].state == .sent {
+        // re-sends it. The `.state == .sent` is IN the predicate (not a separate check after
+        // firstIndex) for two reasons: (1) it selects the RIGHT entry when multiple messages
+        // share the destination — a delivered-but-not-yet-removed one, or a second in-flight
+        // send — rather than whichever is first by index; (2) evaluated AFTER the teardown
+        // await, it doubles as the proof-landed re-check, so a proof that flipped the entry to
+        // `.delivered` meanwhile is simply not matched (not clobbered). The filter also excludes
+        // resource-path (`.sending`) messages, which own their conclusion handlers
+        // (handleResourceTransferComplete / handleOutboundResourceFailed).
+        if let idx = pendingOutbound.firstIndex(where: { $0.destinationHash == destinationHash && $0.state == .sent }) {
             pendingOutbound[idx].state = .outbound
             let snapshot = pendingOutbound[idx]
             try? await database.saveMessage(snapshot)
@@ -1238,6 +1241,27 @@ public actor LXMRouter {
         // re-establishment at the unchanged DELIVERY_RETRY_WAIT gate finds a path first-try
         // instead of burning a PATH_REQUEST_WAIT cycle.
         requestPath(destinationHash)
+    }
+
+    // MARK: - Test support
+    //
+    // `internal` seams (reached only via `@testable import`, never public API) so unit tests
+    // can drive actor-isolated state — `deliveryLinks` / `pendingOutbound` — without standing up
+    // a full link handshake. Mirrors reticulum-swift's own `_setStateForTesting` convention.
+
+    /// Seed a delivery link for `destinationHash` (test-only).
+    internal func _seedDeliveryLinkForTesting(_ link: Link, destinationHash: Data) {
+        deliveryLinks[destinationHash] = link
+    }
+
+    /// Append a pre-built message to `pendingOutbound` (test-only).
+    internal func _enqueuePendingForTesting(_ message: LXMessage) {
+        pendingOutbound.append(message)
+    }
+
+    /// Read the in-memory state of a queued message by hash (test-only).
+    internal func _pendingStateForTesting(messageHash: Data) -> LXMessageState? {
+        pendingOutbound.first(where: { $0.hash == messageHash })?.state
     }
 
     /// Handle outbound resource transfer completion (RESOURCE_PRF received).
