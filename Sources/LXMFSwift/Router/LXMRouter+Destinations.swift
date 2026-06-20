@@ -36,6 +36,19 @@ final class LXMFResourceHandler: ResourceCallbacks, @unchecked Sendable {
     }
 
     func resourceConcluded(_ resource: Resource) async {
+        // Mirror python LXMRouter.delivery_resource_concluded (LXMRouter.py:1878):
+        // only a successfully-assembled (.complete) resource delivers. reticulum-swift
+        // now also invokes this callback for failed / cancelled inbound transfers (so
+        // they don't silently leak), so gate on state before reading assembledData.
+        let state = await resource.state
+        guard state == .complete else {
+            // Expected lifecycle event: reticulum-swift fires this for failed/cancelled
+            // inbound transfers too (so they don't leak). Log at debug, not error — at
+            // error it reads like a malfunction and pollutes crash reporters / os_log.
+            routerLogger.debug("Resource concluded in non-complete state \(state.description, privacy: .public) — not delivering")
+            return
+        }
+
         // Get assembled data from the completed resource
         guard let data = await resource.assembledData else {
             routerLogger.warning("Resource concluded but no assembled data available")

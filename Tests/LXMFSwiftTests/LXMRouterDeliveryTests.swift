@@ -133,4 +133,46 @@ final class LXMRouterDeliveryTests: XCTestCase {
         XCTAssertEqual(saved?.method, .direct,
                        "Without an override, persisted method should match the unpack default (.direct)")
     }
+
+    /// The delivery-proof retry fix keeps a small-packet OPPORTUNISTIC/DIRECT message
+    /// in `pendingOutbound` at `.sent` (awaiting its proof) and relies on
+    /// `loadPendingOutbound` re-enqueuing it after an NE jetsam so it is re-sent and
+    /// earns a fresh proof. This pins the reload filter's scoping: `.outbound`
+    /// (never-sent) and OPPORTUNISTIC/DIRECT `.sent` reload, but a PROPAGATED `.sent`
+    /// (terminal — the propagation node ack'd the upload, no recipient proof is
+    /// expected) must NOT reload, else it would be re-uploaded on every launch.
+    func testLoadPendingOutboundReloadScoping() async throws {
+        let routerIdentity = Identity()
+        let sourceIdentity = Identity()
+        let (_, dbPath) = try await makeRouter(identity: routerIdentity)
+        let database = try LXMFDatabase(path: dbPath)
+
+        func persist(_ method: LXDeliveryMethod, _ state: LXMessageState, _ body: String) async throws -> Data {
+            var msg = LXMessage(
+                destinationHash: Destination.hash(identity: routerIdentity, appName: "lxmf", aspects: ["delivery"]),
+                sourceIdentity: sourceIdentity,
+                content: body.data(using: .utf8)!,
+                title: Data(),
+                fields: nil,
+                desiredMethod: method
+            )
+            _ = try msg.pack()          // stamps a stable, unique hash (content differs per call)
+            msg.method = method
+            msg.state = state
+            try await database.saveMessage(msg)
+            return msg.hash
+        }
+
+        let outboundHash   = try await persist(.direct,        .outbound, "never-sent direct")
+        let sentDirectHash = try await persist(.direct,        .sent,     "sent direct awaiting proof")
+        let sentOppHash    = try await persist(.opportunistic, .sent,     "sent opp awaiting proof")
+        let sentPropHash   = try await persist(.propagated,    .sent,     "propagated terminal sent")
+
+        let reloaded = Set(try await database.loadPendingOutbound().map { $0.hash })
+
+        XCTAssertTrue(reloaded.contains(outboundHash),   ".outbound (never-sent) must reload")
+        XCTAssertTrue(reloaded.contains(sentDirectHash), "DIRECT .sent must reload for retry-until-delivered")
+        XCTAssertTrue(reloaded.contains(sentOppHash),    "opportunistic .sent must reload for retry-until-delivered")
+        XCTAssertFalse(reloaded.contains(sentPropHash),  "PROPAGATED .sent is terminal — must NOT reload (would re-upload)")
+    }
 }

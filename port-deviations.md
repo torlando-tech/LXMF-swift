@@ -409,6 +409,99 @@ PROPAGATED treatment that landed earlier in this PR.
 in-flight `.outbound` DB write goes away and the resource
 callbacks just mutate in-memory state.
 
+**Sub-deviation (OPPORTUNISTIC keep-in-queue + `.sent` reload, 2026-06-19):**
+This is the "long-term refactor" from the re-sync note above, landed for the
+OPPORTUNISTIC path only. `processOutbound`'s opportunistic branch no longer
+`indicesToRemove.insert(i)`s the message at `.sent`; it leaves it in
+`pendingOutbound` and sets `nextDeliveryAttempt = now + DELIVERY_RETRY_WAIT`.
+The message is now removed only by the `.delivered` check at the top of the loop
+(set by `handleDeliveryProofReceived`, which also flips the in-memory entry to
+`.delivered`) or the `MAX_DELIVERY_ATTEMPTS` check. This brings the opportunistic
+path into **exact parity** with python `process_outbound`
+(`LXMRouter.py:2566-2592`): keep in `pending_outbound`, re-send every
+`DELIVERY_RETRY_WAIT` (new constant = 10, python `LXMRouter.py:32`) until
+DELIVERED or `fail_message`. It is divergence-REDUCING (the prior dequeue-at-`.sent`
+was the divergence). The explicit per-send `.sent` DB write is dropped — the
+cycle-end `persistPendingState()` covers durability now that the message stays
+queued.
+
+  - **Why it was a bug:** advancement to `.delivered` depended ENTIRELY on the
+    in-memory proof callback (`ReticulumTransport.pendingProofCallbacks`, not
+    persisted). A single lost packet/proof — or, under Model B, the iOS NE being
+    suspended/jetsammed during the proof window — stranded the message at one
+    checkmark forever (user-reported: "sent messages don't always process the
+    delivery proof").
+
+  - **Swift-specific reload — Category (a), no python analog:**
+    `loadPendingOutbound()` (`LXMFDatabase.swift`) now also reloads
+    `state == .sent && method == .opportunistic`, not just `.outbound`. Python
+    never reloads `pending_outbound` from disk (its process is long-lived,
+    `LXMRouter.py:99`); the swift port MUST, because the NE is jetsammed
+    mid-flight. The filter is SCOPED to `.opportunistic`: `.sent` is terminal for
+    PROPAGATED (python removes it at `LXMRouter.py:2544` — no recipient proof is
+    expected), so reloading propagated `.sent` would wrongly re-upload it every
+    launch. DIRECT small-packet `.sent` is now ALSO reloaded (see the DIRECT
+    sub-deviation below); a DIRECT RESOURCE transfer is persisted at `.outbound`
+    (not `.sent`), so it is caught by the first clause and never double-handled.
+
+  - **Duplicate-resend safety:** re-sending is inherent to python's design and is
+    deduped recipient-side by the stable `message.hash` transient id
+    (`LXMRouter.swift` `deliveredTransientIDs`, persisted via `recordDelivered`),
+    so the recipient shows exactly one row. Because the recipient's delivery
+    destination is PROVE_ALL, a duplicate resend still earns a proof, which is what
+    clears a stuck single-check (a mere callback re-registration could not — the
+    original packet's hash isn't persisted and re-encryption changes it).
+
+**Sub-deviation (DIRECT small-packet keep-in-queue + proof-wait-timeout retry, 2026-06-19):**
+DIRECT small-packet now uses the SAME poll-based keep-in-queue model as opportunistic,
+rather than dequeuing at `.sent`. `processOutbound`'s `.direct` case keeps the message in
+`pendingOutbound` at `.sent` with `nextDeliveryAttempt = now + DELIVERY_RETRY_WAIT` and a
+full-record `saveMessage`; `loadPendingOutbound` reloads DIRECT `.sent`; `handleDeliveryProofReceived`
+already flips the in-memory entry to `.delivered` (shared with opportunistic). On a pass where
+the message is still `.sent` and the proof-wait window elapsed (`shouldAttemptDelivery` true),
+the top of the `.direct` case tears down the delivery link (`closeAndRemoveDeliveryLink` →
+`Link.close(.timeout)` + `transport.unregisterLink`), reverts `.sent`→`.outbound`, and re-sends
+over a FRESH link in the same pass. This mirrors python's `__link_packet_timed_out`
+(`destination.teardown()` + `state = OUTBOUND`, LXMessage.py:613-618) and `process_outbound`'s
+link-CLOSED branch popping `direct_links` + re-establishing on the `DELIVERY_RETRY_WAIT` cadence
+(LXMRouter.py:2628-2670). While awaiting the proof on a live link the message is SKIPPED by
+`shouldAttemptDelivery`, so no duplicate goes out during the wait — matching python's "waiting for
+proof" no-resend (LXMRouter.py:2618-2627). Removed only by the `.delivered` check or
+`MAX_DELIVERY_ATTEMPTS` (`fail_message` parity).
+
+**Two intentional divergences — Category (a):**
+  1. reticulum-swift has NO `set_timeout_callback` primitive (python `PacketReceipt`,
+     Packet.py:595-599): neither `pendingProofCallbacks` nor `receipts` fires on timeout — both
+     expire silently. So the proof-wait timeout is detected by the LXMF `processOutbound` POLL,
+     not by a transport callback. Faithful because python's DIRECT re-send is itself poll-driven
+     by `process_outbound`, and RNS never retransmits link DATA at the packet layer (confirmed:
+     no packet RETRIES in Packet.py/Link.py) — the transport callback would add no observable
+     benefit and, being non-persisted, would not survive an NE jetsam anyway.
+  2. python's receipt timeout is `max(rtt*6, ...)` (sub-second); the swift port collapses it into
+     the single `DELIVERY_RETRY_WAIT` (10s) gate. Observably equivalent because `rtt*6 << 10s`, so
+     the wire-visible inter-send interval (~10s) and total send count (~`MAX_DELIVERY_ATTEMPTS`)
+     are preserved; keeping the link alive during the proof-wait is divergence-REDUCING (a late
+     proof still lands on the existing link and clears the message).
+
+Two swift-runtime concurrency accommodations guard against an actor-yield race that python
+has no analog for (python mutates the queued `LXMessage` in place on a single-threaded
+`process_outbound`; the swift actor releases its executor at every `await`, letting a queued
+`handleDeliveryProofReceived` interleave):
+  1. After the `inout` `sendDirect`/`sendOpportunistic` copy-out, the `pendingOutbound[i] = msg`
+     write-back is GUARDED on `state != .delivered`, so a proof that landed during the send
+     `await` (flipping the entry to `.delivered`) is not clobbered back to `.sent`.
+  2. The DIRECT timeout-revert RE-CHECKS `state == .sent` AFTER `closeAndRemoveDeliveryLink`
+     (which awaits link teardown), before reverting `.sent`→`.outbound`. Without the re-check,
+     a proof flipping the entry to `.delivered` during the teardown awaits would be clobbered
+     back to `.outbound`, re-entering the retry loop until `MAX_DELIVERY_ATTEMPTS` (caught by
+     greptile on PR #9).
+
+**Re-sync note:** two follow-ups remain for stricter parity (LXMF-swift issue #10): (a) an
+optional shorter `max(link.rtt*6, floor)` gate for faster dead-link detection (accepting more link
+churn), and (b) wiring `Link.setCloseCallback` so an UNEXPECTED early link close reverts
+`.sent`→`.outbound` immediately instead of after the `DELIVERY_RETRY_WAIT` window (python's CLOSED
+branch acts immediately, LXMRouter.py:2628-2647).
+
 ### `lxmfDelivery` — broadcast-echo-only self-echo gate
 
 **Site:** `Sources/LXMFSwift/Router/LXMRouter.swift` — `lxmfDelivery(_:method:)`,
@@ -467,6 +560,57 @@ broadcast path.
 gate (or if swift's `LXMFDatabase` is reworked so that a duplicate
 hash insert is a true noop / error rather than an overwrite), this
 deviation should be revisited and possibly removed.
+
+### `saveDeliveredTransientIDs` — off-actor serial write (concurrency adaptation)
+
+**Site:** `Sources/LXMFSwift/Router/LXMRouter.swift` — `saveDeliveredTransientIDs`
+(`localDeliveriesWriteQueue` serial queue + snapshot dispatch).
+
+**Python reference:** `LXMF/LXMRouter.py:1177-1184`
+(`save_locally_delivered_transient_ids`) — synchronously `msgpack.packb`s the whole
+`locally_delivered_transient_ids` dict and `write()`s it inline on the calling thread.
+
+**Cadence (faithful, NOT a deviation):** python adds to `locally_delivered_transient_ids`
+**in-memory** on each delivery (`:1806`) and persists it only from the periodic
+maintenance loop (`:1365`), after a propagation sync (`:1588`), and on exit
+(`exit_handler`) — never per delivery. The swift port matches that: `recordDelivered`
+adds in-memory + sets `deliveredCacheDirty`; the persist runs from the periodic
+`processOutbound` maintenance tick (`persistDeliveredTransientIDsIfDirty`) and from
+`notifySyncCompletion` (post-sync). This is what keeps a per-message DB-save failure
+from durably blacklisting a hash — the in-memory entry is lost on restart, exactly as
+in python.
+
+**The actual deviation — Category (a):** `LXMRouter` is an `actor`, and python's inline
+synchronous serialize+atomic-write would hold the actor's serial executor (its mailbox)
+for the full I/O. So `saveDeliveredTransientIDs` snapshots the dict **on the actor**,
+then serializes + writes it on a dedicated **serial** `DispatchQueue`
+(`localDeliveriesWriteQueue`). The serial queue preserves submission order so the
+most-recent snapshot wins the atomic write (a plain `Task.detached` per call would race
+the global executor and could persist a stale snapshot). Only *where* the bytes are
+written moves off the actor; the file format (msgpack `{transient_id(bin):
+timestamp(float)}`) and load path are byte-compatible with python.
+
+`flushPendingLocalDeliveries()` is a barrier on that serial queue for points where
+durability must be guaranteed synchronously (a graceful shutdown, or a test asserting
+the on-disk state); a real process restart drains the queue the same way. Python's
+inline write needs no such barrier because it is already synchronous.
+
+**Sub-deviation (dedup rollback on failed store — Category (b) robustness, 2026-06-20):**
+`lxmfDelivery` calls `recordDelivered(message.hash)` BEFORE `database.saveMessage` (faithful
+to python `LXMRouter.py:1802-1806`, which sets `locally_delivered_transient_ids[hash]` before
+the delivery callback, so a concurrent duplicate arriving while the store is in flight is still
+rejected). But if the swift `saveMessage` THROWS, the message was never persisted; python leaves
+the dedup entry in place (a failed store there also blacklists the hash until the unpersisted
+in-memory entry is lost on restart). The swift port instead ROLLS BACK — `deliveredTransientIDs.removeValue(forKey:)`
++ re-mark dirty + `return false` (no delegate fire) — so the sender's retry can still be accepted
+and the message isn't permanently lost. Strictly more robust than python; flagged by greptile on PR #9.
+
+**Sub-deviation (`shutdown()` flushes the dedup cache — python-parity, 2026-06-20):**
+`shutdown()` is now `async` and calls `persistDeliveredTransientIDsIfDirty()` +
+`await flushPendingLocalDeliveries()` before teardown, so deliveries recorded since the last
+periodic flush reach disk on a graceful stop. Mirrors python's `exit_handler` calling
+`save_locally_delivered_transient_ids()` (LXMRouter.py:1365). Making `shutdown()` async is
+transparent — every caller already `await`s it (it's an actor method). Flagged by greptile on PR #9.
 
 ## Resolved deviations
 

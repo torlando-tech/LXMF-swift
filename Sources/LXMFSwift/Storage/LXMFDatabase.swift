@@ -30,20 +30,49 @@ public actor LXMFDatabase {
     ///
     /// - Parameter path: Database file path
     /// - Throws: DatabaseError if initialization fails
-    public init(path: String) throws {
-        // Configure database
+    public init(path: String, readonly: Bool = false) throws {
+        // App <-> Network-Extension share this database across processes (Model B).
+        // The writer (the NE) must survive iOS's 0xDEAD10CC "file busy while suspended"
+        // kill; the app opens read-only with `readonly: true`. (GRDB DatabaseSharing.)
         var config = Configuration()
+        config.readonly = readonly
+        // Suspend cleanly when iOS backgrounds the process holding a lock, instead of
+        // being 0xDEAD10CC-killed.
+        config.observesSuspensionNotifications = true
+        // Take write locks up front to avoid cross-process SQLITE_BUSY upgrade
+        // deadlocks. Writer-only: a read-only pool issues deferred read transactions
+        // regardless, so this would be dead (and misleading) config on the reader.
+        if !readonly {
+            config.defaultTransactionKind = .immediate
+        }
         config.prepareDatabase { db in
-            // Enable WAL mode for concurrent reads during writes
-            try db.execute(sql: "PRAGMA journal_mode=WAL")
-            // Set synchronous mode to NORMAL for better performance
-            try db.execute(sql: "PRAGMA synchronous=NORMAL")
+            if !readonly {
+                // Enable WAL mode for concurrent reads during writes
+                try db.execute(sql: "PRAGMA journal_mode=WAL")
+                // Set synchronous mode to NORMAL for better performance
+                try db.execute(sql: "PRAGMA synchronous=NORMAL")
+            }
             // Retry for up to 5 seconds if the database is locked
             try db.execute(sql: "PRAGMA busy_timeout=5000")
         }
 
         // Create database pool (allows concurrent reads during writes in WAL mode)
         dbPool = try DatabasePool(path: path, configuration: config)
+
+        #if os(iOS)
+        // Deliver-while-locked: the NE must read/write after first unlock even when the
+        // device is subsequently locked. Pin the data-protection class on the DB and its
+        // -wal/-shm sidecar files to CompleteUntilFirstUserAuthentication.
+        if !readonly {
+            let fm = FileManager.default
+            for suffix in ["", "-wal", "-shm"] where fm.fileExists(atPath: path + suffix) {
+                try? fm.setAttributes(
+                    [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+                    ofItemAtPath: path + suffix
+                )
+            }
+        }
+        #endif
 
         // Run migrations
         var migrator = DatabaseMigrator()
@@ -143,7 +172,14 @@ public actor LXMFDatabase {
             try db.create(index: "idx_messages_reply_to", on: "messages", columns: ["reply_to_id"])
         }
 
-        try migrator.migrate(dbPool)
+        // Only the writer runs migrations: GRDB's migrator issues an internal
+        // `write {}` to atomically check/apply schema versions, which returns
+        // SQLITE_READONLY (throws) on a read-only pool. Under Model B the writer (the
+        // NE) owns the schema; the read-only app reader just opens the already-migrated
+        // store, so migrating from it would throw at init before any read could happen.
+        if !readonly {
+            try migrator.migrate(dbPool)
+        }
     }
 
     // MARK: - Message Operations
@@ -458,8 +494,29 @@ public actor LXMFDatabase {
     /// - Throws: DatabaseError or LXMFError
     public func loadPendingOutbound() throws -> [LXMessage] {
         try dbPool.read { db in
+            // Reload `.outbound` (never-sent, awaiting first send) AND OPPORTUNISTIC or
+            // DIRECT messages persisted at `.sent` (sent, awaiting a delivery proof). Under
+            // Model B the iOS Network Extension is suspended/jetsammed mid-flight, so a
+            // small-packet message awaiting its proof when the NE died must re-enter
+            // `pendingOutbound` on relaunch to be re-sent and earn a fresh proof —
+            // otherwise its in-memory proof callback (reticulum-swift, non-persisted) is
+            // gone and the message stays at a single checkmark forever. Python keeps
+            // `pending_outbound` in memory across its long-running process
+            // (LXMRouter.py:99); this reload emulates that durability for the jetsam-prone
+            // NE. SCOPED to small-packet methods: `.sent` is TERMINAL for PROPAGATED (the
+            // propagation node ack'd the upload, no recipient proof is expected — python
+            // removes it at LXMRouter.py:2544), so reloading a propagated `.sent` would
+            // wrongly re-upload it on every launch. This safely targets only small-packet
+            // DIRECT: a DIRECT RESOURCE transfer is persisted at `.outbound` (not `.sent`),
+            // so it's caught by the first clause, not double-handled. See port-deviations.md
+            // ("processOutbound keep-in-queue ... loadPendingOutbound").
             let records = try MessageRecord
-                .filter(Column("state") == LXMessageState.outbound.rawValue)
+                .filter(
+                    Column("state") == LXMessageState.outbound.rawValue
+                    || (Column("state") == LXMessageState.sent.rawValue
+                        && (Column("method") == LXDeliveryMethod.opportunistic.rawValue
+                            || Column("method") == LXDeliveryMethod.direct.rawValue))
+                )
                 .order(Column("timestamp").asc)
                 .fetchAll(db)
 

@@ -18,6 +18,7 @@
 //
 
 import Foundation
+import Dispatch
 import CryptoKit
 import ReticulumSwift
 import os.log
@@ -50,8 +51,22 @@ public actor LXMRouter {
     /// Interval between outbound processing cycles
     public static let PROCESSING_INTERVAL: TimeInterval = 1
 
-    /// Duplicate detection cache expiry (1 hour)
-    public static let DUPLICATE_CACHE_EXPIRY: TimeInterval = 3600
+    /// Wait between re-send attempts for a sent-but-unproven message (python
+    /// `LXMRouter.DELIVERY_RETRY_WAIT`, LXMRouter.py:32). An opportunistic / direct
+    /// small-packet message stays in `pendingOutbound` after it reaches `.sent` and is
+    /// re-sent on this cadence — earning a fresh delivery proof each time — until the
+    /// proof advances it to `.delivered` or `MAX_DELIVERY_ATTEMPTS` fails it. `nextDeliveryAttempt`
+    /// gates the re-send so the 1s processing loop can't turn this into a per-second storm.
+    public static let DELIVERY_RETRY_WAIT: TimeInterval = 10
+
+    /// Baseline message expiry — matches python LXMRouter.MESSAGE_EXPIRY (30 days).
+    public static let MESSAGE_EXPIRY: TimeInterval = 30 * 24 * 60 * 60
+
+    /// Duplicate-delivery cache retention. Matches python's locally_delivered_transient_ids
+    /// window of MESSAGE_EXPIRY*6 (~180 days) — NOT 1 hour; too short a window would
+    /// re-accept a duplicate once it expired. The cache is persisted across restarts (see
+    /// local_deliveries), mirroring python (LXMRouter.py:956-961).
+    public static let DUPLICATE_CACHE_EXPIRY: TimeInterval = MESSAGE_EXPIRY * 6
 
     /// Maximum age (seconds) for pending outbound messages before marking as failed.
     /// Prevents crash loops from stuck messages that can never be delivered.
@@ -80,8 +95,27 @@ public actor LXMRouter {
 
     /// Duplicate detection cache: transient ID -> timestamp
     /// Transient ID is message.hash (32 bytes)
-    /// Cached for 1 hour to prevent processing duplicates
+    /// Persisted across restarts (see local_deliveries) to prevent re-processing duplicates.
     var deliveredTransientIDs: [Data: Date] = [:]
+
+    /// Path to the persisted duplicate-delivery cache (`<db-dir>/local_deliveries`),
+    /// mirroring python's `<storagepath>/local_deliveries`. nil for in-memory test DBs.
+    private var localDeliveriesPath: String?
+
+    /// Set when `deliveredTransientIDs` changed since the last persist. Python adds to
+    /// the cache in-memory on each delivery (LXMRouter.py:1806) and persists only on the
+    /// periodic maintenance cycle (:1365), after a propagation sync (:1588), and on exit
+    /// (`exit_handler`) — NOT per delivery. This flag drives that same cadence here so a
+    /// per-message DB-save failure can't durably blacklist a hash (the in-memory entry
+    /// is lost on restart, as in python, giving the sender a retry).
+    private var deliveredCacheDirty = false
+
+    /// Serial queue for persisting `local_deliveries` OFF the actor's executor (see
+    /// port-deviations.md). Writes are enqueued in order, so the most-recent snapshot
+    /// always wins the atomic write; the actor isn't blocked on disk I/O per message.
+    private let localDeliveriesWriteQueue = DispatchQueue(
+        label: "net.reticulum.lxmf.local-deliveries", qos: .utility
+    )
 
     /// Cached stamp costs from announces: destination_hash -> (timestamp, cost)
     public var outboundStampCosts: [Data: (Date, Int)] = [:]
@@ -240,6 +274,19 @@ public actor LXMRouter {
         self.identity = identity
         self.database = try LXMFDatabase(path: databasePath)
 
+        // Persist the duplicate-delivery dedup next to the message DB so it survives a
+        // process restart (python loads `<storagepath>/local_deliveries`, LXMRouter.py:212-216).
+        // nil for `:memory:` test DBs. Loaded via a static helper because instance methods
+        // can't be called until all stored properties are initialized.
+        if databasePath != ":memory:" {
+            let dir = (databasePath as NSString).deletingLastPathComponent
+            if !dir.isEmpty {
+                let path = (dir as NSString).appendingPathComponent("local_deliveries")
+                self.localDeliveriesPath = path
+                self.deliveredTransientIDs = Self.loadLocalDeliveries(from: path)
+            }
+        }
+
         // Load pending outbound from database (restore after crash/restart)
         // Wrapped in do/catch to prevent corrupt messages from crashing init
         do {
@@ -286,8 +333,15 @@ public actor LXMRouter {
     /// Shutdown the router, stopping the processing loop.
     ///
     /// Call this when the router is no longer needed to clean up background tasks.
-    public func shutdown() {
+    public func shutdown() async {
         isShutdown = true
+        // Flush the delivered-dedup cache before teardown so deliveries from the last
+        // maintenance window (recordDelivered enqueues but persists only on the periodic
+        // cycle) aren't dropped on a graceful stop — mirrors python flushing from its
+        // exit_handler (LXMRouter.py:1365). Enqueue the latest snapshot, then await the
+        // serial-queue barrier so the write reaches disk before the process tears down.
+        persistDeliveredTransientIDsIfDirty()
+        await flushPendingLocalDeliveries()
     }
 
     /// Restart the router after a shutdown.
@@ -502,11 +556,8 @@ public actor LXMRouter {
                 return false
             }
 
-            // Add to duplicate cache with current timestamp
-            deliveredTransientIDs[message.hash] = Date()
-
-            // Clean expired entries from duplicate cache
-            cleanDuplicateCache()
+            // Record as delivered: cache + prune + persist so dedup survives a restart.
+            recordDelivered(message.hash)
 
             // Apply physical stats if provided
             if let stats = physicalStats {
@@ -525,6 +576,17 @@ public actor LXMRouter {
                 try await database.saveMessage(message)
             } catch {
                 routerLogger.error("Failed to persist message: \(error)")
+                // Roll back the dedup entry. `recordDelivered` ran BEFORE the save (matching
+                // python LXMRouter.py:1806, so a concurrent duplicate arriving during the save
+                // `await` is still rejected) — but the save FAILED, so the message was never
+                // stored. Leaving the hash blacklisted would reject the sender's retry and lose
+                // the message permanently. Remove it (and re-mark dirty so the removal persists)
+                // so a retry can still be accepted, and bail without firing the delegate (there
+                // is nothing on disk to reload). Strictly more robust than python, which leaves
+                // the entry on a failed store — see port-deviations.md.
+                deliveredTransientIDs.removeValue(forKey: message.hash)
+                deliveredCacheDirty = true
+                return false
             }
 
             // Invoke delegate callback on main actor
@@ -672,77 +734,116 @@ public actor LXMRouter {
                         routerLogger.debug("Calling sendOpportunistic for \(destHashHex)")
                         var msg = pendingOutbound[i]
                         try await sendOpportunistic(&msg)
-                        pendingOutbound[i] = msg
                         routerLogger.info("sendOpportunistic completed for \(destHashHex)")
-                        indicesToRemove.insert(i)
 
-                        // Update database
-                        let sentMsg = pendingOutbound[i]
-                        Task.detached { [database] in
-                            try? await database.updateMessageState(id: sentMsg.hash, state: .sent)
-                        }
+                        // A delivery proof for an EARLIER send can land DURING the sendOpportunistic
+                        // await and flip the queue entry to `.delivered` (handleDeliveryProofReceived).
+                        // Don't clobber that terminal state with this send's `.sent` writeback — leave
+                        // it for the top-of-loop `.delivered` removal.
+                        guard pendingOutbound[i].state != .delivered else { break }
+                        pendingOutbound[i] = msg
+
+                        // KEEP the message in `pendingOutbound` at `.sent` and schedule the
+                        // next attempt — do NOT dequeue it here. Opportunistic delivery is a
+                        // single fire-and-forget packet; advancement to `.delivered` depends
+                        // entirely on the returning delivery proof firing the in-memory proof
+                        // callback. If that packet OR its proof is lost (lossy mesh, or — under
+                        // Model B — the iOS Network Extension is suspended/jetsammed during the
+                        // proof window, dropping the in-memory `pendingProofCallbacks`), the
+                        // ONLY recovery is to re-send and earn a fresh proof. Mirrors python
+                        // `process_outbound`, which keeps opportunistic in `pending_outbound`
+                        // and re-sends every DELIVERY_RETRY_WAIT until DELIVERED or
+                        // MAX_DELIVERY_ATTEMPTS (LXMRouter.py:2585-2592). The entry is removed
+                        // only by the `.delivered` check at the top of this loop (set by
+                        // `handleDeliveryProofReceived`) or the MAX_DELIVERY_ATTEMPTS check.
+                        // (Previously it was dequeued here at `.sent`, so a single lost packet
+                        // or proof stranded the message at one checkmark forever — the reported
+                        // "sent messages don't always process the delivery proof" bug.)
+                        // `nextDeliveryAttempt` gates the re-send (shouldAttemptDelivery) so the
+                        // 1s loop can't resend-storm; the cycle-end `persistPendingState()`
+                        // saves the full record (state + `deliveryAttempts`), so the retry
+                        // budget survives an NE reload.
+                        pendingOutbound[i].nextDeliveryAttempt = Date().addingTimeInterval(Self.DELIVERY_RETRY_WAIT)
                     }
 
                 case .direct:
-                    // Direct delivery: over link
+                    // Direct delivery: over link.
                     let destHashHex = pendingOutbound[i].destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+
+                    // PROOF-WAIT TIMEOUT (python `__link_packet_timed_out`, LXMessage.py:613-618).
+                    // A small-packet DIRECT message stays in `pendingOutbound` at `.sent` after its
+                    // send (below) with `nextDeliveryAttempt = now + DELIVERY_RETRY_WAIT`. Reaching
+                    // this branch means `shouldAttemptDelivery` returned true — i.e. the proof-wait
+                    // window elapsed WITHOUT `handleDeliveryProofReceived` flipping it to `.delivered`.
+                    // So tear down the (possibly dead) delivery link and revert to `.outbound`, then
+                    // re-establish a FRESH link + re-send below. Mirrors python, whose timeout
+                    // callback calls `destination.teardown()` + sets state OUTBOUND and whose
+                    // `process_outbound` then pops `direct_links` and re-establishes
+                    // (LXMRouter.py:2628-2670). The single `deliveryAttempts` increment at the top of
+                    // this loop covers the whole revert+resend cycle. (Without this, a small-packet
+                    // DIRECT message whose link proof was lost — or whose NE was suspended during the
+                    // proof window — stranded at one checkmark, the same bug fixed for opportunistic.)
+                    if pendingOutbound[i].state == .sent {
+                        await closeAndRemoveDeliveryLink(pendingOutbound[i].destinationHash)
+                        // `closeAndRemoveDeliveryLink` awaits (the actor yields its executor),
+                        // so a queued `handleDeliveryProofReceived` can flip this entry to
+                        // `.delivered` during the teardown. RE-CHECK before reverting — an
+                        // unconditional `.outbound` here would clobber a just-delivered message
+                        // back into the retry loop (it would re-send until MAX_DELIVERY_ATTEMPTS).
+                        if pendingOutbound[i].state == .sent {
+                            pendingOutbound[i].state = .outbound
+                        }
+                    }
+
+                    // If a proof landed during the teardown above (entry now `.delivered`),
+                    // skip the re-send entirely — the top-of-loop `.delivered` check removes
+                    // it on the next pass. Avoids a wasted duplicate send.
+                    if pendingOutbound[i].state == .delivered { break }
+
                     let hasPathToRecipient = await hasPath(pendingOutbound[i].destinationHash)
                     let attempt = pendingOutbound[i].deliveryAttempts
                     routerLogger.info("Direct delivery: dest=\(destHashHex), hasPath=\(hasPathToRecipient), attempt=\(attempt)")
-                    routerLogger.debug("Checking path to \(destHashHex), hasPath=\(hasPathToRecipient)")
                     if hasPathToRecipient {
                         // Attempt link-based send (copy out for inout async call)
                         routerLogger.info("Starting sendDirect to \(destHashHex)")
                         var msg = pendingOutbound[i]
                         try await sendDirect(&msg)
-                        pendingOutbound[i] = msg
                         routerLogger.info("sendDirect completed to \(destHashHex)")
-                        indicesToRemove.insert(i)
 
-                        // DB persistence policy mirrors the PROPAGATED
-                        // branch's two-path treatment. Greptile flagged
-                        // (PR #7 round 5) that the previous unconditional
-                        // `Task.detached { .sent }` here left a large
-                        // DIRECT resource transfer with the DB at `.sent`
-                        // immediately after `sendDirect` returned — even
-                        // though the resource was still in flight. A
-                        // crash before RESOURCE_PRF arrived would leave
-                        // the message "sent" on disk with no
-                        // re-enqueue, and the recipient would never get
-                        // it.
-                        //
-                        // Now branched the same way as PROPAGATED
-                        // (LXMRouter.swift:805-842):
-                        //   - sendDirect's small-packet path returns
-                        //     with state=.sent; persist `.sent` via
-                        //     `updateMessageState` (state-column only).
-                        //   - sendDirect's resource path returns with
-                        //     state=.sending; persist `.outbound` via
-                        //     full-record `saveMessage` so
-                        //     `deliveryAttempts` is carried into the DB
-                        //     and a crash between here and the
-                        //     resource callback re-enqueues the
-                        //     message at the right attempt count.
-                        // Both writes are awaited inside the actor so
-                        // the callback writes (`.delivered` for
-                        // success, `.outbound` again for re-enqueue,
-                        // `.rejected`/`.cancelled` for terminals) are
-                        // strictly serialized after this one. Without
-                        // the await, a fast RESOURCE_PRF could land
-                        // its `.delivered` write before this
-                        // `.outbound` write and get clobbered.
-                        let snapshot = pendingOutbound[i]
-                        if snapshot.state == .sending {
-                            var outboundSnapshot = snapshot
-                            outboundSnapshot.state = .outbound
-                            try? await database.saveMessage(outboundSnapshot)
+                        // A delivery proof for an EARLIER send can land DURING the sendDirect await
+                        // and flip the queue entry to `.delivered` (handleDeliveryProofReceived). Do
+                        // NOT clobber that terminal state with this send's `.sent` writeback — leave
+                        // it for the top-of-loop `.delivered` removal.
+                        if pendingOutbound[i].state == .delivered {
+                            // proof won the race — nothing to persist or keep in queue.
                         } else {
-                            try? await database.updateMessageState(id: snapshot.hash, state: snapshot.state)
+                            pendingOutbound[i] = msg
+                            let snapshot = pendingOutbound[i]
+                            if snapshot.state == .sending {
+                                // RESOURCE path: the large transfer is in flight; its terminal state
+                                // is driven by handleResourceTransferComplete / handleOutboundResourceFailed
+                                // (via pendingResourceDeliveries). Persist `.outbound` (full record) so a
+                                // crash / NE restart mid-transfer re-enqueues it, and drop it from the
+                                // in-memory queue (the resource callbacks own its terminal state).
+                                var outboundSnapshot = snapshot
+                                outboundSnapshot.state = .outbound
+                                try? await database.saveMessage(outboundSnapshot)
+                                indicesToRemove.insert(i)
+                            } else {
+                                // SMALL-PACKET path (state == .sent): KEEP in `pendingOutbound` and wait
+                                // DELIVERY_RETRY_WAIT for the proof, mirroring the opportunistic path and
+                                // python DIRECT keeping the message in `pending_outbound` until DELIVERED
+                                // (LXMRouter.py:2517-2519). Re-sent over a fresh link on the next pass if
+                                // still unproven (the timeout-revert at the top of this case). Full-record
+                                // save so `deliveryAttempts` + state survive an NE reload (otherwise the
+                                // retry budget resets to 0 → unbounded retries).
+                                pendingOutbound[i].nextDeliveryAttempt = Date().addingTimeInterval(Self.DELIVERY_RETRY_WAIT)
+                                try? await database.saveMessage(pendingOutbound[i])
+                            }
                         }
                     } else {
                         // Need path first
                         routerLogger.warning("No path to \(destHashHex), requesting path")
-                        routerLogger.debug("No path to \(destHashHex), requesting path")
                         requestPath(pendingOutbound[i].destinationHash)
                         pendingOutbound[i].nextDeliveryAttempt = Date().addingTimeInterval(Self.PATH_REQUEST_WAIT)
                     }
@@ -905,6 +1006,9 @@ public actor LXMRouter {
 
         // Persist state changes
         await persistPendingState()
+        // Durable delivered-dedup save on the maintenance cycle (python persists
+        // locally_delivered_transient_ids from its jobs/maintenance loop, LXMRouter.py:1365).
+        persistDeliveredTransientIDsIfDirty()
 
         // Schedule next processing cycle (unless shutdown)
         if !isShutdown {
@@ -926,6 +1030,99 @@ public actor LXMRouter {
 
         deliveredTransientIDs = deliveredTransientIDs.filter { (_, timestamp) in
             now.timeIntervalSince(timestamp) < expiry
+        }
+    }
+
+    /// Load the persisted locally-delivered transient-id cache (a msgpack map of
+    /// {transient_id(bin) : timestamp(float)}). Faithful port of python loading
+    /// `<storagepath>/local_deliveries` (LXMRouter.py:212-216). Static so it can run from
+    /// `init` before all stored properties are initialized.
+    static func loadLocalDeliveries(from path: String) -> [Data: Date] {
+        guard FileManager.default.fileExists(atPath: path),
+              let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let value = try? unpackLXMF(data),
+              case .map(let entries) = value else {
+            return [:]
+        }
+        var loaded: [Data: Date] = [:]
+        for (key, val) in entries {
+            guard case .binary(let transientID) = key else { continue }
+            let ts: Double
+            switch val {
+            case .double(let d): ts = d
+            case .float(let f): ts = Double(f)
+            case .uint(let u): ts = Double(u)
+            case .int(let i): ts = Double(i)
+            default: continue
+            }
+            loaded[transientID] = Date(timeIntervalSince1970: ts)
+        }
+        return loaded
+    }
+
+    /// Persist the locally-delivered transient-id cache. Faithful port of python
+    /// save_locally_delivered_transient_ids (LXMRouter.py:1177-1184): a msgpack map of
+    /// {transient_id(bin) : timestamp(float)} written to `<db-dir>/local_deliveries`.
+    func saveDeliveredTransientIDs() {
+        guard let path = localDeliveriesPath else { return }
+        // Snapshot on the actor (cheap dict copy), then serialize + write off the
+        // actor's serial executor so the inbound hot path isn't blocked on disk I/O.
+        // The serial queue keeps writes ordered, so the latest snapshot always wins
+        // the atomic write. See port-deviations.md (python writes inline/synchronously,
+        // LXMRouter.py:1177-1184 — an actor can't without blocking its mailbox).
+        let snapshot = deliveredTransientIDs
+        localDeliveriesWriteQueue.async {
+            var entries: [LXMFMessagePackValue: LXMFMessagePackValue] = [:]
+            for (transientID, date) in snapshot {
+                entries[.binary(transientID)] = .double(date.timeIntervalSince1970)
+            }
+            do {
+                try packLXMF(.map(entries)).write(to: URL(fileURLWithPath: path), options: .atomic)
+                #if os(iOS)
+                // The Network Extension writes this while the device is locked → match the
+                // deliver-while-locked data-protection class.
+                try? FileManager.default.setAttributes(
+                    [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+                    ofItemAtPath: path
+                )
+                #endif
+            } catch {
+                routerLogger.warning("Failed to persist local_deliveries: \(error)")
+            }
+        }
+    }
+
+    /// Record a transient id (= LXMF message hash) as locally delivered: cache it, prune
+    /// expired entries, and persist so the dedup survives a process restart. Mirrors python
+    /// adding to locally_delivered_transient_ids + save (LXMRouter.py:1365).
+    func recordDelivered(_ transientID: Data) {
+        deliveredTransientIDs[transientID] = Date()
+        cleanDuplicateCache()
+        // In-memory only (python LXMRouter.py:1806). Durable persistence happens on the
+        // periodic maintenance cycle / after a prop sync / on exit — see
+        // `persistDeliveredTransientIDsIfDirty()` and `saveDeliveredTransientIDs()`.
+        deliveredCacheDirty = true
+    }
+
+    /// Persist the delivered-transient-id cache if it changed since the last save.
+    /// Called from the periodic processing cycle (and `notifySyncCompletion`, in the
+    /// Sync extension) — the swift analogue of python saving
+    /// `locally_delivered_transient_ids` from its maintenance loop (LXMRouter.py:1365),
+    /// not on every delivery. Internal (not private) so the cross-file extension reaches it.
+    func persistDeliveredTransientIDsIfDirty() {
+        guard deliveredCacheDirty else { return }
+        deliveredCacheDirty = false
+        saveDeliveredTransientIDs()
+    }
+
+    /// Block until every enqueued `local_deliveries` persistence has reached disk.
+    /// A barrier on the serial write queue: the hot path (`recordDelivered`) enqueues
+    /// writes without blocking the actor, and this drains them at a point where
+    /// durability must be guaranteed — a graceful shutdown, or a test asserting the
+    /// on-disk state. (A real process restart drains the queue the same way.)
+    func flushPendingLocalDeliveries() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            localDeliveriesWriteQueue.async { continuation.resume() }
         }
     }
 
@@ -982,6 +1179,18 @@ public actor LXMRouter {
         // same fix applied to `handlePropagationAccepted` (PR #7
         // greptile round 4).
         try? await database.updateMessageState(id: messageHash, state: .delivered)
+
+        // Flip the in-memory `pendingOutbound` entry to `.delivered` too. Now that a sent
+        // opportunistic message STAYS in the queue for retry (see processOutbound), the
+        // proof handler must mark it delivered in-memory so the next processOutbound pass
+        // removes it (the `.delivered` check) and STOPS re-sending — otherwise the loop
+        // would keep re-sending an already-delivered message until MAX_DELIVERY_ATTEMPTS.
+        // Mirrors python `__mark_delivered` setting `state = DELIVERED` in-memory
+        // (LXMessage.py:558-561), which is what makes `process_outbound` drop it
+        // (LXMRouter.py:2516-2519). No-op when the entry was already removed (e.g. DIRECT).
+        if let idx = pendingOutbound.firstIndex(where: { $0.hash == messageHash }) {
+            pendingOutbound[idx].state = .delivered
+        }
 
         // Notify delegate for UI refresh
         if let wrapper = delegateWrapper, let delegate = wrapper.delegate {
