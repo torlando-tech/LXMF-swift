@@ -218,6 +218,24 @@ public struct LXMessage {
                         }
                     }
                     fieldsMap[keyValue] = .map(nestedMap)
+                } else if let dictValueU = value as? [UInt8: Any] {
+                    // Nested INTEGER-keyed dict — the shape FIELD_REACTION (0x40)
+                    // uses: {0x00: targetHashBytes, 0x01: emojiUTF8}. Without this
+                    // the reaction field matched no case and was silently dropped
+                    // from the wire. Keys pack as msgpack uint (matching Sideband /
+                    // Columba-Android); values are Data (binary) / String / Int.
+                    var nestedMap: [LXMFMessagePackValue: LXMFMessagePackValue] = [:]
+                    for (k, v) in dictValueU {
+                        let nestedKey = LXMFMessagePackValue.uint(UInt64(k))
+                        if let dataVal = v as? Data {
+                            nestedMap[nestedKey] = .binary(dataVal)
+                        } else if let strVal = v as? String {
+                            nestedMap[nestedKey] = .string(strVal)
+                        } else if let intVal = v as? Int {
+                            nestedMap[nestedKey] = .int(Int64(intVal))
+                        }
+                    }
+                    fieldsMap[keyValue] = .map(nestedMap)
                 }
             }
             payloadArray[3] = .map(fieldsMap)
@@ -418,23 +436,54 @@ public struct LXMessage {
                     // (Field 5 file attachments: [[filename, data], ...])
                     extractedFields[keyByte] = Self.convertMsgpackArrayToSwift(arr)
                 case .map(let nestedMap):
-                    // Convert nested map to [String: Any]
-                    var nestedDict: [String: Any] = [:]
-                    for (nk, nv) in nestedMap {
-                        if case .string(let nkStr) = nk {
-                            switch nv {
-                            case .double(let dbl):
-                                nestedDict[nkStr] = dbl
-                            case .int(let int):
-                                nestedDict[nkStr] = int
-                            case .string(let str):
-                                nestedDict[nkStr] = str
-                            default:
-                                break
+                    // Python umsgpack returns whatever key type was on the wire.
+                    // A STRING-keyed nested map (legacy app_data) → [String: Any];
+                    // an INTEGER-keyed one → [UInt8: Any]. The canonical
+                    // FIELD_REACTION (0x40) is int-keyed ({0x00: targetHashBytes,
+                    // 0x01: emojiUTF8}) — the previous string-keys-only path
+                    // dropped it, so inbound reactions never decoded.
+                    let allStringKeys = nestedMap.keys.allSatisfy {
+                        if case .string = $0 { return true } else { return false }
+                    }
+                    if allStringKeys {
+                        var nestedDict: [String: Any] = [:]
+                        for (nk, nv) in nestedMap {
+                            if case .string(let nkStr) = nk {
+                                switch nv {
+                                case .double(let dbl):
+                                    nestedDict[nkStr] = dbl
+                                case .int(let int):
+                                    nestedDict[nkStr] = int
+                                case .string(let str):
+                                    nestedDict[nkStr] = str
+                                default:
+                                    break
+                                }
                             }
                         }
+                        extractedFields[keyByte] = nestedDict
+                    } else {
+                        var nestedDict: [UInt8: Any] = [:]
+                        for (nk, nv) in nestedMap {
+                            let ikey: UInt8?
+                            switch nk {
+                            case .uint(let u): ikey = UInt8(exactly: u)
+                            case .int(let i): ikey = UInt8(exactly: i)
+                            default: ikey = nil
+                            }
+                            guard let k = ikey else { continue }
+                            switch nv {
+                            case .binary(let d): nestedDict[k] = d
+                            case .string(let s): nestedDict[k] = s
+                            case .int(let i): nestedDict[k] = Int(i)
+                            case .uint(let u): nestedDict[k] = Int(truncatingIfNeeded: u)
+                            case .double(let dbl): nestedDict[k] = dbl
+                            case .bool(let b): nestedDict[k] = b
+                            default: break
+                            }
+                        }
+                        extractedFields[keyByte] = nestedDict
                     }
-                    extractedFields[keyByte] = nestedDict
                 default:
                     break
                 }
