@@ -207,6 +207,25 @@ public actor LXMFDatabase {
             }
         }
 
+        // v8: Pin changes. No foreign key — a change can wait for a message, or a conversation,
+        // that hasn't arrived; deleting a conversation or a message removes its rows by hand.
+        migrator.registerMigration("v8_kvf_pin_changes") { db in
+            try db.create(table: "pin_changes") { t in
+                t.column("hash", .blob).primaryKey()
+                t.column("conversation_hash", .blob).notNull()
+                t.column("target", .blob).notNull()
+                t.column("actor", .blob).notNull()
+                t.column("is_pinned", .boolean).notNull()
+                t.column("timestamp", .double).notNull()
+                t.column("placed_at", .double).notNull()
+            }
+            try db.create(index: "idx_pin_changes_target", on: "pin_changes", columns: ["target"])
+            try db.create(index: "idx_pin_changes_actor", on: "pin_changes", columns: ["actor"])
+            try db.create(index: "idx_pin_changes_conversation",
+                          on: "pin_changes",
+                          columns: ["conversation_hash", "placed_at"])
+        }
+
         return migrator
     }
 
@@ -445,10 +464,14 @@ public actor LXMFDatabase {
                 sql: "DELETE FROM conversations WHERE destination_hash = ?",
                 arguments: [hash]
             )
+            try db.execute(sql: "DELETE FROM pin_changes WHERE conversation_hash = ?", arguments: [hash])
         }
     }
 
-    /// Delete a single message by its ID hash.
+    /// Delete a single message by its ID hash, with the pin changes aimed at it.
+    ///
+    /// Only rows *targeting* the message go: command envelopes are discarded through here too, and
+    /// a pin envelope's hash is also its pin change's key.
     ///
     /// - Parameter messageId: Message hash (32 bytes)
     /// - Throws: DatabaseError
@@ -458,6 +481,7 @@ public actor LXMFDatabase {
                 sql: "DELETE FROM messages WHERE message_id = ?",
                 arguments: [messageId]
             )
+            try db.execute(sql: "DELETE FROM pin_changes WHERE target = ?", arguments: [messageId])
         }
     }
 
@@ -778,6 +802,97 @@ public actor LXMFDatabase {
             try MessageRecord
                 .filter(Column("message_id") == id)
                 .fetchOne(db)
+        }
+    }
+
+    // MARK: - Pin Changes
+
+    /// Stores a pin change. Returns `false` when a change with that hash is already stored.
+    public func savePinChange(_ change: PinChangeRecord) throws -> Bool {
+        try dbPool.write { db in
+            try change.insert(db, onConflict: .ignore)
+            return db.changesCount > 0
+        }
+    }
+
+    /// Every change of a conversation, waiting ones included, oldest line place first.
+    public func pinChanges(forConversation hash: Data) throws -> [PinChangeRecord] {
+        try dbPool.read { db in
+            try PinChangeRecord
+                .filter(Column("conversation_hash") == hash)
+                .order(Column("placed_at"), Column("hash"))
+                .fetchAll(db)
+        }
+    }
+
+    /// Every change aimed at one message.
+    public func pinChanges(forTarget target: Data) throws -> [PinChangeRecord] {
+        try dbPool.read { db in
+            try PinChangeRecord
+                .filter(Column("target") == target)
+                .order(Column("placed_at"), Column("hash"))
+                .fetchAll(db)
+        }
+    }
+
+    /// The changes shown as lines: those whose message is stored in the same conversation,
+    /// a tombstone included. Oldest first.
+    public func pinLines(forConversation hash: Data) throws -> [PinChangeRecord] {
+        try dbPool.read { db in
+            try PinChangeRecord.fetchAll(db, sql: """
+                SELECT pin_changes.* FROM pin_changes
+                JOIN messages ON messages.message_id = pin_changes.target
+                    AND messages.conversation_hash = pin_changes.conversation_hash
+                WHERE pin_changes.conversation_hash = ?
+                ORDER BY pin_changes.placed_at, pin_changes.hash
+                """, arguments: [hash])
+        }
+    }
+
+    /// Each conversation's newest line.
+    public func latestPinLines() throws -> [PinChangeRecord] {
+        let lines = try dbPool.read { db in
+            try PinChangeRecord.fetchAll(db, sql: """
+                SELECT pin_changes.* FROM pin_changes
+                JOIN messages ON messages.message_id = pin_changes.target
+                    AND messages.conversation_hash = pin_changes.conversation_hash
+                ORDER BY pin_changes.placed_at, pin_changes.hash
+                """)
+        }
+        var newest: [Data: PinChangeRecord] = [:]
+        for line in lines {
+            newest[line.conversationHash] = line
+        }
+        return Array(newest.values)
+    }
+
+    /// How many of `actor`'s changes wait for a message not stored yet.
+    public func waitingPinChangeCount(fromActor actor: Data) throws -> Int {
+        try dbPool.read { db in
+            try Int.fetchOne(db, sql: """
+                SELECT COUNT(*) FROM pin_changes
+                WHERE actor = ?
+                    AND NOT EXISTS (SELECT 1 FROM messages WHERE messages.message_id = pin_changes.target)
+                """, arguments: [actor]) ?? 0
+        }
+    }
+
+    /// Deletes waiting changes stamped before `timestamp`. Returns how many went.
+    public func deleteWaitingPinChanges(olderThan timestamp: Double) throws -> Int {
+        try dbPool.write { db in
+            try db.execute(sql: """
+                DELETE FROM pin_changes
+                WHERE timestamp < ?
+                    AND NOT EXISTS (SELECT 1 FROM messages WHERE messages.message_id = pin_changes.target)
+                """, arguments: [timestamp])
+            return db.changesCount
+        }
+    }
+
+    /// Deletes every change aimed at one message.
+    public func deletePinChanges(forTarget target: Data) throws {
+        try dbPool.write { db in
+            try db.execute(sql: "DELETE FROM pin_changes WHERE target = ?", arguments: [target])
         }
     }
 

@@ -35,6 +35,7 @@ themselves a divergence and are listed under [D3](#d3) below.
 | [D10](#d10) | Storage | `countMessages(forConversation:)` conversation counter | `ed7ee1d` | — |
 | [D11](#d11) | Package.swift, Storage | GRDB 7 + SWCompression 4.9; platform floor macOS 14 / iOS 17 | _uncommitted_ | — |
 | [D12](#d12) | Router (inbound) | Host delivery policy (`setDeliveryPolicy`) before dedup/storage; proof sent after admission | _uncommitted_ | D3 |
+| [D13](#d13) | Storage | `pin_changes` table and its queries, for Intercom's message pinning | _uncommitted_ | — |
 
 ### Commit ledger
 
@@ -72,7 +73,7 @@ Standing register for structural changes: new/renamed/dropped **tables**, **colu
 do not belong here — this chapter answers "did the stored data shape change, and can an
 older or newer build still read it?"
 
-**Current state: no divergence.** The schema is upstream's, at migration `v6_add_replies_reactions`:
+**Current state: two fork migrations** on top of upstream's `v6_add_replies_reactions`:
 
 | Migration | Origin |
 |-----------|--------|
@@ -82,10 +83,11 @@ older or newer build still read it?"
 | `v4_add_receiving_interface` | upstream |
 | `v5_add_pinned` | upstream |
 | `v6_add_replies_reactions` | upstream |
+| `v7_message_annotations` | fork ([S1](#schema)) — predates rule 2, so it lacks the `kvf` tag |
+| `v8_kvf_pin_changes` | fork ([S2](#schema)) |
 
-Fork-only changes so far are behavioural: `acceptUnverifiedMessages` ([D3](#d3)) is
-in-memory router config, never persisted, and [D6](#d6) only moved the migrator into
-`makeMigrator()` and added export/import — it registers no migration and touches no table.
+`acceptUnverifiedMessages` ([D3](#d3)) is in-memory router config, never persisted, and
+[D6](#d6) only moved the migrator into `makeMigrator()` and added export/import.
 
 ### Ledger
 
@@ -94,7 +96,8 @@ the point is to be able to reconstruct what our stored data looks like at any co
 
 | ID | Commit | Date | Migration | Structure changed | Domain property | Reason |
 |----|--------|------|-----------|-------------------|-----------------|--------|
-| _(none yet)_ | | | | | | |
+| S1 | `5605dd6` | 2026-09-21 | `v7_message_annotations` | `messages` + `edited_content`, `edited_at`, `deleted_at` | `MessageRecord.editedContent`, `.editedAt`, `.deletedAt` | Intercom's edit and delete-for-everyone. Logged late, 2026-11-12. |
+| S2 | _uncommitted_ | 2026-11-12 | `v8_kvf_pin_changes` | New table `pin_changes` (`hash` PK, `conversation_hash`, `target`, `actor`, `is_pinned`, `timestamp`, `placed_at`); indexes on `target`, `actor`, (`conversation_hash`, `placed_at`) | `PinChangeRecord` | Intercom's message pinning ([D13](#d13)). New table only: an older build ignores it; restore forward-migrates. |
 
 ### Rules for adding one
 
@@ -401,6 +404,24 @@ contacts and must not prove to a blocked sender.
 policy-rejected message pulled from a propagation node is deleted there for good. That is the
 intended outcome for a blocked or unknown sender.
 
+## D13 — Pin changes {#d13}
+
+**Commits:** _uncommitted_ (2026-11-12)
+
+**Files:** `Sources/LXMFSwift/Storage/PinChangeRecord.swift`, `Sources/LXMFSwift/Storage/LXMFDatabase.swift`,
+`Tests/LXMFSwiftTests/PinChangeTests.swift`
+
+Storage for Intercom's message pinning: one `pin_changes` row per pin or unpin ([S2](#schema)).
+The fork only stores and answers queries (`savePinChange`, `pinChanges(forConversation:)`,
+`pinChanges(forTarget:)`, `pinLines(forConversation:)`, `latestPinLines()`,
+`waitingPinChangeCount(fromActor:)`, `deleteWaitingPinChanges(olderThan:)`,
+`deletePinChanges(forTarget:)`); the pinning rules live in Intercom.
+
+- No foreign key: a change can wait for a message, or a conversation row, that hasn't arrived.
+- `deleteConversation` also deletes the conversation's rows; `deleteMessage(id:)` deletes rows
+  whose *target* is that message, never by the row's own hash, because command envelopes are
+  discarded through it.
+
 ## Re-sync checklist
 
 When pulling new upstream work:
@@ -410,7 +431,7 @@ When pulling new upstream work:
 3. Conflict-prone files, in order of likelihood:
    `Sources/LXMFSwift/Router/LXMRouter.swift` (D3, D4, **D9**, D8 call sites),
    `Sources/LXMFSwift/Router/LXMRouter+Delivery.swift` (D5, D8 call sites),
-   `Sources/LXMFSwift/Storage/LXMFDatabase.swift` (D6, D10, D11),
+   `Sources/LXMFSwift/Storage/LXMFDatabase.swift` (D6, D10, D11, D13),
    `port-deviations.md` (D3), `Package.swift` (D1, D11).
    `LXMRouter+NetworkDiagnostics.swift` (D8) is a new file and cannot conflict; it is listed
    here only because its call sites live in the two files above.
@@ -467,6 +488,7 @@ HEAD the file described at that point.
 
 | Date | Covers | Change |
 |------|--------|--------|
+| 2026-11-12 | `6a4962d` + uncommitted | Added [D13](#d13) and the schema ledger's S1 (`v7_message_annotations`, logged late) and S2 (`v8_kvf_pin_changes`). Commits since `3aa1b8b` are not yet audited into the commit ledger. |
 | 2026-09-25 | `3aa1b8b` + uncommitted | Added [D12](#d12) (host delivery policy, proof after admission). |
 | 2026-09-15 | `ef0c712` + uncommitted | Added [D11](#d11) (GRDB 7, SWCompression 4.9, macOS 14 / iOS 17) and [D6](#d6)'s tests; D1 no longer carries SWCompression; re-sync checklist gains the GRDB 6 API grep. Commits `19f7c6b`, `49061a6`, `93e3d0c` since `457eb4e` are not yet audited into the ledger. |
 | 2026-08-19 | `457eb4e` | Added [D8](#d8) (queue diagnostics), [D9](#d9) (pathless retry / unproven-route invalidation) and [D10](#d10) (message count). Corrected [D1](#d1): reticulum floor is 0.4.3 and the SWCompression pin went back to upstream's range. Refreshed the ledger, re-sync checklist and status. |
